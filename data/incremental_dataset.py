@@ -1,1119 +1,1383 @@
-
-
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+"""Single leakage-auditable non-exemplar class-incremental HSI protocol.
+
+Protocol contract
+-----------------
+* Phase t training exposes only the training centres of classes introduced at t.
+* Validation during an active phase exposes only current-phase validation data.
+* Cumulative validation/test over all seen classes is evaluation-only and is
+  available only after the phase is finalized.
+* The spatial branch receives the processed/PCA patch.
+* The spectral branch receives the raw ordered full-band centre spectrum.
+* No optimization/model-selection API returns historical training samples after its phase.
+* A finalized-phase map loader may read all labelled seen-class pixels strictly for
+  post-training qualitative reporting; those rows are never an optimization source.
+* Optional strict spatial audits detect patch-footprint overlap across data
+  splits and across unavailable old/future labelled samples.
+
+Important: a standard random-pixel HSI split is centre-disjoint but generally
+NOT patch-disjoint when patch_size > 1. Therefore it must not be described as
+spatial-leakage-free unless the strict audits actually pass.
+"""
+
+import random
+from numbers import Integral, Real
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 
-def _ordered_unique_ints(values: Iterable[int]) -> List[int]:
-    """Return unique ints while preserving order.
+_SPLITS = ("train", "val", "test")
 
-    CIL class order is part of the protocol. Do not replace this with
-    ``sorted(set(values))`` in trainer/evaluator code; that silently changes
-    shuffled class-order experiments.
+
+def _exact_integer(value: object, *, name: str, minimum: Optional[int] = None) -> int:
+    """Return an exact signed-int64-compatible scalar without silent truncation."""
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError(f"{name} must be an integer scalar")
+        value = value.item()
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer")
+
+    if isinstance(value, Integral):
+        result = int(value)
+    elif isinstance(value, Real):
+        number = float(value)
+        if not np.isfinite(number) or not number.is_integer():
+            raise ValueError(f"{name} must be a finite integer")
+        result = int(number)
+    else:
+        raise ValueError(f"{name} must be an integer")
+
+    info = np.iinfo(np.int64)
+    if result < int(info.min) or result > int(info.max):
+        raise ValueError(f"{name} is outside signed int64 range")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return result
+
+
+def _exact_bool(value: object, *, name: str) -> bool:
+    """Parse an explicit Boolean without Python's bool('false') pitfall."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        integer = int(value)
+        if integer in (0, 1):
+            return bool(integer)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"true", "1", "yes", "y"}:
+            return True
+        if token in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"{name} must be a Boolean")
+
+
+def _integer_array(value: object, *, name: str) -> np.ndarray:
+    """Return exact int64 data without Boolean, fractional, or overflow coercion."""
+    raw = np.asarray(value)
+    if raw.dtype == np.bool_ or raw.dtype.kind not in "iuf":
+        raise ValueError(f"{name} must contain integer values")
+
+    info = np.iinfo(np.int64)
+    if np.issubdtype(raw.dtype, np.floating):
+        if not np.isfinite(raw).all() or not np.equal(raw, np.round(raw)).all():
+            raise ValueError(f"{name} must contain finite integer values")
+        # float64 cannot represent int64.max exactly; use the exact
+        # representable half-open interval [-2**63, 2**63).
+        lower = float(-(2**63))
+        upper_exclusive = float(2**63)
+        if raw.size and (
+            np.any(raw < lower) or np.any(raw >= upper_exclusive)
+        ):
+            raise ValueError(f"{name} contains values outside signed int64 range")
+    elif raw.size and np.issubdtype(raw.dtype, np.unsignedinteger):
+        if np.any(raw > info.max):
+            raise ValueError(f"{name} contains values outside signed int64 range")
+    elif raw.size:
+        if np.any(raw < info.min) or np.any(raw > info.max):
+            raise ValueError(f"{name} contains values outside signed int64 range")
+
+    return raw.astype(np.int64, copy=False)
+
+
+def _ids(values: Iterable[int], *, name: str, allow_empty: bool = False) -> List[int]:
+    result = [
+        _exact_integer(value, name=f"{name} value", minimum=0)
+        for value in values
+    ]
+    if not result and not allow_empty:
+        raise ValueError(f"{name} cannot be empty")
+    if len(result) != len(set(result)):
+        raise ValueError(f"{name} must contain unique IDs")
+    return result
+
+
+def _normalize_split_name(split: str) -> str:
+    token = str(split).strip().lower()
+    return {
+        "training": "train",
+        "validation": "val",
+        "testing": "test",
+    }.get(token, token)
+
+
+def _seed_worker(_: int) -> None:
+    seed = int(torch.initial_seed() % (2**32))
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+
+def _seed32(value: object, *, name: str) -> int:
+    """Validate the exact integer domain accepted by NumPy RandomState."""
+    result = _exact_integer(
+        value,
+        name=name,
+        minimum=0,
+    )
+    if result > (2**32) - 1:
+        raise ValueError(
+            f"{name} must be <= 2**32-1"
+        )
+    return result
+
+
+def _derived_seed32(base_seed: int, component: int) -> int:
+    """Derive a deterministic per-class seed without leaving uint32 range."""
+    base = _seed32(
+        base_seed,
+        name="base seed",
+    )
+    part = _exact_integer(
+        component,
+        name="seed component",
+        minimum=0,
+    )
+    return int(
+        (base + 1009 * part)
+        % (2**32)
+    )
+
+def _phase_schedule(
+    class_count: int,
+    base_classes: int,
+    increment: int,
+) -> Tuple[List[int], Dict[int, List[int]]]:
+    total = _exact_integer(class_count, name="class_count", minimum=1)
+    base = _exact_integer(base_classes, name="base_classes", minimum=1)
+    step = _exact_integer(increment, name="increment", minimum=1)
+    if base > total:
+        raise ValueError("base_classes cannot exceed class_count")
+    sizes = [base]
+    remaining = total - base
+    while remaining:
+        current = min(step, remaining)
+        sizes.append(current)
+        remaining -= current
+    phases: Dict[int, List[int]] = {}
+    start = 0
+    for phase, size in enumerate(sizes):
+        phases[phase] = list(range(start, start + size))
+        start += size
+    return sizes, phases
+
+
+def _split_counts(
+    total: int,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+) -> Tuple[int, int, int]:
+    """Allocate one fixed per-class split; validation may be disabled.
+
+    Train and test are mandatory.  Validation is optional because some
+    published HSI benchmarks provide train/test masks only.
     """
-    out: List[int] = []
-    seen: Set[int] = set()
-    for value in values:
-        v = int(value)
-        if v not in seen:
-            out.append(v)
-            seen.add(v)
-    return out
+    train_fraction = float(train_ratio)
+    val_fraction = float(val_ratio)
 
-
-def _as_1d_int_array(values: Any, *, name: str) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.int64).reshape(-1)
-    if arr.size == 0:
-        raise ValueError(f"{name} is empty.")
-    return arr
-
-
-class HSIPatchDataset(Dataset):
-    def __init__(
-        self,
-        patches: np.ndarray,
-        labels: np.ndarray,
-        coords: Optional[np.ndarray] = None,
-        return_metadata: bool = False,
-        center_spectra: Optional[np.ndarray] = None,
-        spectra_are_physical: bool = False,
-        return_input_center_when_no_spectra: bool = False,
+    if (
+        not np.isfinite(train_fraction)
+        or not np.isfinite(val_fraction)
+        or train_fraction <= 0.0
+        or val_fraction < 0.0
+        or train_fraction + val_fraction >= 1.0
     ):
-        patches = np.ascontiguousarray(patches, dtype=np.float32)
-        labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+        raise ValueError(
+            "require finite train_ratio>0, val_ratio>=0, and "
+            "train_ratio+val_ratio<1"
+        )
 
-        if len(patches) != len(labels):
-            raise ValueError(f"patch/label length mismatch: {len(patches)} vs {len(labels)}")
+    required_split_count = 3 if val_fraction > 0.0 else 2
+    count = _exact_integer(
+        total,
+        name="class sample count",
+        minimum=required_split_count,
+    )
 
-        self.patches = torch.from_numpy(patches).float()
-        self.labels = torch.from_numpy(labels).long()
-        self.return_metadata = bool(return_metadata)
-        self.spectra_are_physical = bool(spectra_are_physical)
-        self.return_input_center_when_no_spectra = bool(return_input_center_when_no_spectra)
+    quotas = np.asarray(
+        (
+            train_fraction,
+            val_fraction,
+            1.0 - train_fraction - val_fraction,
+        ),
+        dtype=np.float64,
+    ) * count
+    counts = np.floor(quotas).astype(np.int64)
+    remainder = count - int(counts.sum())
+    if remainder:
+        order = np.argsort(-(quotas - counts), kind="stable")
+        counts[order[:remainder]] += 1
 
-        if center_spectra is None:
-            self.center_spectra = None
-        else:
-            center_spectra = np.asarray(center_spectra, dtype=np.float32)
-            if len(center_spectra) != len(labels):
-                raise ValueError(f"center_spectra/label length mismatch: {len(center_spectra)} vs {len(labels)}")
-            if center_spectra.ndim != 2:
-                center_spectra = center_spectra.reshape(len(labels), -1)
-            self.center_spectra = torch.from_numpy(np.ascontiguousarray(center_spectra)).float()
+    required = (0, 2) if val_fraction == 0.0 else (0, 1, 2)
+    for destination in required:
+        if counts[destination] == 0:
+            candidates = [
+                index
+                for index in required
+                if index != destination and counts[index] > 1
+            ]
+            if not candidates:
+                raise ValueError(
+                    "class is too small to realize the requested non-empty splits"
+                )
+            source = max(candidates, key=lambda index: int(counts[index]))
+            counts[source] -= 1
+            counts[destination] += 1
 
-        if coords is None:
-            self.coords = torch.empty((len(labels), 0), dtype=torch.long)
-        else:
-            coords = np.asarray(coords, dtype=np.int64)
-            if len(coords) != len(labels):
-                raise ValueError(f"coord/label length mismatch: {len(coords)} vs {len(labels)}")
-            if coords.ndim != 2 or coords.shape[1] != 2:
-                raise ValueError(f"coords must be [N,2], got {coords.shape}")
-            self.coords = torch.from_numpy(coords).long()
+    if val_fraction == 0.0:
+        # A zero validation ratio is an explicit train/test-only protocol.
+        if counts[1] != 0:
+            counts[2] += counts[1]
+            counts[1] = 0
 
-    def __len__(self) -> int:
-        return int(len(self.labels))
+    n_train, n_val, n_test = (int(v) for v in counts)
+    if n_train + n_val + n_test != count:
+        raise RuntimeError("split allocation does not conserve class samples")
+    if n_train <= 0 or n_test <= 0:
+        raise RuntimeError("train and test splits must be non-empty")
+    if val_fraction > 0.0 and n_val <= 0:
+        raise RuntimeError("positive val_ratio produced an empty validation split")
+    return n_train, n_val, n_test
 
-    @staticmethod
-    def _center_spectrum(patch: torch.Tensor) -> torch.Tensor:
-        # Patches are normally [C,H,W]. Fallbacks keep compatibility with flat inputs.
-        if patch.dim() == 3:
-            return patch[:, patch.size(1) // 2, patch.size(2) // 2].float()
-        if patch.dim() == 2:
-            return patch.float().mean(dim=-1)
-        return patch.float().flatten()
-
-    def __getitem__(self, idx: int):
-        patch = self.patches[idx]
-        label = self.labels[idx]
-        if not self.return_metadata:
-            return patch, label
-        # Return physical wavelength-ordered center spectra only when the
-        # IncrementalHSIDataset explicitly provides them.  Do NOT silently fall
-        # back to PCA/reduced patch-center spectra here: several trainer paths
-        # interpret the third tuple field as raw spectral metadata.  Returning an
-        # empty tensor is safer; the model/helper can still derive a non-physical
-        # reduced center vector from the patch when needed.
-        if self.center_spectra is not None:
-            spectrum = self.center_spectra[idx]
-        elif self.return_input_center_when_no_spectra:
-            spectrum = self._center_spectrum(patch)
-        else:
-            spectrum = torch.empty((0,), dtype=patch.dtype)
-        coord = self.coords[idx] if self.coords.numel() > 0 else torch.empty((0,), dtype=torch.long)
-        return patch, label, spectrum, coord
+def _random_class_split(
+    indices: np.ndarray,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    values = _integer_array(indices, name="class indices").reshape(-1)
+    if np.unique(values).size != values.size:
+        raise ValueError("class indices contain duplicates")
+    n_train, n_val, _ = _split_counts(
+        len(values),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    rng = np.random.RandomState(_exact_integer(seed, name="split seed", minimum=0))
+    shuffled = rng.permutation(values)
+    train = shuffled[:n_train]
+    val = shuffled[n_train : n_train + n_val]
+    test = shuffled[n_train + n_val :]
+    return {
+        "train": train,
+        "val": val,
+        "test": test,
+        "all": np.concatenate((train, val, test)),
+    }
 
 
+def _spatial_class_split(
+    indices: np.ndarray,
+    coords: np.ndarray,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    block_size: int,
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    """Classwise spatial-block split.
 
-class ClassBalancedBatchSampler(Sampler[List[int]]):
+    This is a benchmark split option, not a proof of patch disjointness.
+    Patch-overlap audits are computed separately.
     """
-    Class-balanced batch sampler for geometry-native HSI base training.
+    values = _integer_array(indices, name="class indices").reshape(-1)
+    xy = _integer_array(coords, name="coords")[values]
+    size = _exact_integer(block_size, name="spatial_block_size", minimum=1)
+    max_block_col = int(np.max(xy[:, 1] // size)) + 1
+    block_ids = (xy[:, 0] // size) * max_block_col + xy[:, 1] // size
+    blocks = [values[block_ids == block] for block in np.unique(block_ids)]
 
-    Local low-rank geometry is not compatible with random imbalanced batches:
-    singleton rare classes produce degenerate covariance and rank-0 geometry.
-    This sampler builds each train batch from multiple classes with multiple
-    samples per class, sampling with replacement when a class is small.
-    """
+    validation_enabled = float(val_ratio) > 0.0
+    minimum_blocks = 3 if validation_enabled else 2
+    if len(blocks) < minimum_blocks:
+        raise RuntimeError(
+            "a class occupies too few spatial blocks for the requested split"
+        )
 
-    def __init__(
-        self,
-        labels: torch.Tensor,
-        batch_size: int,
-        classes_per_batch: Optional[int] = None,
-        samples_per_class: Optional[int] = None,
-        seed: int = 42,
-        drop_last: bool = False,
-    ) -> None:
-        labels_np = labels.detach().cpu().numpy().astype(np.int64).reshape(-1)
-        if labels_np.size == 0:
-            raise ValueError("ClassBalancedBatchSampler received zero labels.")
+    rng = np.random.RandomState(
+        _exact_integer(seed, name="split seed", minimum=0)
+    )
+    rng.shuffle(blocks)
 
-        self.labels_np = labels_np
-        self.batch_size = int(max(1, batch_size))
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
+    target_train, target_val, _ = _split_counts(
+        len(values),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
 
-        self.class_to_indices: Dict[int, np.ndarray] = {}
-        for c in sorted(np.unique(labels_np).tolist()):
-            idx = np.where(labels_np == int(c))[0].astype(np.int64)
-            if idx.size > 0:
-                self.class_to_indices[int(c)] = idx
+    train_blocks: List[np.ndarray] = []
+    val_blocks: List[np.ndarray] = []
+    test_blocks: List[np.ndarray] = []
+    train_count = 0
+    val_count = 0
 
-        self.classes = sorted(self.class_to_indices.keys())
-        if not self.classes:
-            raise ValueError("ClassBalancedBatchSampler found no classes.")
+    for block_index, block in enumerate(blocks):
+        remaining = len(blocks) - block_index
+        reserve_for_test = 1
+        reserve_for_val = 1 if validation_enabled and not val_blocks else 0
 
-        if classes_per_batch is None or int(classes_per_batch) <= 0:
-            classes_per_batch = min(len(self.classes), self.batch_size)
-        self.classes_per_batch = int(max(1, min(classes_per_batch, len(self.classes), self.batch_size)))
+        if (
+            train_count < target_train
+            and remaining > reserve_for_test + reserve_for_val
+        ):
+            train_blocks.append(block)
+            train_count += len(block)
+        elif (
+            validation_enabled
+            and val_count < target_val
+            and remaining > reserve_for_test
+        ):
+            val_blocks.append(block)
+            val_count += len(block)
+        else:
+            test_blocks.append(block)
 
-        if samples_per_class is None or int(samples_per_class) <= 0:
-            samples_per_class = max(2, self.batch_size // self.classes_per_batch)
-        self.samples_per_class = int(max(1, samples_per_class))
+    if not train_blocks or not test_blocks:
+        raise RuntimeError("spatial block allocation produced an empty train/test split")
+    if validation_enabled and not val_blocks:
+        raise RuntimeError("spatial block allocation produced an empty validation split")
 
-        self.effective_batch_size = self.classes_per_batch * self.samples_per_class
-        if self.effective_batch_size > self.batch_size:
-            self.samples_per_class = max(1, self.batch_size // self.classes_per_batch)
-            self.effective_batch_size = self.classes_per_batch * self.samples_per_class
+    train = np.concatenate(train_blocks)
+    val = (
+        np.concatenate(val_blocks)
+        if val_blocks
+        else np.empty(0, dtype=np.int64)
+    )
+    test = np.concatenate(test_blocks)
 
-        self.num_batches = int(np.ceil(labels_np.size / float(max(self.effective_batch_size, 1))))
-        if self.drop_last:
-            self.num_batches = int(labels_np.size // float(max(self.effective_batch_size, 1)))
-        self.num_batches = max(1, self.num_batches)
-        self.epoch = 0
+    return {
+        "train": train,
+        "val": val,
+        "test": test,
+        "all": np.concatenate((train, val, test)),
+    }
 
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
+def _validate_split_by_class(
+    split_by_class: Mapping[int, Mapping[str, np.ndarray]],
+    labels: np.ndarray,
+    class_count: int,
+) -> None:
+    y = _integer_array(
+        labels,
+        name="global labels",
+    ).reshape(-1)
+    total_classes = _exact_integer(
+        class_count,
+        name="class_count",
+        minimum=1,
+    )
 
-    def __len__(self) -> int:
-        return self.num_batches
+    if y.size == 0:
+        raise ValueError(
+            "global labels cannot be empty"
+        )
+    observed_classes = sorted(
+        int(value)
+        for value in np.unique(y)
+    )
+    if observed_classes != list(
+        range(total_classes)
+    ):
+        raise ValueError(
+            "global labels must contain exactly contiguous class IDs "
+            f"0..{total_classes - 1}; observed={observed_classes}"
+        )
 
-    def __iter__(self):
-        rng = np.random.RandomState(self.seed + self.epoch)
-        classes = np.asarray(self.classes, dtype=np.int64)
+    if set(int(v) for v in split_by_class) != set(range(total_classes)):
+        raise ValueError("split_by_class does not cover every class")
 
-        for _ in range(self.num_batches):
-            replace_classes = len(classes) < self.classes_per_batch
-            chosen_classes = rng.choice(
-                classes,
-                size=self.classes_per_batch,
-                replace=replace_classes,
+    used: set[int] = set()
+    for class_id in range(total_classes):
+        row = split_by_class[class_id]
+        missing = set((*_SPLITS, "all")) - set(row)
+        if missing:
+            raise ValueError(
+                f"class {class_id} split is missing {sorted(missing)}"
             )
 
-            batch: List[int] = []
-            for c in chosen_classes.tolist():
-                pool = self.class_to_indices[int(c)]
-                replace_samples = pool.size < self.samples_per_class
-                sampled = rng.choice(
-                    pool,
-                    size=self.samples_per_class,
-                    replace=replace_samples,
+        arrays = {
+            name: _integer_array(
+                row[name],
+                name=f"class {class_id} {name} indices",
+            ).reshape(-1)
+            for name in (*_SPLITS, "all")
+        }
+
+        if arrays["train"].size == 0 or arrays["test"].size == 0:
+            raise ValueError(
+                f"class {class_id} must have non-empty train and test splits"
+            )
+        if arrays["all"].size == 0:
+            raise ValueError(f"class {class_id} all split cannot be empty")
+
+        for name, array in arrays.items():
+            if np.unique(array).size != array.size:
+                raise ValueError(
+                    f"class {class_id} {name} split contains duplicates"
                 )
-                batch.extend(int(i) for i in sampled.tolist())
+            if array.size and (array.min() < 0 or array.max() >= y.size):
+                raise ValueError(
+                    f"class {class_id} {name} split contains invalid indices"
+                )
 
-            rng.shuffle(batch)
-            if not batch:
-                continue
-            if self.drop_last and len(batch) < self.effective_batch_size:
-                continue
-            yield batch
+        train_set, val_set, test_set = (
+            set(arrays[name].tolist()) for name in _SPLITS
+        )
+        if train_set & val_set or train_set & test_set or val_set & test_set:
+            raise ValueError(f"class {class_id} train/val/test indices overlap")
+
+        union = train_set | val_set | test_set
+        if set(arrays["all"].tolist()) != union:
+            raise ValueError(f"class {class_id} all indices are inconsistent")
+
+        for array in arrays.values():
+            if array.size and not np.all(y[array] == class_id):
+                raise ValueError(f"class {class_id} split contains another class")
+
+        expected = set(np.flatnonzero(y == class_id).tolist())
+        if union != expected:
+            raise ValueError(
+                f"class {class_id} split does not account for every sample"
+            )
+        if used & expected:
+            raise ValueError("a sample appears in more than one class")
+        used |= expected
+
+def _collect_indices(
+    split_by_class: Mapping[int, Mapping[str, np.ndarray]],
+    class_ids: Sequence[int],
+    split: str,
+) -> np.ndarray:
+    token = _normalize_split_name(split)
+    if token not in {*_SPLITS, "all"}:
+        raise ValueError(f"unknown split {split!r}")
+    ids = _ids(class_ids, name="class_ids", allow_empty=True)
+    if not ids:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(
+        [
+            _integer_array(
+                split_by_class[class_id][token],
+                name=f"class {class_id} {token} indices",
+            ).reshape(-1)
+            for class_id in ids
+        ]
+    )
 
 
-class IncrementalHSIDataset:
-    """
-    Strict non-exemplar incremental dataset manager.
+def build_incremental_protocol(
+    input_labels: np.ndarray,
+    input_coords: np.ndarray,
+    *,
+    gt_shape: Sequence[int],
+    class_count: int,
+    base_classes: int,
+    increment: int,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int = 0,
+    shuffle_order: bool = False,
+    class_order: Optional[Sequence[int]] = None,
+    target_names: Optional[Sequence[str]] = None,
+    split_strategy: str = "random_pixel",
+    spatial_block_size: int = 33,
+    predefined_splits: Optional[Mapping[int, Mapping[str, Sequence[int]]]] = None,
+    **_: Any,
+) -> Dict[str, Any]:
+    original_labels = _integer_array(input_labels, name="input_labels").reshape(-1)
+    coords = _integer_array(input_coords, name="input_coords")
+    shape = tuple(
+        _exact_integer(v, name="gt_shape value", minimum=1) for v in gt_shape
+    )
+    total_classes = _exact_integer(class_count, name="class_count", minimum=1)
+    protocol_seed = _seed32(
+        seed,
+        name="seed",
+    )
 
-    Important:
-    The dataset manager never assumes label 0 is background. If label 0 is in
-    labels, it is treated as a valid class.
-    """
+    if len(shape) != 2 or coords.shape != (len(original_labels), 2):
+        raise ValueError("labels, coordinates and gt_shape are inconsistent")
+    if original_labels.size == 0:
+        raise ValueError("input_labels cannot be empty")
+    if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+        raise ValueError("coords must identify unique labelled pixels")
+    if (
+        np.any(coords[:, 0] < 0)
+        or np.any(coords[:, 0] >= shape[0])
+        or np.any(coords[:, 1] < 0)
+        or np.any(coords[:, 1] >= shape[1])
+    ):
+        raise ValueError("coords lie outside gt_shape")
+
+    original_ids = sorted(int(v) for v in np.unique(original_labels))
+    if original_ids != list(range(total_classes)):
+        raise ValueError("input labels must be contiguous zero-based class IDs")
+
+    shuffle_classes = _exact_bool(shuffle_order, name="shuffle_order")
+    if class_order is not None and shuffle_classes:
+        raise ValueError("choose either class_order or shuffle_order, not both")
+    if class_order is not None:
+        order = _ids(class_order, name="class_order")
+    elif shuffle_classes:
+        order = np.random.RandomState(protocol_seed).permutation(
+            original_ids
+        ).tolist()
+    else:
+        order = original_ids
+    if set(order) != set(original_ids) or len(order) != len(original_ids):
+        raise ValueError("class_order must be a complete class permutation")
+
+    original_to_global = {
+        original: global_id for global_id, original in enumerate(order)
+    }
+    global_to_original = {
+        global_id: original for original, global_id in original_to_global.items()
+    }
+    global_labels = np.asarray(
+        [original_to_global[int(label)] for label in original_labels],
+        dtype=np.int64,
+    )
+    phase_sizes, phase_to_classes = _phase_schedule(
+        total_classes, base_classes, increment
+    )
+
+    strategy = str(split_strategy).strip().lower()
+    if predefined_splits is not None:
+        predefined_original = {
+            _exact_integer(class_id, name="predefined class ID", minimum=0): row
+            for class_id, row in predefined_splits.items()
+        }
+        if set(predefined_original) != set(original_ids):
+            raise ValueError(
+                "predefined_splits must be keyed by every original class ID"
+            )
+        split_by_class = {}
+        for original_id, row in predefined_original.items():
+            if "train" not in row or "test" not in row:
+                raise ValueError(
+                    f"predefined class {original_id} must provide train and test indices"
+                )
+            mapped = {
+                "train": _integer_array(
+                    row["train"],
+                    name=f"predefined class {original_id} train indices",
+                ).reshape(-1),
+                "val": _integer_array(
+                    row.get("val", np.empty(0, dtype=np.int64)),
+                    name=f"predefined class {original_id} val indices",
+                ).reshape(-1),
+                "test": _integer_array(
+                    row["test"],
+                    name=f"predefined class {original_id} test indices",
+                ).reshape(-1),
+            }
+            mapped["all"] = np.concatenate(
+                (mapped["train"], mapped["val"], mapped["test"])
+            )
+            split_by_class[original_to_global[original_id]] = mapped
+        strategy = "predefined"
+    elif strategy == "random_pixel":
+        split_by_class = {
+            class_id: _random_class_split(
+                np.flatnonzero(global_labels == class_id),
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                seed=_derived_seed32(
+                    protocol_seed,
+                    global_to_original[class_id],
+                ),
+            )
+            for class_id in range(total_classes)
+        }
+    elif strategy == "spatial_block":
+        split_by_class = {
+            class_id: _spatial_class_split(
+                np.flatnonzero(global_labels == class_id),
+                coords,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                block_size=spatial_block_size,
+                seed=_derived_seed32(
+                    protocol_seed,
+                    global_to_original[class_id],
+                ),
+            )
+            for class_id in range(total_classes)
+        }
+    else:
+        raise ValueError(
+            "split_strategy must be random_pixel, spatial_block, or predefined"
+        )
+
+    _validate_split_by_class(split_by_class, global_labels, total_classes)
+
+    validation_presence = [
+        bool(split_by_class[class_id]["val"].size)
+        for class_id in range(total_classes)
+    ]
+    if any(validation_presence) and not all(validation_presence):
+        raise ValueError(
+            "validation must be consistently enabled for every class or "
+            "disabled for every class"
+        )
+    validation_enabled = all(validation_presence)
+
+    names = [] if target_names is None else [str(v) for v in target_names]
+    if names and len(names) != total_classes:
+        raise ValueError("target_names must contain one name per class")
+    global_names = [names[original] for original in order] if names else []
+
+    phase_train = {
+        phase: _collect_indices(split_by_class, classes, "train")
+        for phase, classes in phase_to_classes.items()
+    }
+    phase_val = {
+        phase: _collect_indices(split_by_class, classes, "val")
+        for phase, classes in phase_to_classes.items()
+    }
+    phase_test = {
+        phase: _collect_indices(split_by_class, classes, "test")
+        for phase, classes in phase_to_classes.items()
+    }
+    cumulative_test = {
+        phase: _collect_indices(
+            split_by_class,
+            list(range(sum(phase_sizes[: phase + 1]))),
+            "test",
+        )
+        for phase in phase_to_classes
+    }
+
+    return {
+        "training_mode": "non_exemplar_class_incremental",
+        "seed": protocol_seed,
+        "class_count": total_classes,
+        "base_classes": _exact_integer(
+            base_classes, name="base_classes", minimum=1
+        ),
+        "increment": _exact_integer(increment, name="increment", minimum=1),
+        "phase_sizes": phase_sizes,
+        "phase_to_classes": phase_to_classes,
+        "class_order_original_ids": order,
+        "original_to_global": original_to_global,
+        "global_to_original": global_to_original,
+        "original_labels": original_labels,
+        "global_labels": global_labels,
+        "global_target_names": global_names,
+        "split_by_class": split_by_class,
+        "phase_train_indices": phase_train,
+        "phase_val_indices": phase_val,
+        "phase_test_indices": phase_test,
+        "cumulative_test_indices": cumulative_test,
+        # Canonical preprocessing membership. This is exactly phase-0 TRAIN,
+        # not a second independently constructed split.
+        "base_train_indices": phase_train[0].copy(),
+        "split_strategy": strategy,
+        "spatial_partition_mode": (
+            "classwise_block_assignment"
+            if strategy == "spatial_block"
+            else "pixel_indices"
+        ),
+        "single_head_global_labels": True,
+        "current_phase_training_classes_only": True,
+        "cumulative_seen_class_evaluation": True,
+        "stores_old_training_samples": False,
+        "validation_enabled": bool(validation_enabled),
+        "preprocessing_fit_phase": 0,
+        "preprocessing_frozen_across_phases": True,
+    }
+
+
+class IncrementalHSIPatchDataset(Dataset):
+    def __init__(
+        self,
+        manager: "IncrementalHSIDatasetManager",
+        indices: Sequence[int],
+    ) -> None:
+        self.manager = manager
+        self.indices = _integer_array(indices, name="dataset indices").reshape(-1)
+        if self.indices.size == 0:
+            raise ValueError("dataset indices cannot be empty")
+        if self.indices.min() < 0 or self.indices.max() >= len(manager.labels):
+            raise ValueError("dataset indices are outside labelled samples")
+        if np.unique(self.indices).size != self.indices.size:
+            raise ValueError("dataset indices cannot contain duplicates")
+
+    def __len__(self) -> int:
+        return int(self.indices.size)
+
+    def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
+        item_id = _exact_integer(item, name="dataset item", minimum=0)
+        if item_id >= len(self):
+            raise IndexError(item_id)
+        sample_index = int(self.indices[item_id])
+        row, col = self.manager.coords[sample_index]
+        patch = self.manager.extract_patch(int(row), int(col))
+        raw_center_spectrum = self.manager.ordered_spectral_cube[
+            int(row), int(col)
+        ]
+        return {
+            "image": torch.from_numpy(
+                np.moveaxis(patch, -1, 0).copy()
+            ).float(),
+            "raw_center_spectrum": torch.from_numpy(
+                raw_center_spectrum.copy()
+            ).float(),
+            "label": torch.tensor(
+                int(self.manager.labels[sample_index]),
+                dtype=torch.long,
+            ),
+            "coord": torch.tensor(
+                (int(row), int(col)),
+                dtype=torch.long,
+            ),
+            "sample_index": torch.tensor(sample_index, dtype=torch.long),
+        }
+
+
+class IncrementalHSIDatasetManager:
+    """Current-class training and seen-class evaluation with spatial audits."""
 
     def __init__(
         self,
-        patches: np.ndarray,
+        *,
+        processed_cube: np.ndarray,
         labels: np.ndarray,
         coords: np.ndarray,
-        gt_shape: Tuple[int, int],
-        GT: np.ndarray,
-        base_classes: int,
-        increment: int,
-        train_ratio: float = 0.2,
-        val_ratio: float = 0.1,
-        seed: int = 42,
-        shuffle_order: bool = False,
-        device: str = "cuda",
-        min_train_per_class: int = 20,
+        protocol: Mapping[str, Any],
+        target_names: Sequence[str],
+        gt_shape: Sequence[int],
+        patch_size: int,
+        ordered_spectral_cube: Optional[np.ndarray] = None,
         num_workers: int = 0,
-        strict_non_exemplar: bool = True,
-        target_names: Optional[List[str]] = None,
-        label_policy: Optional[Dict] = None,
-        class_balanced_train_batches: bool = True,
-        geometry_batch_classes: int = 0,
-        geometry_samples_per_class: int = 0,
-        return_metadata: bool = False,
-        raw_spectra: Optional[np.ndarray] = None,
-        center_spectra: Optional[np.ndarray] = None,
-        spectra_are_physical: bool = False,
-    ):
-        # Raw arrays from ImageCubes.
-        self.patches = np.asarray(patches, dtype=np.float32)
-        self.labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-        self.coords = np.asarray(coords, dtype=np.int64)
-        self.gt_shape = gt_shape
-        self.GT = GT
-        self.spectra_are_physical = bool(spectra_are_physical)
-        # raw_spectra/center_spectra are per-sample physical center spectra aligned
-        # with patches/labels. They are descriptors metadata, not old exemplars;
-        # strict non-exemplar access rules below still prevent old raw train use.
-        raw_center = center_spectra if center_spectra is not None else raw_spectra
-        self.raw_spectra = None
-        if raw_center is not None:
-            raw_center = np.asarray(raw_center, dtype=np.float32)
-            if raw_center.ndim != 2:
-                raw_center = raw_center.reshape(len(self.labels), -1)
-            if len(raw_center) != len(self.labels):
-                raise ValueError(f"raw_spectra/label length mismatch: {len(raw_center)} vs {len(self.labels)}")
-            self.raw_spectra = np.ascontiguousarray(raw_center, dtype=np.float32)
-            if not np.isfinite(self.raw_spectra).all():
-                self.raw_spectra = np.nan_to_num(self.raw_spectra, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-            # Do NOT auto-mark metadata as physical.  In reduced-band PCA runs,
-            # center_spectra may be PCA/component vectors, not wavelength-ordered
-            # spectra.  The caller owns this flag.
-            self.spectra_are_physical = bool(spectra_are_physical)
-
-        if len(self.patches) != len(self.labels):
-            raise ValueError(f"patch/label length mismatch: {len(self.patches)} vs {len(self.labels)}")
-        if len(self.coords) != len(self.labels):
-            raise ValueError(f"coord/label length mismatch: {len(self.coords)} vs {len(self.labels)}")
-        if self.labels.size == 0:
-            raise ValueError("Empty labels passed to IncrementalHSIDataset.")
-        if self.labels.min() < 0:
-            raise ValueError(
-                f"Negative labels passed to IncrementalHSIDataset: min={self.labels.min()}. "
-                f"Loader must remove background/ignore labels before incremental split."
+        device: str = "cpu",
+        seed: Optional[int] = None,
+        require_patch_disjoint: bool = False,
+        require_phase_context_isolation: Optional[bool] = None,
+        context_policy: str = "full_scene_reflect",
+        **_: Any,
+    ) -> None:
+        self.processed_cube = np.ascontiguousarray(
+            processed_cube, dtype=np.float32
+        )
+        self.gt_shape = tuple(
+            _exact_integer(v, name="gt_shape value", minimum=1)
+            for v in gt_shape
+        )
+        self.coords = _integer_array(coords, name="coords")
+        supplied_labels = _integer_array(labels, name="labels").reshape(-1)
+        original_labels = _integer_array(
+            protocol["original_labels"], name="protocol original_labels"
+        ).reshape(-1)
+        global_labels = _integer_array(
+            protocol["global_labels"], name="protocol global labels"
+        ).reshape(-1)
+        if (
+            np.array_equal(
+                supplied_labels,
+                original_labels,
             )
-
-        # Settings.
-        self.base_classes = int(base_classes)
-        self.increment = int(increment)
-        self.train_ratio = float(train_ratio)
-        self.val_ratio = float(val_ratio)
-        self.seed = int(seed)
-        self.device = str(device)
-        self.min_train_per_class = int(min_train_per_class)
-        self.num_workers = int(num_workers)
-        self.strict_non_exemplar = bool(strict_non_exemplar)
-        self.class_balanced_train_batches = bool(class_balanced_train_batches)
-        self.geometry_batch_classes = int(geometry_batch_classes)
-        self.geometry_samples_per_class = int(geometry_samples_per_class)
-        self.return_metadata = bool(return_metadata)
-        self.target_names = target_names
-        self.label_policy = self._normalize_label_policy(label_policy)
-        self.has_background = bool(self.label_policy.get("has_background", True))
-        self.background_label = self.label_policy.get("background_label", 0 if self.has_background else None)
-        self.raw_class_values = [int(v) for v in self.label_policy.get("raw_class_values", [])]
-
-        self.pin_memory = self.device.startswith("cuda")
-
-        # Cache for semantic tokens / concept tokens.
-        self._semantic_token_cache: Dict[Tuple[int, str], torch.Tensor] = {}
-
-        # Protocol state.
-        self.current_phase: int = 0
-        self.finalized_phases: Set[int] = set()
-        self.finalized_classes: Set[int] = set()
-        self._memory_build_active: bool = False
-        self._memory_build_classes: Set[int] = set()
-
-        # Class order and remapping.
-        # labels may already be 0..K-1, but we still remap to sequential IDs
-        # according to class_order. If label 0 exists, it is included.
-        self.all_classes = sorted(int(x) for x in np.unique(self.labels).tolist())
-        if self.all_classes[0] != 0:
-            print(
-                f"[IncrementalHSIDataset:WARN] smallest label is {self.all_classes[0]}, "
-                f"not 0. The manager will remap to sequential IDs."
+            or np.array_equal(
+                supplied_labels,
+                global_labels,
             )
-
-        self.num_classes = len(self.all_classes)
-
-        if self.base_classes <= 0 or self.base_classes > self.num_classes:
-            raise ValueError(f"base_classes={self.base_classes} invalid for num_classes={self.num_classes}")
-        if self.increment <= 0:
-            raise ValueError(f"increment must be > 0, got {self.increment}")
-
-        if shuffle_order:
-            rng = np.random.RandomState(self.seed)
-            self.class_order = rng.permutation(self.all_classes).tolist()
+        ):
+            self.labels = global_labels
         else:
-            self.class_order = list(self.all_classes)
+            raise ValueError(
+                "labels do not match the protocol"
+            )
 
-        self.label_map = {global_id: seq_id for seq_id, global_id in enumerate(self.class_order)}
-        self.inv_label_map = {v: k for k, v in self.label_map.items()}
+        protocol_class_count = _exact_integer(
+            protocol["class_count"],
+            name="protocol class_count",
+            minimum=1,
+        )
+        observed_global_classes = sorted(
+            int(value)
+            for value in np.unique(self.labels)
+        )
+        if observed_global_classes != list(
+            range(protocol_class_count)
+        ):
+            raise ValueError(
+                "protocol global labels must contain exactly contiguous "
+                f"class IDs 0..{protocol_class_count - 1}; "
+                f"observed={observed_global_classes}"
+            )
 
-        self.remapped_labels = np.array(
-            [self.label_map[int(l)] for l in self.labels],
-            dtype=np.int64,
+        if (
+            self.processed_cube.ndim != 3
+            or self.processed_cube.shape[:2] != self.gt_shape
+            or self.processed_cube.shape[2] <= 0
+            or not np.isfinite(self.processed_cube).all()
+        ):
+            raise ValueError("processed_cube must be finite and match gt_shape")
+        if self.coords.shape != (len(self.labels), 2):
+            raise ValueError("coords must align with labels")
+        if np.unique(self.coords, axis=0).shape[0] != self.coords.shape[0]:
+            raise ValueError("coords contain duplicate labelled-pixel locations")
+        if (
+            np.any(self.coords[:, 0] < 0)
+            or np.any(self.coords[:, 0] >= self.gt_shape[0])
+            or np.any(self.coords[:, 1] < 0)
+            or np.any(self.coords[:, 1] >= self.gt_shape[1])
+        ):
+            raise ValueError("coords contain positions outside gt_shape")
+
+        if ordered_spectral_cube is None:
+            raise ValueError(
+                "ordered_spectral_cube is required for the raw spectral branch"
+            )
+        ordered = np.asarray(ordered_spectral_cube, dtype=np.float32)
+        if (
+            ordered.ndim != 3
+            or ordered.shape[:2] != self.gt_shape
+            or ordered.shape[2] <= 0
+            or not np.isfinite(ordered).all()
+        ):
+            raise ValueError("ordered_spectral_cube is invalid")
+        self.ordered_spectral_cube = np.ascontiguousarray(ordered)
+
+        self.patch_size = _exact_integer(
+            patch_size, name="patch_size", minimum=1
+        )
+        if self.patch_size % 2 == 0:
+            raise ValueError("patch_size must be odd")
+        radius = self.patch_size // 2
+        self.padded_cube = np.pad(
+            self.processed_cube,
+            ((radius, radius), (radius, radius), (0, 0)),
+            mode="reflect",
         )
 
-        # target_names provided by the loader are indexed by input label id
-        # after ImageCubes mapping. Convert them once to sequential phase ids.
-        self.target_names_by_seq = self._build_target_names_by_seq(target_names)
-
-        self._validate_class_zero_policy()
-        self._validate_full_class_coverage()
-
-        # Phase partition in sequential label space.
-        remaining_classes = self.num_classes - self.base_classes
-        self.num_phases = 1 + int(np.ceil(remaining_classes / self.increment))
-
-        self.phase_to_classes: Dict[int, List[int]] = {}
-        self.class_to_phase: Dict[int, int] = {}
-
-        for phase in range(self.num_phases):
-            if phase == 0:
-                cls_list = list(range(self.base_classes))
-            else:
-                start = self.base_classes + (phase - 1) * self.increment
-                end = min(start + self.increment, self.num_classes)
-                cls_list = list(range(start, end))
-
-            self.phase_to_classes[phase] = cls_list
-            for cls in cls_list:
-                self.class_to_phase[int(cls)] = int(phase)
-
-        self._create_splits()
-        self._validate_protocol_integrity()
-        self._print_stats()
-
-    # ============================================================
-    # Label policy helpers
-    # ============================================================
-    def _normalize_label_policy(self, label_policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Normalize dataset label metadata.
-
-        The incremental manager receives sequential training labels. Raw GT
-        background handling must be decided in the loader/ImageCubes stage. This
-        policy is carried here only for validation, reporting, and visualization.
-
-        Rules:
-            - if has_background=True, raw background is display-only and should
-              not appear in self.labels;
-            - if has_background=False, raw class 0 is allowed to be a real class;
-            - model/trainer class ids remain sequential 0..K-1 either way.
-        """
-        policy = dict(label_policy or {})
-
-        if "has_background" not in policy:
-            # Conservative default: most classic HSI datasets use raw 0 as background.
-            # Datasets with raw class 0 real must pass has_background=False from the loader.
-            policy["has_background"] = True
-
-        policy["has_background"] = bool(policy["has_background"])
-
-        if policy["has_background"]:
-            try:
-                policy["background_label"] = int(policy.get("background_label", 0))
-            except Exception:
-                policy["background_label"] = 0
-        else:
-            policy["background_label"] = None
-
-        raw_values = policy.get("raw_class_values", None)
-        if raw_values is None:
-            raw_values = []
-        policy["raw_class_values"] = [int(v) for v in raw_values]
-
-        return policy
-
-    # ============================================================
-    # Validation
-    # ============================================================
-    def _validate_class_zero_policy(self) -> None:
-        """
-        Validate class-0/background semantics without deleting label 0.
-
-        Important:
-            self.labels are already training labels from ImageCubes. They are
-            not necessarily raw GT labels. Therefore this method never assumes
-            input label 0 is background. It only checks consistency between the
-            loader-provided label_policy and the sequential label space.
-        """
-        input_has_zero = 0 in set(int(x) for x in self.labels.tolist())
-        remap_has_zero = 0 in set(int(x) for x in self.remapped_labels.tolist())
-
-        if input_has_zero and not remap_has_zero:
-            raise RuntimeError(
-                "Input label 0 existed but disappeared after incremental remapping. "
-                "This is invalid for datasets where class 0 is real and also invalid "
-                "for already-remapped foreground labels."
+        self.phase_to_classes = {
+            _exact_integer(phase, name="phase ID", minimum=0): _ids(
+                classes, name=f"phase_to_classes[{phase}]"
+            )
+            for phase, classes in protocol["phase_to_classes"].items()
+        }
+        if sorted(self.phase_to_classes) != list(range(len(self.phase_to_classes))):
+            raise ValueError("phase IDs must be contiguous from zero")
+        class_count = protocol_class_count
+        flattened = [
+            class_id
+            for phase in range(len(self.phase_to_classes))
+            for class_id in self.phase_to_classes[phase]
+        ]
+        if flattened != list(range(class_count)):
+            raise ValueError(
+                "phase schedule must cover global class IDs once in order"
             )
 
-        if not self.has_background:
-            # Raw class 0 may be a real class. This is valid. Do not warn just
-            # because sequential class 0 exists; it must exist in any sequential
-            # class space.
-            if self.raw_class_values and 0 not in self.raw_class_values:
-                print(
-                    "[IncrementalHSIDataset:WARN] label_policy says has_background=False, "
-                    "but raw_class_values does not include raw class 0. This may still be "
-                    "valid, but check the loader metadata."
+        # The protocol must expose one canonical base-training membership for
+        # preprocessing, and it must be exactly the phase-0 training split.
+        if "base_train_indices" not in protocol:
+            raise ValueError("protocol is missing base_train_indices")
+        if "phase_train_indices" not in protocol:
+            raise ValueError("protocol is missing phase_train_indices")
+        phase_train_indices = protocol["phase_train_indices"]
+        if not isinstance(phase_train_indices, Mapping) or 0 not in phase_train_indices:
+            raise ValueError("protocol phase_train_indices must contain phase 0")
+        base_train_indices = _integer_array(
+            protocol["base_train_indices"],
+            name="protocol base_train_indices",
+        ).reshape(-1)
+        phase0_train_indices = _integer_array(
+            phase_train_indices[0],
+            name="protocol phase_train_indices[0]",
+        ).reshape(-1)
+        if (
+            base_train_indices.size == 0
+            or phase0_train_indices.size == 0
+            or not np.array_equal(
+                np.sort(base_train_indices),
+                np.sort(phase0_train_indices),
+            )
+        ):
+            raise ValueError(
+                "protocol base_train_indices must equal phase_train_indices[0]"
+            )
+        self.base_train_indices = base_train_indices.copy()
+
+        self._split_by_class = {
+            _exact_integer(class_id, name="split class ID", minimum=0): {
+                name: _integer_array(
+                    values, name=f"class {class_id} {name} indices"
                 )
-        else:
-            # Background must have been removed before this manager. If raw
-            # background label was 0, sequential class 0 is still allowed because
-            # it now means the first foreground class, not background.
-            if self.background_label is None:
-                print(
-                    "[IncrementalHSIDataset:WARN] has_background=True but background_label is None. "
-                    "Visualization/reporting will treat display value 0 as background/unlabeled."
+                for name, values in row.items()
+            }
+            for class_id, row in protocol["split_by_class"].items()
+        }
+        _validate_split_by_class(
+            self._split_by_class, self.labels, class_count
+        )
+
+        # Validate every protocol membership field against the single canonical
+        # split_by_class state.  This prevents preprocessing/training/reporting
+        # from silently consuming different sample memberships.
+        for field, split_name in (
+            ("phase_train_indices", "train"),
+            ("phase_val_indices", "val"),
+            ("phase_test_indices", "test"),
+        ):
+            raw = protocol.get(field)
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"protocol {field} must be a phase mapping")
+            if set(int(key) for key in raw) != set(self.phase_to_classes):
+                raise ValueError(
+                    f"protocol {field} must contain every phase exactly once"
                 )
 
+            for phase_id, classes in self.phase_to_classes.items():
+                declared = _integer_array(
+                    raw[phase_id],
+                    name=f"protocol {field}[{phase_id}]",
+                ).reshape(-1)
+                expected = _collect_indices(
+                    self._split_by_class,
+                    classes,
+                    split_name,
+                )
+                if not np.array_equal(
+                    np.sort(declared),
+                    np.sort(expected),
+                ):
+                    raise ValueError(
+                        f"protocol {field}[{phase_id}] disagrees with split_by_class"
+                    )
 
-    def _build_target_names_by_seq(self, target_names: Optional[List[str]]) -> Optional[List[str]]:
-        if target_names is None:
-            return None
+        cumulative_test = protocol.get("cumulative_test_indices")
+        if not isinstance(cumulative_test, Mapping):
+            raise ValueError(
+                "protocol cumulative_test_indices must be a phase mapping"
+            )
+        if set(int(key) for key in cumulative_test) != set(self.phase_to_classes):
+            raise ValueError(
+                "protocol cumulative_test_indices must contain every phase"
+            )
+        for phase_id in self.phase_to_classes:
+            declared = _integer_array(
+                cumulative_test[phase_id],
+                name=f"protocol cumulative_test_indices[{phase_id}]",
+            ).reshape(-1)
+            expected = _collect_indices(
+                self._split_by_class,
+                self.get_seen_classes(phase_id),
+                "test",
+            )
+            if not np.array_equal(
+                np.sort(declared),
+                np.sort(expected),
+            ):
+                raise ValueError(
+                    "protocol cumulative_test_indices "
+                    f"[{phase_id}] disagrees with split_by_class"
+                )
 
-        out: List[str] = []
-        for sid in range(len(self.all_classes)):
-            gid = self.inv_label_map.get(sid, sid)
-            if int(gid) < len(target_names):
-                out.append(str(target_names[int(gid)]))
-            else:
-                out.append(f"Class {gid}")
-        return out
+        preprocessing_fit_phase = _exact_integer(
+            protocol.get("preprocessing_fit_phase", 0),
+            name="protocol preprocessing_fit_phase",
+            minimum=0,
+        )
+        if preprocessing_fit_phase != 0:
+            raise ValueError("persistent HSI preprocessing must be fitted in phase 0")
 
-    def _validate_full_class_coverage(self) -> None:
-        present = set(int(x) for x in np.unique(self.remapped_labels).tolist())
-        expected = set(range(self.num_classes))
-        missing = sorted(expected - present)
-        extra = sorted(present - expected)
-
-        if missing or extra:
-            raise RuntimeError(
-                f"Remapped label space is broken. Missing={missing}, extra={extra}, "
-                f"num_classes={self.num_classes}, class_order={self.class_order}"
+        preprocessing_frozen = _exact_bool(
+            protocol.get("preprocessing_frozen_across_phases", True),
+            name="protocol preprocessing_frozen_across_phases",
+        )
+        if not preprocessing_frozen:
+            raise ValueError(
+                "persistent HSI preprocessing must remain frozen across phases"
             )
 
-    def _validate_protocol_integrity(self) -> None:
-        """Fail fast on class-order, phase, and split corruption."""
-        phase_union: List[int] = []
-        for p in range(self.num_phases):
-            cls = self.phase_to_classes.get(p, [])
-            if not cls:
-                raise RuntimeError(f"Phase {p} has no classes.")
-            phase_union.extend(int(c) for c in cls)
-        if phase_union != list(range(self.num_classes)):
-            raise RuntimeError(
-                f"Phase partition must cover contiguous sequential ids exactly once. "
-                f"got={phase_union}, expected={list(range(self.num_classes))}"
+        names = [str(v) for v in target_names]
+        global_names = [
+            str(v) for v in protocol.get("global_target_names", [])
+        ]
+        if global_names and len(global_names) != class_count:
+            raise ValueError("protocol global_target_names has wrong length")
+        if not global_names and len(names) != class_count:
+            raise ValueError("target_names must contain one name per class")
+        self.class_order_original_ids = _ids(
+            protocol["class_order_original_ids"],
+            name="class_order_original_ids",
+        )
+        if set(self.class_order_original_ids) != set(range(class_count)):
+            raise ValueError(
+                "class_order_original_ids must be a complete original-class permutation"
             )
-        for c in range(self.num_classes):
-            if c not in self.class_to_phase:
-                raise RuntimeError(f"class_to_phase missing class {c}")
-        all_split = np.concatenate([self.train_indices, self.val_indices, self.test_indices]).astype(np.int64)
-        if all_split.size != len(np.unique(all_split)):
-            raise RuntimeError("Train/val/test splits overlap. This leaks samples across splits.")
-        valid = set(range(len(self.remapped_labels)))
-        bad = sorted(set(int(i) for i in all_split.tolist()).difference(valid))
-        if bad:
-            raise RuntimeError(f"Split indices outside dataset range: {bad[:10]}")
-        missing = sorted(valid.difference(set(int(i) for i in all_split.tolist())))
-        # A class with n=1 may be train-only, but every sample must still appear in exactly one split.
-        if missing:
-            raise RuntimeError(f"Some samples are absent from all splits: first_missing={missing[:10]}")
+        self.target_names = global_names or [
+            names[index] for index in self.class_order_original_ids
+        ]
+
+        self.global_to_original = {
+            _exact_integer(k, name="global class ID", minimum=0):
+            _exact_integer(v, name="original class ID", minimum=0)
+            for k, v in protocol["global_to_original"].items()
+        }
+        expected_global_to_original = {
+            global_id: original_id
+            for global_id, original_id in enumerate(self.class_order_original_ids)
+        }
+        if self.global_to_original != expected_global_to_original:
+            raise ValueError(
+                "global_to_original disagrees with class_order_original_ids"
+            )
+
+        self.split_strategy = str(protocol["split_strategy"]).strip().lower()
+        self.spatial_partition_mode = str(
+            protocol.get("spatial_partition_mode", "pixel_indices")
+        )
+
+        validation_presence = [
+            bool(self._split_by_class[class_id]["val"].size)
+            for class_id in range(class_count)
+        ]
+        if any(validation_presence) and not all(validation_presence):
+            raise ValueError(
+                "validation must be present for every class or absent for every class"
+            )
+        actual_validation_enabled = all(validation_presence)
+        declared_validation_enabled = _exact_bool(
+            protocol.get("validation_enabled", actual_validation_enabled),
+            name="protocol validation_enabled",
+        )
+        if declared_validation_enabled != actual_validation_enabled:
+            raise ValueError(
+                "protocol validation_enabled disagrees with validation split membership"
+            )
+        self.validation_enabled = actual_validation_enabled
+
+        self.require_patch_disjoint = _exact_bool(
+            require_patch_disjoint,
+            name="require_patch_disjoint",
+        )
+        self.require_phase_context_isolation = (
+            self.require_patch_disjoint
+            if require_phase_context_isolation is None
+            else _exact_bool(
+                require_phase_context_isolation,
+                name="require_phase_context_isolation",
+            )
+        )
+        self.context_policy = str(context_policy).strip()
+        if self.context_policy != "full_scene_reflect":
+            raise ValueError(
+                "only context_policy='full_scene_reflect' is implemented"
+            )
+
+        protocol_seed = _exact_integer(
+            protocol["seed"], name="protocol seed", minimum=0
+        )
+        self.seed = (
+            protocol_seed
+            if seed is None
+            else _exact_integer(seed, name="dataset-manager seed", minimum=0)
+        )
+        if self.seed != protocol_seed:
+            raise ValueError("dataset-manager seed disagrees with protocol seed")
+
+        self.num_workers = _exact_integer(
+            num_workers, name="num_workers", minimum=0
+        )
+        self.pin_memory = str(device).startswith("cuda")
+        self.current_phase: Optional[int] = None
+        self.finalized_phases: List[int] = []
+
+        self._split_patch_disjoint = self._audit_split_patch_disjoint()
+        self._phase_context_isolated = self._audit_phase_context_isolation()
+
+        if self.require_patch_disjoint and not self._split_patch_disjoint:
+            raise RuntimeError(
+                "train/val/test patch footprints overlap. A random-pixel centre "
+                "split is not spatial-leakage-free for patch models. Use a "
+                "guarded/predefined spatial split or explicitly disable the "
+                "strict audit only for benchmark-comparability experiments."
+            )
+        if (
+            self.require_phase_context_isolation
+            and not self._phase_context_isolated
+        ):
+            raise RuntimeError(
+                "at least one phase-training patch contains an annotated labeled "
+                "center unavailable in that phase (old, future, validation, or test). "
+                "This violates strict spatial phase isolation."
+            )
+
+    @property
+    def nb_tasks(self) -> int:
+        return len(self.phase_to_classes)
+
+    @property
+    def base_classes(self) -> List[int]:
+        return list(self.phase_to_classes[0])
 
     def _validate_phase(self, phase: int) -> int:
-        phase = int(phase)
-        if phase < 0 or phase >= self.num_phases:
-            raise ValueError(f"Invalid phase {phase}. Valid range: 0..{self.num_phases - 1}")
-        return phase
+        value = _exact_integer(phase, name="phase", minimum=0)
+        if value not in self.phase_to_classes:
+            raise ValueError(f"unknown phase {phase}")
+        return value
 
-    # ============================================================
-    # Basic mapping helpers
-    # ============================================================
-    def seq_to_global(self, seq_id: int) -> int:
-        return int(self.inv_label_map[int(seq_id)])
-
-    def global_to_seq(self, global_id: int) -> int:
-        return int(self.label_map[int(global_id)])
-
-    def get_phase_classes(self, phase: int) -> List[int]:
-        phase = self._validate_phase(phase)
-        return list(self.phase_to_classes[phase])
-
-    def get_classes_up_to_phase(self, phase: int) -> List[int]:
-        phase = self._validate_phase(phase)
-        classes: List[int] = []
-        for p in range(phase + 1):
-            classes.extend(self.phase_to_classes[p])
-        return _ordered_unique_ints(classes)
-
-    def get_seen_classes(self, phase: int) -> List[int]:
-        """Alias used by trainers/evaluators: cumulative sequential ids."""
-        return self.get_classes_up_to_phase(phase)
-
-    def get_old_classes(self, phase: int) -> List[int]:
-        phase = self._validate_phase(phase)
-        if phase == 0:
-            return []
-        return self.get_classes_up_to_phase(phase - 1)
-
-    def get_new_classes(self, phase: int) -> List[int]:
-        phase = self._validate_phase(phase)
-        return list(self.phase_to_classes[phase])
-
-    def get_future_classes(self, phase: int) -> List[int]:
-        phase = self._validate_phase(phase)
-        seen = set(self.get_seen_classes(phase))
-        return [int(c) for c in range(self.num_classes) if int(c) not in seen]
-
-    def classifier_num_classes_for_phase(self, phase: int) -> int:
-        """Required classifier width for global sequential CE/logits.
-
-        The project uses global sequential labels. Therefore phase ``p`` logits
-        must contain columns ``0..max(seen_classes)``. Since phases are allocated
-        in contiguous sequential ids, this equals ``len(seen_classes)``. Keeping
-        this method explicit catches accidental full-dataset classifier outputs
-        during early phases.
-        """
-        seen = self.get_seen_classes(phase)
-        if not seen:
-            raise RuntimeError(f"No seen classes for phase {phase}.")
-        expected = list(range(max(seen) + 1))
-        if seen != expected:
-            raise RuntimeError(
-                f"Seen classes are not contiguous global ids: seen={seen}, expected={expected}. "
-                "The trainer/classifier uses global sequential labels and requires contiguous phase ids."
-            )
-        return int(max(seen) + 1)
-
-    def get_phase_class_splits(self, phase: int) -> Dict[str, List[int]]:
-        phase = self._validate_phase(phase)
-        return {
-            "old": self.get_old_classes(phase),
-            "new": self.get_new_classes(phase),
-            "seen": self.get_seen_classes(phase),
-            "future": self.get_future_classes(phase),
-        }
-
-    def assert_classifier_contract(self, phase: int, logits_or_width: Any, *, context: str = "") -> None:
-        """Assert classifier output matches currently seen class space."""
-        phase = self._validate_phase(phase)
-        expected = self.classifier_num_classes_for_phase(phase)
-        if torch.is_tensor(logits_or_width):
-            if logits_or_width.dim() != 2:
-                raise RuntimeError(f"{context}: logits must be [B,C], got {tuple(logits_or_width.shape)}")
-            got = int(logits_or_width.size(1))
-        else:
-            got = int(logits_or_width)
-        if got != expected:
-            raise RuntimeError(
-                f"{context}: classifier width mismatch for phase {phase}: got {got}, expected {expected}. "
-                f"Seen classes={self.get_seen_classes(phase)}. Do not expose future-class logits during this phase."
-            )
-
-    def assert_labels_for_phase(
-        self,
-        labels: Any,
-        phase: int,
-        *,
-        context: str = "",
-        current_train_only: bool = False,
-        cumulative: bool = True,
-    ) -> None:
-        """Validate label tensors before CE/loss/evaluation.
-
-        ``current_train_only=True`` is for raw train batches in strict NECIL.
-        ``cumulative=True`` is for validation/test over all seen classes.
-        """
-        phase = self._validate_phase(phase)
-        y = _as_1d_int_array(labels.detach().cpu().numpy() if torch.is_tensor(labels) else labels, name="labels")
-        if y.min() < 0:
-            raise RuntimeError(f"{context}: negative labels entered phase {phase}: min={int(y.min())}")
-        allowed = self.get_new_classes(phase) if current_train_only else (self.get_seen_classes(phase) if cumulative else self.get_new_classes(phase))
-        allowed_set = set(int(c) for c in allowed)
-        bad = sorted(set(int(v) for v in y.tolist()).difference(allowed_set))
-        if bad:
-            raise RuntimeError(
-                f"{context}: labels outside allowed phase classes. bad={bad}, allowed={allowed}, "
-                f"phase={phase}, current_train_only={current_train_only}, cumulative={cumulative}"
-            )
-
-    def get_geometry_reservation_plan(self, phase: int = 0, *, feature_dim: Optional[int] = None, rank: Optional[int] = None) -> Dict[str, Any]:
-        """Return an abstract future-capacity plan without future data access.
-
-        This is safe for base training because it uses only the public protocol
-        schedule: number/order of classes and phase sizes. It does not expose
-        future patches, labels-per-sample, spectra, features, or class statistics.
-        """
-        phase = self._validate_phase(phase)
-        seen = self.get_seen_classes(phase)
-        future = self.get_future_classes(phase)
-        return {
-            "phase": int(phase),
-            "seen_classes": seen,
-            "future_class_slots": future,
-            "total_class_capacity": int(self.num_classes),
-            "seen_classifier_width": int(self.classifier_num_classes_for_phase(phase)),
-            "feature_dim": None if feature_dim is None else int(feature_dim),
-            "rank": None if rank is None else int(rank),
-            "allowed_reservation": [
-                "empty_geometry_rows",
-                "center_margin_budget",
-                "subspace_orthogonality_budget",
-                "residual_variance_floor",
-                "transport_trust_region_budget",
-            ],
-            "forbidden_reservation": [
-                "future_raw_patches",
-                "future_raw_spectra",
-                "future_feature_vectors",
-                "future_class_statistics",
-                "future_labels_in_base_loss",
-            ],
-        }
-
-    # ============================================================
-    # Protocol controls
-    # ============================================================
     def start_phase(self, phase: int) -> None:
-        phase = self._validate_phase(phase)
-        self.current_phase = phase
-        self._invalidate_train_caches_for_locked_classes()
+        value = self._validate_phase(phase)
+        if self.current_phase is not None:
+            raise RuntimeError(f"phase {self.current_phase} is already active")
+        if value in self.finalized_phases:
+            raise RuntimeError(f"phase {value} is already finalized")
+        if self.finalized_phases != list(range(value)):
+            raise RuntimeError(
+                "phases must start in order after prior finalization"
+            )
+        self.current_phase = value
 
     def finalize_phase(self, phase: int) -> None:
-        phase = self._validate_phase(phase)
+        value = self._validate_phase(phase)
+        if self.current_phase != value:
+            raise RuntimeError(f"phase {value} is not the active phase")
+        self.finalized_phases.append(value)
+        self.current_phase = None
 
-        self.finalized_phases.add(phase)
-        self.finalized_classes.update(self.phase_to_classes[phase])
-        self._memory_build_active = False
-        self._memory_build_classes.clear()
-        self._invalidate_train_caches_for_locked_classes()
-
-    def is_phase_finalized(self, phase: int) -> bool:
-        return int(phase) in self.finalized_phases
-
-    def is_class_finalized(self, cls: int) -> bool:
-        return int(cls) in self.finalized_classes
-
-    def get_accessible_train_classes(self) -> List[int]:
-        if not self.strict_non_exemplar:
-            return list(range(self.num_classes))
-        return list(self.phase_to_classes[self.current_phase])
-
-    def _invalidate_train_caches_for_locked_classes(self) -> None:
-        keys_to_delete = []
-        accessible = set(self.get_accessible_train_classes())
-
-        for key in list(self._semantic_token_cache.keys()):
-            cls, descriptor = key
-            if "_train" not in descriptor:
-                continue
-            if self.strict_non_exemplar and int(cls) not in accessible:
-                keys_to_delete.append(key)
-
-        for k in keys_to_delete:
-            del self._semantic_token_cache[k]
-
-    def _is_train_access_allowed(self, cls: int) -> bool:
-        """Return whether raw TRAIN samples of ``cls`` may be read now.
-
-        This is the strict exemplar-free access contract. Once a phase is
-        finalized, its raw training samples are old exemplars and must never be
-        exposed again. The only exception is the short memory_build_context for
-        the current phase before finalization, where descriptors are being built
-        from current-class data.
-        """
-        cls = int(cls)
-        if cls < 0 or cls >= self.num_classes:
-            raise ValueError(f"class id {cls} outside sequential label space [0,{self.num_classes - 1}]")
-
-        if not self.strict_non_exemplar:
-            return True
-
-        if cls in self.finalized_classes:
-            return False
-
-        if self._memory_build_active and cls in self._memory_build_classes:
-            return True
-
-        if cls in self.phase_to_classes[self.current_phase]:
-            return True
-
-        return False
-
-    def _check_class_split_access(self, cls: int, split: str) -> None:
-        cls = int(cls)
-        split = str(split).lower()
-
-        if cls < 0 or cls >= self.num_classes:
-            raise ValueError(f"class id {cls} outside sequential label space [0,{self.num_classes - 1}]")
-
-        if split != "train":
-            return
-
-        if not self._is_train_access_allowed(cls):
-            phase_of_cls = self.class_to_phase.get(cls, None)
-            raise PermissionError(
-                f"Strict non-exemplar protocol violation: raw TRAIN access denied for class {cls} "
-                f"(phase={phase_of_cls}, current_phase={self.current_phase}, finalized={cls in self.finalized_classes}, "
-                f"memory_build_active={self._memory_build_active}). Use GeometryBank descriptors / synthetic geometry replay, "
-                f"not old raw patches or old raw spectra."
-            )
-
-    @contextmanager
-    def memory_build_context(self, phase: int):
-        phase = int(phase)
-        if phase != self.current_phase:
-            raise ValueError(
-                f"memory_build_context phase={phase} must match current_phase={self.current_phase}"
-            )
-
-        allowed_classes = set(self.phase_to_classes[phase])
-
-        prev_active = self._memory_build_active
-        prev_classes = set(self._memory_build_classes)
-
-        self._memory_build_active = True
-        self._memory_build_classes = allowed_classes
-
-        try:
-            yield
-        finally:
-            self._memory_build_active = prev_active
-            self._memory_build_classes = prev_classes
-
-    # ============================================================
-    # Split creation
-    # ============================================================
-    def _create_splits(self) -> None:
-        self.train_indices: List[int] = []
-        self.val_indices: List[int] = []
-        self.test_indices: List[int] = []
-
-        for seq_id in range(self.num_classes):
-            class_indices = np.where(self.remapped_labels == seq_id)[0]
-            n_samples = len(class_indices)
-
-            if n_samples == 0:
-                continue
-
-            rng = np.random.RandomState(self.seed + seq_id)
-            shuffled = rng.permutation(class_indices)
-
-            if n_samples == 1:
-                self.train_indices.extend(shuffled.tolist())
-                continue
-
-            if n_samples == 2:
-                self.train_indices.append(int(shuffled[0]))
-                self.test_indices.append(int(shuffled[1]))
-                continue
-
-            n_train = max(self.min_train_per_class, int(round(n_samples * self.train_ratio)))
-            n_val = max(1, int(round(n_samples * self.val_ratio)))
-
-            if n_train + n_val >= n_samples:
-                overflow = (n_train + n_val) - (n_samples - 1)
-
-                reduce_val = min(overflow, max(0, n_val - 1))
-                n_val -= reduce_val
-                overflow -= reduce_val
-
-                if overflow > 0:
-                    n_train = max(1, n_train - overflow)
-
-            n_train = max(1, min(n_train, n_samples - 2))
-            n_val = max(1, min(n_val, n_samples - n_train - 1))
-            n_test = n_samples - n_train - n_val
-
-            assert n_train >= 1
-            assert n_val >= 1
-            assert n_test >= 1
-            assert n_train + n_val + n_test == n_samples
-
-            self.train_indices.extend(shuffled[:n_train].tolist())
-            self.val_indices.extend(shuffled[n_train:n_train + n_val].tolist())
-            self.test_indices.extend(shuffled[n_train + n_val:].tolist())
-
-        self.train_indices = np.array(self.train_indices, dtype=np.int64)
-        self.val_indices = np.array(self.val_indices, dtype=np.int64)
-        self.test_indices = np.array(self.test_indices, dtype=np.int64)
-
-    # ============================================================
-    # Diagnostics
-    # ============================================================
-    def _print_stats(self) -> None:
-        print("[IncrementalHSIDataset] Initialized")
-        print(f"  Total classes: {self.num_classes} | Phases: {self.num_phases}")
-        print(f"  Input classes: {self.all_classes}")
-        print(f"  Class order: {self.class_order}")
-        print(f"  Strict non-exemplar: {self.strict_non_exemplar}")
-        print(
-            f"  Spectral metadata: available={self.has_spectral_metadata()}, "
-            f"physical={self.has_physical_spectra()}, dim={self.get_spectra_dim()}"
-        )
-        print(
-            f"  Label policy: has_background={self.has_background}, "
-            f"background_label={self.background_label}, raw_class_values={self.raw_class_values}"
-        )
-        print(
-            "  Sequential class 0 present: "
-            f"{0 in set(int(x) for x in self.remapped_labels.tolist())} "
-            "(sequential class 0 is a real foreground training class, not background)"
-        )
-
-        print(f"  Split sizes: train={len(self.train_indices)} | val={len(self.val_indices)} | test={len(self.test_indices)}")
-
-        for p in range(self.num_phases):
-            global_ids = [self.seq_to_global(sid) for sid in self.phase_to_classes[p]]
-            names = []
-            if self.target_names_by_seq is not None:
-                for sid in self.phase_to_classes[p]:
-                    if int(sid) < len(self.target_names_by_seq):
-                        names.append(self.target_names_by_seq[int(sid)])
-                    else:
-                        names.append(f"Class {self.seq_to_global(sid)}")
-            print(f"  Phase {p}: Sequential {self.phase_to_classes[p]} (Input labels {global_ids})")
-            if names:
-                print(f"           Names: {names}")
-
-    def get_label_policy_summary(self) -> Dict[str, Any]:
-        return {
-            "has_background": bool(self.has_background),
-            "background_label": self.background_label,
-            "raw_class_values": list(self.raw_class_values),
-            "class_order": [int(c) for c in self.class_order],
-            "label_map": {int(k): int(v) for k, v in self.label_map.items()},
-            "inv_label_map": {int(k): int(v) for k, v in self.inv_label_map.items()},
-            "note": (
-                "Training labels are sequential 0..K-1. Display value 0 in maps "
-                "is reserved for background/unseen/suppressed; class c is displayed as c+1."
-            ),
-        }
-
-    def has_spectral_metadata(self) -> bool:
-        return self.raw_spectra is not None and int(self.raw_spectra.size) > 0
-
-    def has_physical_spectra(self) -> bool:
-        return bool(self.has_spectral_metadata() and self.spectra_are_physical)
-
-    def get_spectra_dim(self) -> int:
-        if self.raw_spectra is None or self.raw_spectra.ndim != 2:
-            return 0
-        return int(self.raw_spectra.shape[1])
-
-    def get_spectral_metadata_summary(self) -> Dict[str, Any]:
-        return {
-            "available": bool(self.has_spectral_metadata()),
-            "physical": bool(self.has_physical_spectra()),
-            "dim": int(self.get_spectra_dim()),
-            "note": (
-                "Physical spectra are wavelength-ordered raw center spectra for SCB-GR spectral-risk mining. "
-                "If physical=False, the metadata must not be used for derivative spectral-shape scoring."
-            ),
-        }
-
-    def _spectra_for_indices(self, idx: np.ndarray, *, require_physical: bool = True) -> torch.Tensor:
-        if self.raw_spectra is None:
-            raise AttributeError("No center-spectral metadata are available in this dataset.")
-        if bool(require_physical) and not bool(self.spectra_are_physical):
-            raise RuntimeError(
-                "Requested physical center spectra, but IncrementalHSIDataset.spectra_are_physical=False. "
-                "This usually means the metadata are PCA/reduced components. Do not use them for spectral derivatives."
-            )
-        if len(idx) == 0:
-            raise ValueError("No indices provided for spectral metadata lookup.")
-        return torch.from_numpy(np.ascontiguousarray(self.raw_spectra[idx])).float()
-
-    def get_class_spectra(self, cls: int, split: str = "train", require_physical: bool = True) -> torch.Tensor:
-        """Return per-sample center spectra for one class/split.
-
-        By default this returns only physical wavelength-ordered spectra.  This
-        is deliberate: trainer/helper code may use this method for SCB-GR
-        spectral-shape descriptors, where PCA/reduced components would be wrong.
-
-        The same strict non-exemplar access rule as get_class_patches applies:
-        old train spectra are denied after their phase is finalized. They are
-        not old exemplars; they are used only while building the current class
-        geometry state.
-        """
-        idx = self.get_class_indices(int(cls), split=split)
-        if len(idx) == 0:
-            raise ValueError(f"No spectra found for class {cls} in split '{split}'")
-        return self._spectra_for_indices(idx, require_physical=bool(require_physical))
-
-    def get_class_center_spectra(self, cls: int, split: str = "train") -> torch.Tensor:
-        return self.get_class_spectra(cls, split=split, require_physical=True)
-
-    def get_class_raw_spectra(self, cls: int, split: str = "train") -> torch.Tensor:
-        return self.get_class_spectra(cls, split=split, require_physical=True)
-
-    def get_class_spectral_summary(self, cls: int, split: str = "train") -> torch.Tensor:
-        # Keep this conservative. Reduced/non-physical spectra are already
-        # available from the patch center through the model/helper fallback.
-        return self.get_class_spectra(cls, split=split, require_physical=True)
-
-    def get_class_counts(self) -> Dict[int, int]:
-        return {
-            int(c): int((self.remapped_labels == int(c)).sum())
-            for c in range(self.num_classes)
-        }
-
-    def get_split_class_counts(self, split: str = "train") -> Dict[int, int]:
-        indices = self._get_split_indices(split)
-        return {
-            int(c): int((self.remapped_labels[indices] == int(c)).sum())
-            for c in range(self.num_classes)
-        }
-
-    def protocol_state(self) -> Dict[str, object]:
-        return {
-            "current_phase": int(self.current_phase),
-            "strict_non_exemplar": bool(self.strict_non_exemplar),
-            "finalized_phases": sorted(int(p) for p in self.finalized_phases),
-            "finalized_classes": sorted(int(c) for c in self.finalized_classes),
-            "accessible_train_classes": self.get_accessible_train_classes(),
-            "phase_class_splits": self.get_phase_class_splits(self.current_phase),
-            "classifier_width": self.classifier_num_classes_for_phase(self.current_phase),
-            "memory_build_active": bool(self._memory_build_active),
-            "memory_build_classes": sorted(int(c) for c in self._memory_build_classes),
-            "spectral_metadata": self.get_spectral_metadata_summary(),
-        }
-
-    def assert_no_old_train_access(self, cls: int) -> None:
-        self._check_class_split_access(int(cls), "train")
-
-    def _assert_indices_match_classes(self, idx: np.ndarray, class_ids: Sequence[int], *, context: str) -> None:
-        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
-        class_ids = _ordered_unique_ints(class_ids)
-        if idx.size == 0:
-            return
-        if idx.min() < 0 or idx.max() >= len(self.remapped_labels):
-            raise RuntimeError(f"{context}: indices outside dataset range.")
-        allowed = set(int(c) for c in class_ids)
-        labels = self.remapped_labels[idx]
-        bad = sorted(set(int(v) for v in labels.tolist()).difference(allowed))
-        if bad:
-            raise RuntimeError(f"{context}: indices contain labels outside active classes. bad={bad}, allowed={class_ids}")
-
-    def _make_loader(
+    def restore_finalized_phases(
         self,
-        idx: np.ndarray,
+        phases: Sequence[int],
+    ) -> None:
+        """Restore checkpoint protocol state without exposing historical data."""
+        if self.current_phase is not None:
+            raise RuntimeError(
+                "cannot restore finalized phases while a phase is active"
+            )
+        if self.finalized_phases:
+            raise RuntimeError(
+                "restore_finalized_phases requires a fresh unfinalized manager"
+            )
+        values = [
+            self._validate_phase(value)
+            for value in phases
+        ]
+        if values != list(range(len(values))):
+            raise ValueError(
+                "restored finalized phases must be contiguous from zero"
+            )
+        self.finalized_phases = values
+
+    def get_task_size(self, phase: int) -> int:
+        return len(self.phase_to_classes[self._validate_phase(phase)])
+
+    def get_new_classes(self, phase: int) -> List[int]:
+        return list(self.phase_to_classes[self._validate_phase(phase)])
+
+    def get_old_classes(self, phase: int) -> List[int]:
+        value = self._validate_phase(phase)
+        return [
+            class_id
+            for previous in range(value)
+            for class_id in self.phase_to_classes[previous]
+        ]
+
+    def get_seen_classes(self, phase: int) -> List[int]:
+        return self.get_old_classes(phase) + self.get_new_classes(phase)
+
+    def extract_patch(self, row: int, col: int) -> np.ndarray:
+        row_id = _exact_integer(row, name="patch row", minimum=0)
+        col_id = _exact_integer(col, name="patch col", minimum=0)
+        if row_id >= self.gt_shape[0] or col_id >= self.gt_shape[1]:
+            raise ValueError("patch centre lies outside gt_shape")
+        return self.padded_cube[
+            row_id : row_id + self.patch_size,
+            col_id : col_id + self.patch_size,
+        ]
+
+    def _indices_mask(self, indices: np.ndarray) -> np.ndarray:
+        mask = np.zeros(self.gt_shape, dtype=bool)
+        values = _integer_array(indices, name="audit indices").reshape(-1)
+        if values.size:
+            if values.min() < 0 or values.max() >= len(self.labels):
+                raise ValueError("audit indices are outside labelled samples")
+            if np.unique(values).size != values.size:
+                raise ValueError("audit indices contain duplicates")
+            xy = self.coords[values]
+            mask[xy[:, 0], xy[:, 1]] = True
+        return mask
+
+    def _patch_overlap_count(
+        self,
+        left_indices: np.ndarray,
+        right_indices: np.ndarray,
+    ) -> int:
+        """Count left centers whose extracted patch overlaps a right patch."""
+        left = _integer_array(left_indices, name="left indices").reshape(-1)
+        right = _integer_array(right_indices, name="right indices").reshape(-1)
+        if left.size == 0 or right.size == 0:
+            return 0
+
+        # Two odd P x P patches overlap when center Chebyshev distance <= P-1.
+        from scipy.ndimage import maximum_filter
+
+        right_mask = self._indices_mask(right)
+        radius = self.patch_size - 1
+        dilated = (
+            right_mask
+            if radius == 0
+            else maximum_filter(
+                right_mask.astype(np.uint8),
+                size=2 * radius + 1,
+                mode="constant",
+                cval=0,
+            ).astype(bool)
+        )
+        xy = self.coords[left]
+        return int(dilated[xy[:, 0], xy[:, 1]].sum())
+
+    def _forbidden_center_in_patch_count(
+        self,
+        train_indices: np.ndarray,
+        forbidden_indices: np.ndarray,
+    ) -> int:
+        """Count train patches containing an unavailable labeled center.
+
+        This differs from patch-vs-patch overlap. During phase-t training the
+        unavailable old/future/validation/test sample is not itself extracted as
+        a patch. The strict observable leakage event is that its labeled center
+        spectrum lies inside the current train patch.
+        """
+        train = _integer_array(train_indices, name="train indices").reshape(-1)
+        forbidden = _integer_array(
+            forbidden_indices, name="forbidden indices"
+        ).reshape(-1)
+        if train.size == 0 or forbidden.size == 0:
+            return 0
+
+        from scipy.ndimage import maximum_filter
+
+        forbidden_mask = self._indices_mask(forbidden)
+        radius = self.patch_size // 2
+        dilated = (
+            forbidden_mask
+            if radius == 0
+            else maximum_filter(
+                forbidden_mask.astype(np.uint8),
+                size=2 * radius + 1,
+                mode="constant",
+                cval=0,
+            ).astype(bool)
+        )
+        xy = self.coords[train]
+        return int(dilated[xy[:, 0], xy[:, 1]].sum())
+
+    def _audit_split_patch_disjoint(self) -> bool:
+        all_classes = list(range(len(self._split_by_class)))
+        split_indices = {
+            split: _collect_indices(
+                self._split_by_class, all_classes, split
+            )
+            for split in _SPLITS
+        }
+        for left_index, left_name in enumerate(_SPLITS):
+            for right_name in _SPLITS[left_index + 1 :]:
+                if self._patch_overlap_count(
+                    split_indices[left_name],
+                    split_indices[right_name],
+                ):
+                    return False
+        return True
+
+    def _audit_phase_context_isolation(self) -> bool:
+        all_indices = np.arange(len(self.labels), dtype=np.int64)
+        for phase in range(self.nb_tasks):
+            available = _collect_indices(
+                self._split_by_class,
+                self.phase_to_classes[phase],
+                "train",
+            )
+            available_set = np.zeros(len(self.labels), dtype=bool)
+            available_set[available] = True
+            forbidden = all_indices[~available_set]
+            if self._forbidden_center_in_patch_count(available, forbidden):
+                return False
+        return True
+
+    def spatial_leakage_report(self) -> Dict[str, Any]:
+        return {
+            "patch_size": self.patch_size,
+            "split_patch_disjoint": bool(self._split_patch_disjoint),
+            "phase_training_context_isolated": bool(
+                self._phase_context_isolated
+            ),
+            "strict_split_required": self.require_patch_disjoint,
+            "strict_phase_context_required": self.require_phase_context_isolation,
+            "context_policy": self.context_policy,
+            "guarantee_scope": (
+                "train/val/test extracted patch footprints plus unavailable annotated "
+                "labeled centers inside phase-training patches; unlabeled/background "
+                "scene pixels cannot be assigned a task identity by the benchmark"
+            ),
+        }
+
+    def _make_dataset(
+        self,
+        class_ids: Sequence[int],
+        split: str,
+    ) -> IncrementalHSIPatchDataset:
+        return IncrementalHSIPatchDataset(
+            self,
+            _collect_indices(self._split_by_class, class_ids, split),
+        )
+
+    def _loader(
+        self,
+        dataset: Dataset,
+        *,
         batch_size: int,
         shuffle: bool,
-        *,
-        balanced: bool = False,
-        active_classes: Optional[List[int]] = None,
+        phase: int,
+        split: str,
     ) -> DataLoader:
-        idx = np.asarray(idx, dtype=np.int64)
-        if idx.size == 0:
-            raise ValueError(
-                "Requested DataLoader has zero samples. Check phase split, class order, "
-                "or strict non-exemplar access policy."
-            )
-
-        dataset = HSIPatchDataset(
-            self.patches[idx],
-            self.remapped_labels[idx],
-            coords=self.coords[idx],
-            return_metadata=self.return_metadata,
-            center_spectra=(self.raw_spectra[idx] if self.has_physical_spectra() else None),
-            spectra_are_physical=bool(self.has_physical_spectra()),
-            return_input_center_when_no_spectra=False,
+        size = _exact_integer(batch_size, name="batch_size", minimum=1)
+        phase_id = self._validate_phase(phase)
+        offset = {"train": 11, "val": 17, "test": 23, "all": 29}[split]
+        generator = torch.Generator().manual_seed(
+            self.seed + 1009 * phase_id + offset
         )
-
-        if balanced:
-            present = sorted(int(c) for c in dataset.labels.unique().tolist())
-            if len(present) <= 1:
-                return DataLoader(
-                    dataset,
-                    batch_size=int(batch_size),
-                    shuffle=bool(shuffle),
-                    pin_memory=self.pin_memory,
-                    num_workers=self.num_workers,
-                    drop_last=False,
-                )
-
-            classes_per_batch = int(self.geometry_batch_classes)
-            if classes_per_batch <= 0:
-                classes_per_batch = len(active_classes) if active_classes is not None else len(present)
-            classes_per_batch = max(2, min(classes_per_batch, len(present), int(batch_size)))
-
-            samples_per_class = int(self.geometry_samples_per_class)
-            if samples_per_class <= 0:
-                samples_per_class = max(2, int(batch_size) // classes_per_batch)
-
-            sampler = ClassBalancedBatchSampler(
-                labels=dataset.labels,
-                batch_size=int(batch_size),
-                classes_per_batch=classes_per_batch,
-                samples_per_class=samples_per_class,
-                seed=self.seed + self.current_phase * 1009,
-                drop_last=False,
-            )
-
-            return DataLoader(
-                dataset,
-                batch_sampler=sampler,
-                pin_memory=self.pin_memory,
-                num_workers=self.num_workers,
-            )
-
         return DataLoader(
             dataset,
-            batch_size=int(batch_size),
+            batch_size=size,
             shuffle=bool(shuffle),
-            pin_memory=self.pin_memory,
             num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
             drop_last=False,
+            persistent_workers=self.num_workers > 0,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
+            generator=generator,
         )
-
-    # ============================================================
-    # Split access helpers
-    # ============================================================
-    def _get_split_indices(self, split: str) -> np.ndarray:
-        split = split.lower()
-        if split == "train":
-            return self.train_indices
-        if split == "val":
-            return self.val_indices
-        if split == "test":
-            return self.test_indices
-        if split == "all":
-            return np.arange(len(self.remapped_labels), dtype=np.int64)
-        raise ValueError(f"Unknown split '{split}'. Use one of: train, val, test, all")
-
-    def get_class_indices(self, cls: int, split: str = "train") -> np.ndarray:
-        cls = int(cls)
-        split = split.lower()
-        self._check_class_split_access(cls, split)
-
-        indices = self._get_split_indices(split)
-        mask = self.remapped_labels[indices] == cls
-        return indices[mask]
-
-    def get_class_patches(self, cls: int, split: str = "train") -> np.ndarray:
-        idx = self.get_class_indices(cls, split=split)
-        if len(idx) == 0:
-            raise ValueError(f"No samples found for class {cls} in split '{split}'")
-        return self.patches[idx]
-
-    # ============================================================
-    # DataLoaders
-    # ============================================================
-    def get_class_balanced_phase_loader(
-        self,
-        phase: int,
-        split: str = "train",
-        batch_size: int = 64,
-        shuffle: bool = True,
-    ) -> DataLoader:
-        """Return a class-balanced phase loader for geometry construction/refinement.
-
-        This is a named wrapper so the trainer can request balanced current-phase
-        batches without relying on implicit flags.  It preserves strict
-        non-exemplar access: train split exposes only current-phase raw samples.
-        """
-        old_flag = self.class_balanced_train_batches
-        try:
-            self.class_balanced_train_batches = True
-            return self.get_phase_dataloader(
-                phase=phase,
-                split=split,
-                batch_size=batch_size,
-                shuffle=shuffle,
-            )
-        finally:
-            self.class_balanced_train_batches = old_flag
 
     def get_phase_dataloader(
         self,
@@ -1122,226 +1386,153 @@ class IncrementalHSIDataset:
         batch_size: int = 64,
         shuffle: bool = True,
     ) -> DataLoader:
-        phase = self._validate_phase(phase)
-        split = split.lower()
-
-        active_classes = self.phase_to_classes[phase]
-
-        if split == "train":
-            if self.strict_non_exemplar and phase != self.current_phase:
-                raise PermissionError(
-                    f"Raw TRAIN loader requested for phase {phase}, but current_phase is {self.current_phase}. "
-                    "Strict non-exemplar mode only allows current-phase raw train access."
-                )
-
-        indices = self._get_split_indices(split)
-        mask = np.isin(self.remapped_labels[indices], active_classes)
-        idx = indices[mask]
-        self._assert_indices_match_classes(idx, active_classes, context=f"get_phase_dataloader({split}, phase={phase})")
-
-        use_balanced = (
-            split == "train"
-            and bool(self.class_balanced_train_batches)
-            and bool(shuffle)
+        phase_id = self._validate_phase(phase)
+        if self.current_phase != phase_id:
+            raise RuntimeError(
+                "phase train/validation loaders require an active phase"
+            )
+        token = _normalize_split_name(split)
+        if token not in {"train", "val"}:
+            raise ValueError("active phase loaders are train/val only")
+        if token == "val" and not self.validation_enabled:
+            raise RuntimeError("validation is disabled by this experiment protocol")
+        dataset = self._make_dataset(
+            self.get_new_classes(phase_id), token
         )
-
-        return self._make_loader(
-            idx,
+        return self._loader(
+            dataset,
             batch_size=batch_size,
-            shuffle=(shuffle if split == "train" else False),
-            balanced=use_balanced,
-            active_classes=active_classes,
+            shuffle=shuffle if token == "train" else False,
+            phase=phase_id,
+            split=token,
         )
 
     def get_cumulative_dataloader(
         self,
-        up_to_phase: int,
-        split: str = "train",
-        batch_size: int = 64,
-        shuffle: bool = True,
-        allow_train_old: bool = False,
+        phase: int,
+        split: str = "test",
+        batch_size: int = 256,
+        shuffle: bool = False,
     ) -> DataLoader:
-        up_to_phase = self._validate_phase(up_to_phase)
-        split = split.lower()
-
-        if split == "train" and self.strict_non_exemplar:
-            if bool(allow_train_old):
-                raise PermissionError(
-                    "allow_train_old=True would expose raw old training samples in strict non-exemplar mode. "
-                    "Use GeometryBank synthetic replay instead."
-                )
-            # Critical protocol rule: training loaders expose only current-phase raw samples.
-            active_classes = list(self.phase_to_classes[self.current_phase])
-        else:
-            active_classes = self.get_seen_classes(up_to_phase)
-
-        indices = self._get_split_indices(split)
-        mask = np.isin(self.remapped_labels[indices], active_classes)
-        idx = indices[mask]
-
-        self._assert_indices_match_classes(idx, active_classes, context=f"get_cumulative_dataloader({split}, phase={up_to_phase})")
-
-        use_balanced = (
-            split == "train"
-            and bool(self.class_balanced_train_batches)
-            and bool(shuffle)
+        phase_id = self._validate_phase(phase)
+        if phase_id not in self.finalized_phases:
+            raise RuntimeError(
+                "cumulative evaluation requires a finalized phase"
+            )
+        token = _normalize_split_name(split)
+        if token not in {"val", "test"}:
+            raise ValueError("cumulative loaders are evaluation-only")
+        if token == "val" and not self.validation_enabled:
+            raise RuntimeError("validation is disabled by this experiment protocol")
+        dataset = self._make_dataset(
+            self.get_seen_classes(phase_id), token
         )
-
-        return self._make_loader(
-            idx,
+        return self._loader(
+            dataset,
             batch_size=batch_size,
-            shuffle=(shuffle if split == "train" else False),
-            balanced=use_balanced,
-            active_classes=active_classes,
+            shuffle=bool(shuffle),
+            phase=phase_id,
+            split=token,
         )
 
-    def get_cumulative_test_data(self, phase: int):
-        phase = self._validate_phase(phase)
-        active_classes = self.get_seen_classes(phase)
-        mask = np.isin(self.remapped_labels[self.test_indices], active_classes)
-        idx = self.test_indices[mask]
-        self._assert_indices_match_classes(idx, active_classes, context=f"get_cumulative_test_data(phase={phase})")
-        return self.patches[idx], self.remapped_labels[idx], self.coords[idx]
-
-    def get_cumulative_val_data(self, phase: int):
-        phase = self._validate_phase(phase)
-        active_classes = self.get_seen_classes(phase)
-        mask = np.isin(self.remapped_labels[self.val_indices], active_classes)
-        idx = self.val_indices[mask]
-        self._assert_indices_match_classes(idx, active_classes, context=f"get_cumulative_val_data(phase={phase})")
-        return self.patches[idx], self.remapped_labels[idx], self.coords[idx]
-
-    def get_current_train_data(self, phase: Optional[int] = None):
-        phase = self.current_phase if phase is None else self._validate_phase(phase)
-        if self.strict_non_exemplar and int(phase) != int(self.current_phase):
-            raise PermissionError(
-                f"Raw train data requested for phase {phase}, but current_phase={self.current_phase}. "
-                "Strict NECIL exposes only current-phase train samples."
-            )
-        active_classes = self.get_new_classes(phase)
-        mask = np.isin(self.remapped_labels[self.train_indices], active_classes)
-        idx = self.train_indices[mask]
-        self._assert_indices_match_classes(idx, active_classes, context=f"get_current_train_data(phase={phase})")
-        return self.patches[idx], self.remapped_labels[idx], self.coords[idx]
-
-    # ============================================================
-    # K-means concept extraction
-    # ============================================================
-    def _kmeans_numpy(
+    def get_reporting_dataloader(
         self,
-        x: np.ndarray,
-        k: int,
-        seed: int = 42,
-        max_iters: int = 30,
-    ) -> np.ndarray:
-        if x.ndim != 2:
-            raise ValueError(f"Expected x to be 2D, got shape={x.shape}")
-
-        n, d = x.shape
-        if n == 0:
-            raise ValueError("Empty input to k-means")
-
-        k = max(1, min(int(k), n))
-        rng = np.random.RandomState(seed)
-
-        centers = np.empty((k, d), dtype=np.float32)
-        first = rng.randint(0, n)
-        centers[0] = x[first]
-        dist2 = ((x - centers[0]) ** 2).sum(axis=1)
-
-        for i in range(1, k):
-            probs = dist2 / max(dist2.sum(), 1e-12)
-            idx = rng.choice(n, p=probs)
-            centers[i] = x[idx]
-            dist2 = np.minimum(dist2, ((x - centers[i]) ** 2).sum(axis=1))
-
-        for _ in range(max_iters):
-            assign = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
-            new_centers = centers.copy()
-            for i in range(k):
-                mask = assign == i
-                if mask.any():
-                    new_centers[i] = x[mask].mean(axis=0)
-
-            if np.allclose(new_centers, centers, atol=1e-5):
-                centers = new_centers
-                break
-            centers = new_centers
-
-        return centers.astype(np.float32)
-
-    # ============================================================
-    # Semantic concept / token access
-    # ============================================================
-    def get_class_concept_tokens(
-        self,
-        cls: int,
-        split: str = "train",
-        num_concepts: int = 4,
-        use_cache: bool = True,
-    ) -> torch.Tensor:
-        cls = int(cls)
-        split = split.lower()
-        num_concepts = int(max(1, num_concepts))
-
-        self._check_class_split_access(cls, split)
-
-        cache_key = (cls, f"concept_{split}_{num_concepts}")
-        if use_cache and cache_key in self._semantic_token_cache:
-            return self._semantic_token_cache[cache_key].clone()
-
-        class_indices = self.get_class_indices(cls, split=split)
-        if len(class_indices) == 0:
-            raise ValueError(f"No samples found for class {cls} in split '{split}'")
-
-        class_patches = self.patches[class_indices]
-        per_sample_summaries = class_patches.mean(axis=(2, 3)).astype(np.float32)
-
-        if per_sample_summaries.shape[0] <= num_concepts:
-            concepts = per_sample_summaries
-        else:
-            concepts = self._kmeans_numpy(
-                per_sample_summaries,
-                k=num_concepts,
-                seed=self.seed + cls,
-            )
-
-        token = torch.from_numpy(concepts).float()
-
-        if use_cache:
-            self._semantic_token_cache[cache_key] = token.clone()
-
-        return token
-
-    def get_class_semantic_token(
-        self,
-        cls: int,
-        split: str = "train",
-        use_cache: bool = True,
-    ) -> torch.Tensor:
-        cls = int(cls)
-        split = split.lower()
-        self._check_class_split_access(cls, split)
-
-        cache_key = (cls, f"coarse_{split}")
-        if use_cache and cache_key in self._semantic_token_cache:
-            return self._semantic_token_cache[cache_key].clone()
-
-        concepts = self.get_class_concept_tokens(
-            cls=cls,
-            split=split,
-            num_concepts=4,
-            use_cache=use_cache,
+        phase: int,
+        *,
+        batch_size: int = 256,
+    ) -> DataLoader:
+        """Test-only reporting loader. Never mixes train/val samples into metrics."""
+        return self.get_cumulative_dataloader(
+            phase,
+            split="test",
+            batch_size=batch_size,
+            shuffle=False,
         )
-        token = concepts.mean(dim=0, keepdim=True)
 
-        if use_cache:
-            self._semantic_token_cache[cache_key] = token.clone()
+    def get_map_dataloader(
+        self,
+        phase: int,
+        *,
+        batch_size: int = 256,
+    ) -> DataLoader:
+        """All labelled seen-class pixels for qualitative maps only."""
+        phase_id = self._validate_phase(phase)
+        if phase_id not in self.finalized_phases:
+            raise RuntimeError("map generation requires a finalized phase")
+        dataset = self._make_dataset(
+            self.get_seen_classes(phase_id), "all"
+        )
+        return self._loader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            phase=phase_id,
+            split="all",
+        )
 
-        return token
+    def protocol_report(self) -> Dict[str, Any]:
+        return {
+            "training_mode": "non_exemplar_class_incremental",
+            "tasks": self.nb_tasks,
+            "phase_to_classes": {
+                phase: list(classes)
+                for phase, classes in self.phase_to_classes.items()
+            },
+            "class_order_original_ids": list(self.class_order_original_ids),
+            "split_strategy": self.split_strategy,
+            "spatial_partition_mode": self.spatial_partition_mode,
+            "current_phase": self.current_phase,
+            "finalized_phases": list(self.finalized_phases),
+            "single_head_global_labels": True,
+            "current_phase_training_classes_only": True,
+            "cumulative_seen_class_evaluation": True,
+            "old_training_data_public_api": False,
+            "stores_old_training_samples": False,
+            "validation_enabled": bool(self.validation_enabled),
+            "preprocessing_fit_phase": 0,
+            "base_train_sample_count": int(self.base_train_indices.size),
+            "preprocessing_frozen_across_phases": True,
+            "spatial_leakage": self.spatial_leakage_report(),
+        }
 
-    def clear_semantic_token_cache(self) -> None:
-        self._semantic_token_cache.clear()
+    def assert_exemplar_free_contract(self) -> bool:
+        if self.finalized_phases != list(range(len(self.finalized_phases))):
+            raise RuntimeError("finalized phase state is not contiguous")
+        if self.current_phase is not None:
+            if self.current_phase in self.finalized_phases:
+                raise RuntimeError(
+                    "an active phase cannot also be finalized"
+                )
+            if self.current_phase != len(self.finalized_phases):
+                raise RuntimeError(
+                    "active phase must immediately follow finalized phases"
+                )
+        if any(
+            token in self.__dict__
+            for token in ("exemplars", "replay_buffer", "memory_samples")
+        ):
+            raise RuntimeError("dataset manager contains forbidden replay state")
+        if self.require_patch_disjoint and not self._split_patch_disjoint:
+            raise RuntimeError("strict split patch-disjoint contract is violated")
+        if (
+            self.require_phase_context_isolation
+            and not self._phase_context_isolated
+        ):
+            raise RuntimeError(
+                "strict phase-context isolation contract is violated"
+            )
+        return True
+
+
+__all__ = [
+    "build_incremental_protocol",
+    "IncrementalHSIPatchDataset",
+    "IncrementalHSIDatasetManager",
+]
+
+
+
+
 
 
 
@@ -1352,822 +1543,1385 @@ class IncrementalHSIDataset:
 
 # from __future__ import annotations
 
-# from contextlib import contextmanager
-# from typing import Dict, List, Optional, Set, Tuple, Any
+# """Single leakage-auditable non-exemplar class-incremental HSI protocol.
+
+# Protocol contract
+# -----------------
+# * Phase t training exposes only the training centres of classes introduced at t.
+# * Validation during an active phase exposes only current-phase validation data.
+# * Cumulative validation/test over all seen classes is evaluation-only and is
+#   available only after the phase is finalized.
+# * The spatial branch receives the processed/PCA patch.
+# * The spectral branch receives the raw ordered full-band centre spectrum.
+# * No optimization/model-selection API returns historical training samples after its phase.
+# * A finalized-phase map loader may read all labelled seen-class pixels strictly for
+#   post-training qualitative reporting; those rows are never an optimization source.
+# * Optional strict spatial audits detect patch-footprint overlap across data
+#   splits and across unavailable old/future labelled samples.
+
+# Important: a standard random-pixel HSI split is centre-disjoint but generally
+# NOT patch-disjoint when patch_size > 1. Therefore it must not be described as
+# spatial-leakage-free unless the strict audits actually pass.
+# """
+
+# import random
+# from numbers import Integral, Real
+# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # import numpy as np
 # import torch
-# from torch.utils.data import DataLoader, Dataset, Sampler
+# from torch.utils.data import DataLoader, Dataset
 
 
-# class HSIPatchDataset(Dataset):
-#     def __init__(
-#         self,
-#         patches: np.ndarray,
-#         labels: np.ndarray,
-#         coords: Optional[np.ndarray] = None,
-#         return_metadata: bool = False,
-#         center_spectra: Optional[np.ndarray] = None,
+# _SPLITS = ("train", "val", "test")
+
+
+# def _exact_integer(value: object, *, name: str, minimum: Optional[int] = None) -> int:
+#     """Return an exact signed-int64-compatible scalar without silent truncation."""
+#     if torch.is_tensor(value):
+#         if value.numel() != 1:
+#             raise ValueError(f"{name} must be an integer scalar")
+#         value = value.item()
+#     if isinstance(value, (bool, np.bool_)):
+#         raise ValueError(f"{name} must be an integer")
+
+#     if isinstance(value, Integral):
+#         result = int(value)
+#     elif isinstance(value, Real):
+#         number = float(value)
+#         if not np.isfinite(number) or not number.is_integer():
+#             raise ValueError(f"{name} must be a finite integer")
+#         result = int(number)
+#     else:
+#         raise ValueError(f"{name} must be an integer")
+
+#     info = np.iinfo(np.int64)
+#     if result < int(info.min) or result > int(info.max):
+#         raise ValueError(f"{name} is outside signed int64 range")
+#     if minimum is not None and result < minimum:
+#         raise ValueError(f"{name} must be >= {minimum}")
+#     return result
+
+
+# def _exact_bool(value: object, *, name: str) -> bool:
+#     """Parse an explicit Boolean without Python's bool('false') pitfall."""
+#     if isinstance(value, (bool, np.bool_)):
+#         return bool(value)
+#     if isinstance(value, Integral) and not isinstance(value, bool):
+#         integer = int(value)
+#         if integer in (0, 1):
+#             return bool(integer)
+#     if isinstance(value, str):
+#         token = value.strip().lower()
+#         if token in {"true", "1", "yes", "y"}:
+#             return True
+#         if token in {"false", "0", "no", "n"}:
+#             return False
+#     raise ValueError(f"{name} must be a Boolean")
+
+
+# def _integer_array(value: object, *, name: str) -> np.ndarray:
+#     """Return exact int64 data without Boolean, fractional, or overflow coercion."""
+#     raw = np.asarray(value)
+#     if raw.dtype == np.bool_ or raw.dtype.kind not in "iuf":
+#         raise ValueError(f"{name} must contain integer values")
+
+#     info = np.iinfo(np.int64)
+#     if np.issubdtype(raw.dtype, np.floating):
+#         if not np.isfinite(raw).all() or not np.equal(raw, np.round(raw)).all():
+#             raise ValueError(f"{name} must contain finite integer values")
+#         # float64 cannot represent int64.max exactly; use the exact
+#         # representable half-open interval [-2**63, 2**63).
+#         lower = float(-(2**63))
+#         upper_exclusive = float(2**63)
+#         if raw.size and (
+#             np.any(raw < lower) or np.any(raw >= upper_exclusive)
+#         ):
+#             raise ValueError(f"{name} contains values outside signed int64 range")
+#     elif raw.size and np.issubdtype(raw.dtype, np.unsignedinteger):
+#         if np.any(raw > info.max):
+#             raise ValueError(f"{name} contains values outside signed int64 range")
+#     elif raw.size:
+#         if np.any(raw < info.min) or np.any(raw > info.max):
+#             raise ValueError(f"{name} contains values outside signed int64 range")
+
+#     return raw.astype(np.int64, copy=False)
+
+
+# def _ids(values: Iterable[int], *, name: str, allow_empty: bool = False) -> List[int]:
+#     result = [
+#         _exact_integer(value, name=f"{name} value", minimum=0)
+#         for value in values
+#     ]
+#     if not result and not allow_empty:
+#         raise ValueError(f"{name} cannot be empty")
+#     if len(result) != len(set(result)):
+#         raise ValueError(f"{name} must contain unique IDs")
+#     return result
+
+
+# def _normalize_split_name(split: str) -> str:
+#     token = str(split).strip().lower()
+#     return {
+#         "training": "train",
+#         "validation": "val",
+#         "testing": "test",
+#     }.get(token, token)
+
+
+# def _seed_worker(_: int) -> None:
+#     seed = int(torch.initial_seed() % (2**32))
+#     random.seed(seed)
+#     np.random.seed(seed)
+
+
+
+# def _seed32(value: object, *, name: str) -> int:
+#     """Validate the exact integer domain accepted by NumPy RandomState."""
+#     result = _exact_integer(
+#         value,
+#         name=name,
+#         minimum=0,
+#     )
+#     if result > (2**32) - 1:
+#         raise ValueError(
+#             f"{name} must be <= 2**32-1"
+#         )
+#     return result
+
+
+# def _derived_seed32(base_seed: int, component: int) -> int:
+#     """Derive a deterministic per-class seed without leaving uint32 range."""
+#     base = _seed32(
+#         base_seed,
+#         name="base seed",
+#     )
+#     part = _exact_integer(
+#         component,
+#         name="seed component",
+#         minimum=0,
+#     )
+#     return int(
+#         (base + 1009 * part)
+#         % (2**32)
+#     )
+
+# def _phase_schedule(
+#     class_count: int,
+#     base_classes: int,
+#     increment: int,
+# ) -> Tuple[List[int], Dict[int, List[int]]]:
+#     total = _exact_integer(class_count, name="class_count", minimum=1)
+#     base = _exact_integer(base_classes, name="base_classes", minimum=1)
+#     step = _exact_integer(increment, name="increment", minimum=1)
+#     if base > total:
+#         raise ValueError("base_classes cannot exceed class_count")
+#     sizes = [base]
+#     remaining = total - base
+#     while remaining:
+#         current = min(step, remaining)
+#         sizes.append(current)
+#         remaining -= current
+#     phases: Dict[int, List[int]] = {}
+#     start = 0
+#     for phase, size in enumerate(sizes):
+#         phases[phase] = list(range(start, start + size))
+#         start += size
+#     return sizes, phases
+
+
+# def _split_counts(
+#     total: int,
+#     *,
+#     train_ratio: float,
+#     val_ratio: float,
+# ) -> Tuple[int, int, int]:
+#     """Allocate one fixed per-class split; validation may be disabled.
+
+#     Train and test are mandatory.  Validation is optional because some
+#     published HSI benchmarks provide train/test masks only.
+#     """
+#     train_fraction = float(train_ratio)
+#     val_fraction = float(val_ratio)
+
+#     if (
+#         not np.isfinite(train_fraction)
+#         or not np.isfinite(val_fraction)
+#         or train_fraction <= 0.0
+#         or val_fraction < 0.0
+#         or train_fraction + val_fraction >= 1.0
 #     ):
-#         patches = np.ascontiguousarray(patches, dtype=np.float32)
-#         labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+#         raise ValueError(
+#             "require finite train_ratio>0, val_ratio>=0, and "
+#             "train_ratio+val_ratio<1"
+#         )
 
-#         if len(patches) != len(labels):
-#             raise ValueError(f"patch/label length mismatch: {len(patches)} vs {len(labels)}")
+#     required_split_count = 3 if val_fraction > 0.0 else 2
+#     count = _exact_integer(
+#         total,
+#         name="class sample count",
+#         minimum=required_split_count,
+#     )
 
-#         self.patches = torch.from_numpy(patches).float()
-#         self.labels = torch.from_numpy(labels).long()
-#         self.return_metadata = bool(return_metadata)
+#     quotas = np.asarray(
+#         (
+#             train_fraction,
+#             val_fraction,
+#             1.0 - train_fraction - val_fraction,
+#         ),
+#         dtype=np.float64,
+#     ) * count
+#     counts = np.floor(quotas).astype(np.int64)
+#     remainder = count - int(counts.sum())
+#     if remainder:
+#         order = np.argsort(-(quotas - counts), kind="stable")
+#         counts[order[:remainder]] += 1
 
-#         if center_spectra is None:
-#             self.center_spectra = None
-#         else:
-#             center_spectra = np.asarray(center_spectra, dtype=np.float32)
-#             if len(center_spectra) != len(labels):
-#                 raise ValueError(f"center_spectra/label length mismatch: {len(center_spectra)} vs {len(labels)}")
-#             if center_spectra.ndim != 2:
-#                 center_spectra = center_spectra.reshape(len(labels), -1)
-#             self.center_spectra = torch.from_numpy(np.ascontiguousarray(center_spectra)).float()
+#     required = (0, 2) if val_fraction == 0.0 else (0, 1, 2)
+#     for destination in required:
+#         if counts[destination] == 0:
+#             candidates = [
+#                 index
+#                 for index in required
+#                 if index != destination and counts[index] > 1
+#             ]
+#             if not candidates:
+#                 raise ValueError(
+#                     "class is too small to realize the requested non-empty splits"
+#                 )
+#             source = max(candidates, key=lambda index: int(counts[index]))
+#             counts[source] -= 1
+#             counts[destination] += 1
 
-#         if coords is None:
-#             self.coords = torch.empty((len(labels), 0), dtype=torch.long)
-#         else:
-#             coords = np.asarray(coords, dtype=np.int64)
-#             if len(coords) != len(labels):
-#                 raise ValueError(f"coord/label length mismatch: {len(coords)} vs {len(labels)}")
-#             if coords.ndim != 2 or coords.shape[1] != 2:
-#                 raise ValueError(f"coords must be [N,2], got {coords.shape}")
-#             self.coords = torch.from_numpy(coords).long()
+#     if val_fraction == 0.0:
+#         # A zero validation ratio is an explicit train/test-only protocol.
+#         if counts[1] != 0:
+#             counts[2] += counts[1]
+#             counts[1] = 0
 
-#     def __len__(self) -> int:
-#         return int(len(self.labels))
+#     n_train, n_val, n_test = (int(v) for v in counts)
+#     if n_train + n_val + n_test != count:
+#         raise RuntimeError("split allocation does not conserve class samples")
+#     if n_train <= 0 or n_test <= 0:
+#         raise RuntimeError("train and test splits must be non-empty")
+#     if val_fraction > 0.0 and n_val <= 0:
+#         raise RuntimeError("positive val_ratio produced an empty validation split")
+#     return n_train, n_val, n_test
 
-#     @staticmethod
-#     def _center_spectrum(patch: torch.Tensor) -> torch.Tensor:
-#         # Patches are normally [C,H,W]. Fallbacks keep compatibility with flat inputs.
-#         if patch.dim() == 3:
-#             return patch[:, patch.size(1) // 2, patch.size(2) // 2].float()
-#         if patch.dim() == 2:
-#             return patch.float().mean(dim=-1)
-#         return patch.float().flatten()
+# def _random_class_split(
+#     indices: np.ndarray,
+#     *,
+#     train_ratio: float,
+#     val_ratio: float,
+#     seed: int,
+# ) -> Dict[str, np.ndarray]:
+#     values = _integer_array(indices, name="class indices").reshape(-1)
+#     if np.unique(values).size != values.size:
+#         raise ValueError("class indices contain duplicates")
+#     n_train, n_val, _ = _split_counts(
+#         len(values),
+#         train_ratio=train_ratio,
+#         val_ratio=val_ratio,
+#     )
+#     rng = np.random.RandomState(_exact_integer(seed, name="split seed", minimum=0))
+#     shuffled = rng.permutation(values)
+#     train = shuffled[:n_train]
+#     val = shuffled[n_train : n_train + n_val]
+#     test = shuffled[n_train + n_val :]
+#     return {
+#         "train": train,
+#         "val": val,
+#         "test": test,
+#         "all": np.concatenate((train, val, test)),
+#     }
 
-#     def __getitem__(self, idx: int):
-#         patch = self.patches[idx]
-#         label = self.labels[idx]
-#         if not self.return_metadata:
-#             return patch, label
-#         # Prefer physical wavelength-ordered raw center spectra when provided by
-#         # ImageCubes.  Fallback to the model-input center spectrum, which may be
-#         # PCA and must be marked non-physical by the trainer/model.
-#         spectrum = self.center_spectra[idx] if self.center_spectra is not None else self._center_spectrum(patch)
-#         coord = self.coords[idx] if self.coords.numel() > 0 else torch.empty((0,), dtype=torch.long)
-#         return patch, label, spectrum, coord
 
+# def _spatial_class_split(
+#     indices: np.ndarray,
+#     coords: np.ndarray,
+#     *,
+#     train_ratio: float,
+#     val_ratio: float,
+#     block_size: int,
+#     seed: int,
+# ) -> Dict[str, np.ndarray]:
+#     """Classwise spatial-block split.
 
-
-# class ClassBalancedBatchSampler(Sampler[List[int]]):
+#     This is a benchmark split option, not a proof of patch disjointness.
+#     Patch-overlap audits are computed separately.
 #     """
-#     Class-balanced batch sampler for geometry-native HSI base training.
+#     values = _integer_array(indices, name="class indices").reshape(-1)
+#     xy = _integer_array(coords, name="coords")[values]
+#     size = _exact_integer(block_size, name="spatial_block_size", minimum=1)
+#     max_block_col = int(np.max(xy[:, 1] // size)) + 1
+#     block_ids = (xy[:, 0] // size) * max_block_col + xy[:, 1] // size
+#     blocks = [values[block_ids == block] for block in np.unique(block_ids)]
 
-#     Local low-rank geometry is not compatible with random imbalanced batches:
-#     singleton rare classes produce degenerate covariance and rank-0 geometry.
-#     This sampler builds each train batch from multiple classes with multiple
-#     samples per class, sampling with replacement when a class is small.
-#     """
+#     validation_enabled = float(val_ratio) > 0.0
+#     minimum_blocks = 3 if validation_enabled else 2
+#     if len(blocks) < minimum_blocks:
+#         raise RuntimeError(
+#             "a class occupies too few spatial blocks for the requested split"
+#         )
 
-#     def __init__(
-#         self,
-#         labels: torch.Tensor,
-#         batch_size: int,
-#         classes_per_batch: Optional[int] = None,
-#         samples_per_class: Optional[int] = None,
-#         seed: int = 42,
-#         drop_last: bool = False,
-#     ) -> None:
-#         labels_np = labels.detach().cpu().numpy().astype(np.int64).reshape(-1)
-#         if labels_np.size == 0:
-#             raise ValueError("ClassBalancedBatchSampler received zero labels.")
+#     rng = np.random.RandomState(
+#         _exact_integer(seed, name="split seed", minimum=0)
+#     )
+#     rng.shuffle(blocks)
 
-#         self.labels_np = labels_np
-#         self.batch_size = int(max(1, batch_size))
-#         self.seed = int(seed)
-#         self.drop_last = bool(drop_last)
+#     target_train, target_val, _ = _split_counts(
+#         len(values),
+#         train_ratio=train_ratio,
+#         val_ratio=val_ratio,
+#     )
 
-#         self.class_to_indices: Dict[int, np.ndarray] = {}
-#         for c in sorted(np.unique(labels_np).tolist()):
-#             idx = np.where(labels_np == int(c))[0].astype(np.int64)
-#             if idx.size > 0:
-#                 self.class_to_indices[int(c)] = idx
+#     train_blocks: List[np.ndarray] = []
+#     val_blocks: List[np.ndarray] = []
+#     test_blocks: List[np.ndarray] = []
+#     train_count = 0
+#     val_count = 0
 
-#         self.classes = sorted(self.class_to_indices.keys())
-#         if not self.classes:
-#             raise ValueError("ClassBalancedBatchSampler found no classes.")
+#     for block_index, block in enumerate(blocks):
+#         remaining = len(blocks) - block_index
+#         reserve_for_test = 1
+#         reserve_for_val = 1 if validation_enabled and not val_blocks else 0
 
-#         if classes_per_batch is None or int(classes_per_batch) <= 0:
-#             classes_per_batch = min(len(self.classes), self.batch_size)
-#         self.classes_per_batch = int(max(1, min(classes_per_batch, len(self.classes), self.batch_size)))
+#         if (
+#             train_count < target_train
+#             and remaining > reserve_for_test + reserve_for_val
+#         ):
+#             train_blocks.append(block)
+#             train_count += len(block)
+#         elif (
+#             validation_enabled
+#             and val_count < target_val
+#             and remaining > reserve_for_test
+#         ):
+#             val_blocks.append(block)
+#             val_count += len(block)
+#         else:
+#             test_blocks.append(block)
 
-#         if samples_per_class is None or int(samples_per_class) <= 0:
-#             samples_per_class = max(2, self.batch_size // self.classes_per_batch)
-#         self.samples_per_class = int(max(1, samples_per_class))
+#     if not train_blocks or not test_blocks:
+#         raise RuntimeError("spatial block allocation produced an empty train/test split")
+#     if validation_enabled and not val_blocks:
+#         raise RuntimeError("spatial block allocation produced an empty validation split")
 
-#         self.effective_batch_size = self.classes_per_batch * self.samples_per_class
-#         if self.effective_batch_size > self.batch_size:
-#             self.samples_per_class = max(1, self.batch_size // self.classes_per_batch)
-#             self.effective_batch_size = self.classes_per_batch * self.samples_per_class
+#     train = np.concatenate(train_blocks)
+#     val = (
+#         np.concatenate(val_blocks)
+#         if val_blocks
+#         else np.empty(0, dtype=np.int64)
+#     )
+#     test = np.concatenate(test_blocks)
 
-#         self.num_batches = int(np.ceil(labels_np.size / float(max(self.effective_batch_size, 1))))
-#         if self.drop_last:
-#             self.num_batches = int(labels_np.size // float(max(self.effective_batch_size, 1)))
-#         self.num_batches = max(1, self.num_batches)
-#         self.epoch = 0
+#     return {
+#         "train": train,
+#         "val": val,
+#         "test": test,
+#         "all": np.concatenate((train, val, test)),
+#     }
 
-#     def set_epoch(self, epoch: int) -> None:
-#         self.epoch = int(epoch)
+# def _validate_split_by_class(
+#     split_by_class: Mapping[int, Mapping[str, np.ndarray]],
+#     labels: np.ndarray,
+#     class_count: int,
+# ) -> None:
+#     y = _integer_array(
+#         labels,
+#         name="global labels",
+#     ).reshape(-1)
+#     total_classes = _exact_integer(
+#         class_count,
+#         name="class_count",
+#         minimum=1,
+#     )
 
-#     def __len__(self) -> int:
-#         return self.num_batches
+#     if y.size == 0:
+#         raise ValueError(
+#             "global labels cannot be empty"
+#         )
+#     observed_classes = sorted(
+#         int(value)
+#         for value in np.unique(y)
+#     )
+#     if observed_classes != list(
+#         range(total_classes)
+#     ):
+#         raise ValueError(
+#             "global labels must contain exactly contiguous class IDs "
+#             f"0..{total_classes - 1}; observed={observed_classes}"
+#         )
 
-#     def __iter__(self):
-#         rng = np.random.RandomState(self.seed + self.epoch)
-#         classes = np.asarray(self.classes, dtype=np.int64)
+#     if set(int(v) for v in split_by_class) != set(range(total_classes)):
+#         raise ValueError("split_by_class does not cover every class")
 
-#         for _ in range(self.num_batches):
-#             replace_classes = len(classes) < self.classes_per_batch
-#             chosen_classes = rng.choice(
-#                 classes,
-#                 size=self.classes_per_batch,
-#                 replace=replace_classes,
+#     used: set[int] = set()
+#     for class_id in range(total_classes):
+#         row = split_by_class[class_id]
+#         missing = set((*_SPLITS, "all")) - set(row)
+#         if missing:
+#             raise ValueError(
+#                 f"class {class_id} split is missing {sorted(missing)}"
 #             )
 
-#             batch: List[int] = []
-#             for c in chosen_classes.tolist():
-#                 pool = self.class_to_indices[int(c)]
-#                 replace_samples = pool.size < self.samples_per_class
-#                 sampled = rng.choice(
-#                     pool,
-#                     size=self.samples_per_class,
-#                     replace=replace_samples,
+#         arrays = {
+#             name: _integer_array(
+#                 row[name],
+#                 name=f"class {class_id} {name} indices",
+#             ).reshape(-1)
+#             for name in (*_SPLITS, "all")
+#         }
+
+#         if arrays["train"].size == 0 or arrays["test"].size == 0:
+#             raise ValueError(
+#                 f"class {class_id} must have non-empty train and test splits"
+#             )
+#         if arrays["all"].size == 0:
+#             raise ValueError(f"class {class_id} all split cannot be empty")
+
+#         for name, array in arrays.items():
+#             if np.unique(array).size != array.size:
+#                 raise ValueError(
+#                     f"class {class_id} {name} split contains duplicates"
 #                 )
-#                 batch.extend(int(i) for i in sampled.tolist())
+#             if array.size and (array.min() < 0 or array.max() >= y.size):
+#                 raise ValueError(
+#                     f"class {class_id} {name} split contains invalid indices"
+#                 )
 
-#             rng.shuffle(batch)
-#             if not batch:
-#                 continue
-#             if self.drop_last and len(batch) < self.effective_batch_size:
-#                 continue
-#             yield batch
+#         train_set, val_set, test_set = (
+#             set(arrays[name].tolist()) for name in _SPLITS
+#         )
+#         if train_set & val_set or train_set & test_set or val_set & test_set:
+#             raise ValueError(f"class {class_id} train/val/test indices overlap")
+
+#         union = train_set | val_set | test_set
+#         if set(arrays["all"].tolist()) != union:
+#             raise ValueError(f"class {class_id} all indices are inconsistent")
+
+#         for array in arrays.values():
+#             if array.size and not np.all(y[array] == class_id):
+#                 raise ValueError(f"class {class_id} split contains another class")
+
+#         expected = set(np.flatnonzero(y == class_id).tolist())
+#         if union != expected:
+#             raise ValueError(
+#                 f"class {class_id} split does not account for every sample"
+#             )
+#         if used & expected:
+#             raise ValueError("a sample appears in more than one class")
+#         used |= expected
+
+# def _collect_indices(
+#     split_by_class: Mapping[int, Mapping[str, np.ndarray]],
+#     class_ids: Sequence[int],
+#     split: str,
+# ) -> np.ndarray:
+#     token = _normalize_split_name(split)
+#     if token not in {*_SPLITS, "all"}:
+#         raise ValueError(f"unknown split {split!r}")
+#     ids = _ids(class_ids, name="class_ids", allow_empty=True)
+#     if not ids:
+#         return np.empty(0, dtype=np.int64)
+#     return np.concatenate(
+#         [
+#             _integer_array(
+#                 split_by_class[class_id][token],
+#                 name=f"class {class_id} {token} indices",
+#             ).reshape(-1)
+#             for class_id in ids
+#         ]
+#     )
 
 
-# class IncrementalHSIDataset:
-#     """
-#     Strict non-exemplar incremental dataset manager.
+# def build_incremental_protocol(
+#     input_labels: np.ndarray,
+#     input_coords: np.ndarray,
+#     *,
+#     gt_shape: Sequence[int],
+#     class_count: int,
+#     base_classes: int,
+#     increment: int,
+#     train_ratio: float,
+#     val_ratio: float,
+#     seed: int = 0,
+#     shuffle_order: bool = False,
+#     class_order: Optional[Sequence[int]] = None,
+#     target_names: Optional[Sequence[str]] = None,
+#     split_strategy: str = "random_pixel",
+#     spatial_block_size: int = 33,
+#     predefined_splits: Optional[Mapping[int, Mapping[str, Sequence[int]]]] = None,
+#     **_: Any,
+# ) -> Dict[str, Any]:
+#     original_labels = _integer_array(input_labels, name="input_labels").reshape(-1)
+#     coords = _integer_array(input_coords, name="input_coords")
+#     shape = tuple(
+#         _exact_integer(v, name="gt_shape value", minimum=1) for v in gt_shape
+#     )
+#     total_classes = _exact_integer(class_count, name="class_count", minimum=1)
+#     protocol_seed = _seed32(
+#         seed,
+#         name="seed",
+#     )
 
-#     Important:
-#     The dataset manager never assumes label 0 is background. If label 0 is in
-#     labels, it is treated as a valid class.
-#     """
+#     if len(shape) != 2 or coords.shape != (len(original_labels), 2):
+#         raise ValueError("labels, coordinates and gt_shape are inconsistent")
+#     if original_labels.size == 0:
+#         raise ValueError("input_labels cannot be empty")
+#     if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+#         raise ValueError("coords must identify unique labelled pixels")
+#     if (
+#         np.any(coords[:, 0] < 0)
+#         or np.any(coords[:, 0] >= shape[0])
+#         or np.any(coords[:, 1] < 0)
+#         or np.any(coords[:, 1] >= shape[1])
+#     ):
+#         raise ValueError("coords lie outside gt_shape")
+
+#     original_ids = sorted(int(v) for v in np.unique(original_labels))
+#     if original_ids != list(range(total_classes)):
+#         raise ValueError("input labels must be contiguous zero-based class IDs")
+
+#     shuffle_classes = _exact_bool(shuffle_order, name="shuffle_order")
+#     if class_order is not None and shuffle_classes:
+#         raise ValueError("choose either class_order or shuffle_order, not both")
+#     if class_order is not None:
+#         order = _ids(class_order, name="class_order")
+#     elif shuffle_classes:
+#         order = np.random.RandomState(protocol_seed).permutation(
+#             original_ids
+#         ).tolist()
+#     else:
+#         order = original_ids
+#     if set(order) != set(original_ids) or len(order) != len(original_ids):
+#         raise ValueError("class_order must be a complete class permutation")
+
+#     original_to_global = {
+#         original: global_id for global_id, original in enumerate(order)
+#     }
+#     global_to_original = {
+#         global_id: original for original, global_id in original_to_global.items()
+#     }
+#     global_labels = np.asarray(
+#         [original_to_global[int(label)] for label in original_labels],
+#         dtype=np.int64,
+#     )
+#     phase_sizes, phase_to_classes = _phase_schedule(
+#         total_classes, base_classes, increment
+#     )
+
+#     strategy = str(split_strategy).strip().lower()
+#     if predefined_splits is not None:
+#         predefined_original = {
+#             _exact_integer(class_id, name="predefined class ID", minimum=0): row
+#             for class_id, row in predefined_splits.items()
+#         }
+#         if set(predefined_original) != set(original_ids):
+#             raise ValueError(
+#                 "predefined_splits must be keyed by every original class ID"
+#             )
+#         split_by_class = {}
+#         for original_id, row in predefined_original.items():
+#             if "train" not in row or "test" not in row:
+#                 raise ValueError(
+#                     f"predefined class {original_id} must provide train and test indices"
+#                 )
+#             mapped = {
+#                 "train": _integer_array(
+#                     row["train"],
+#                     name=f"predefined class {original_id} train indices",
+#                 ).reshape(-1),
+#                 "val": _integer_array(
+#                     row.get("val", np.empty(0, dtype=np.int64)),
+#                     name=f"predefined class {original_id} val indices",
+#                 ).reshape(-1),
+#                 "test": _integer_array(
+#                     row["test"],
+#                     name=f"predefined class {original_id} test indices",
+#                 ).reshape(-1),
+#             }
+#             mapped["all"] = np.concatenate(
+#                 (mapped["train"], mapped["val"], mapped["test"])
+#             )
+#             split_by_class[original_to_global[original_id]] = mapped
+#         strategy = "predefined"
+#     elif strategy == "random_pixel":
+#         split_by_class = {
+#             class_id: _random_class_split(
+#                 np.flatnonzero(global_labels == class_id),
+#                 train_ratio=train_ratio,
+#                 val_ratio=val_ratio,
+#                 seed=_derived_seed32(
+#                     protocol_seed,
+#                     global_to_original[class_id],
+#                 ),
+#             )
+#             for class_id in range(total_classes)
+#         }
+#     elif strategy == "spatial_block":
+#         split_by_class = {
+#             class_id: _spatial_class_split(
+#                 np.flatnonzero(global_labels == class_id),
+#                 coords,
+#                 train_ratio=train_ratio,
+#                 val_ratio=val_ratio,
+#                 block_size=spatial_block_size,
+#                 seed=_derived_seed32(
+#                     protocol_seed,
+#                     global_to_original[class_id],
+#                 ),
+#             )
+#             for class_id in range(total_classes)
+#         }
+#     else:
+#         raise ValueError(
+#             "split_strategy must be random_pixel, spatial_block, or predefined"
+#         )
+
+#     _validate_split_by_class(split_by_class, global_labels, total_classes)
+
+#     validation_presence = [
+#         bool(split_by_class[class_id]["val"].size)
+#         for class_id in range(total_classes)
+#     ]
+#     if any(validation_presence) and not all(validation_presence):
+#         raise ValueError(
+#             "validation must be consistently enabled for every class or "
+#             "disabled for every class"
+#         )
+#     validation_enabled = all(validation_presence)
+
+#     names = [] if target_names is None else [str(v) for v in target_names]
+#     if names and len(names) != total_classes:
+#         raise ValueError("target_names must contain one name per class")
+#     global_names = [names[original] for original in order] if names else []
+
+#     phase_train = {
+#         phase: _collect_indices(split_by_class, classes, "train")
+#         for phase, classes in phase_to_classes.items()
+#     }
+#     phase_val = {
+#         phase: _collect_indices(split_by_class, classes, "val")
+#         for phase, classes in phase_to_classes.items()
+#     }
+#     phase_test = {
+#         phase: _collect_indices(split_by_class, classes, "test")
+#         for phase, classes in phase_to_classes.items()
+#     }
+#     cumulative_test = {
+#         phase: _collect_indices(
+#             split_by_class,
+#             list(range(sum(phase_sizes[: phase + 1]))),
+#             "test",
+#         )
+#         for phase in phase_to_classes
+#     }
+
+#     return {
+#         "training_mode": "non_exemplar_class_incremental",
+#         "seed": protocol_seed,
+#         "class_count": total_classes,
+#         "base_classes": _exact_integer(
+#             base_classes, name="base_classes", minimum=1
+#         ),
+#         "increment": _exact_integer(increment, name="increment", minimum=1),
+#         "phase_sizes": phase_sizes,
+#         "phase_to_classes": phase_to_classes,
+#         "class_order_original_ids": order,
+#         "original_to_global": original_to_global,
+#         "global_to_original": global_to_original,
+#         "original_labels": original_labels,
+#         "global_labels": global_labels,
+#         "global_target_names": global_names,
+#         "split_by_class": split_by_class,
+#         "phase_train_indices": phase_train,
+#         "phase_val_indices": phase_val,
+#         "phase_test_indices": phase_test,
+#         "cumulative_test_indices": cumulative_test,
+#         # Canonical preprocessing membership. This is exactly phase-0 TRAIN,
+#         # not a second independently constructed split.
+#         "base_train_indices": phase_train[0].copy(),
+#         "split_strategy": strategy,
+#         "spatial_partition_mode": (
+#             "classwise_block_assignment"
+#             if strategy == "spatial_block"
+#             else "pixel_indices"
+#         ),
+#         "single_head_global_labels": True,
+#         "current_phase_training_classes_only": True,
+#         "cumulative_seen_class_evaluation": True,
+#         "stores_old_training_samples": False,
+#         "validation_enabled": bool(validation_enabled),
+#         "preprocessing_fit_phase": 0,
+#         "preprocessing_frozen_across_phases": True,
+#     }
+
+
+# class IncrementalHSIPatchDataset(Dataset):
+#     def __init__(
+#         self,
+#         manager: "IncrementalHSIDatasetManager",
+#         indices: Sequence[int],
+#     ) -> None:
+#         self.manager = manager
+#         self.indices = _integer_array(indices, name="dataset indices").reshape(-1)
+#         if self.indices.size == 0:
+#             raise ValueError("dataset indices cannot be empty")
+#         if self.indices.min() < 0 or self.indices.max() >= len(manager.labels):
+#             raise ValueError("dataset indices are outside labelled samples")
+#         if np.unique(self.indices).size != self.indices.size:
+#             raise ValueError("dataset indices cannot contain duplicates")
+
+#     def __len__(self) -> int:
+#         return int(self.indices.size)
+
+#     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
+#         item_id = _exact_integer(item, name="dataset item", minimum=0)
+#         if item_id >= len(self):
+#             raise IndexError(item_id)
+#         sample_index = int(self.indices[item_id])
+#         row, col = self.manager.coords[sample_index]
+#         patch = self.manager.extract_patch(int(row), int(col))
+#         raw_center_spectrum = self.manager.ordered_spectral_cube[
+#             int(row), int(col)
+#         ]
+#         return {
+#             "image": torch.from_numpy(
+#                 np.moveaxis(patch, -1, 0).copy()
+#             ).float(),
+#             "raw_center_spectrum": torch.from_numpy(
+#                 raw_center_spectrum.copy()
+#             ).float(),
+#             "label": torch.tensor(
+#                 int(self.manager.labels[sample_index]),
+#                 dtype=torch.long,
+#             ),
+#             "coord": torch.tensor(
+#                 (int(row), int(col)),
+#                 dtype=torch.long,
+#             ),
+#             "sample_index": torch.tensor(sample_index, dtype=torch.long),
+#         }
+
+
+# class IncrementalHSIDatasetManager:
+#     """Current-class training and seen-class evaluation with spatial audits."""
 
 #     def __init__(
 #         self,
-#         patches: np.ndarray,
+#         *,
+#         processed_cube: np.ndarray,
 #         labels: np.ndarray,
 #         coords: np.ndarray,
-#         gt_shape: Tuple[int, int],
-#         GT: np.ndarray,
-#         base_classes: int,
-#         increment: int,
-#         train_ratio: float = 0.2,
-#         val_ratio: float = 0.1,
-#         seed: int = 42,
-#         shuffle_order: bool = False,
-#         device: str = "cuda",
-#         min_train_per_class: int = 20,
+#         protocol: Mapping[str, Any],
+#         target_names: Sequence[str],
+#         gt_shape: Sequence[int],
+#         patch_size: int,
+#         ordered_spectral_cube: Optional[np.ndarray] = None,
 #         num_workers: int = 0,
-#         strict_non_exemplar: bool = True,
-#         target_names: Optional[List[str]] = None,
-#         label_policy: Optional[Dict] = None,
-#         class_balanced_train_batches: bool = True,
-#         geometry_batch_classes: int = 0,
-#         geometry_samples_per_class: int = 0,
-#         return_metadata: bool = False,
-#         raw_spectra: Optional[np.ndarray] = None,
-#         center_spectra: Optional[np.ndarray] = None,
-#         spectra_are_physical: bool = False,
-#     ):
-#         # Raw arrays from ImageCubes.
-#         self.patches = np.asarray(patches, dtype=np.float32)
-#         self.labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-#         self.coords = np.asarray(coords, dtype=np.int64)
-#         self.gt_shape = gt_shape
-#         self.GT = GT
-#         self.spectra_are_physical = bool(spectra_are_physical)
-#         # raw_spectra/center_spectra are per-sample physical center spectra aligned
-#         # with patches/labels. They are descriptors metadata, not old exemplars;
-#         # strict non-exemplar access rules below still prevent old raw train use.
-#         raw_center = center_spectra if center_spectra is not None else raw_spectra
-#         self.raw_spectra = None
-#         if raw_center is not None:
-#             raw_center = np.asarray(raw_center, dtype=np.float32)
-#             if raw_center.ndim != 2:
-#                 raw_center = raw_center.reshape(len(self.labels), -1)
-#             if len(raw_center) != len(self.labels):
-#                 raise ValueError(f"raw_spectra/label length mismatch: {len(raw_center)} vs {len(self.labels)}")
-#             self.raw_spectra = np.ascontiguousarray(raw_center, dtype=np.float32)
-#             # Do NOT auto-mark metadata as physical.  In reduced-band PCA runs,
-#             # center_spectra may be PCA/component vectors, not wavelength-ordered
-#             # spectra.  The caller owns this flag.
-#             self.spectra_are_physical = bool(spectra_are_physical)
-
-#         if len(self.patches) != len(self.labels):
-#             raise ValueError(f"patch/label length mismatch: {len(self.patches)} vs {len(self.labels)}")
-#         if len(self.coords) != len(self.labels):
-#             raise ValueError(f"coord/label length mismatch: {len(self.coords)} vs {len(self.labels)}")
-#         if self.labels.size == 0:
-#             raise ValueError("Empty labels passed to IncrementalHSIDataset.")
-#         if self.labels.min() < 0:
-#             raise ValueError(
-#                 f"Negative labels passed to IncrementalHSIDataset: min={self.labels.min()}. "
-#                 f"Loader must remove background/ignore labels before incremental split."
+#         device: str = "cpu",
+#         seed: Optional[int] = None,
+#         require_patch_disjoint: bool = False,
+#         require_phase_context_isolation: Optional[bool] = None,
+#         context_policy: str = "full_scene_reflect",
+#         **_: Any,
+#     ) -> None:
+#         self.processed_cube = np.ascontiguousarray(
+#             processed_cube, dtype=np.float32
+#         )
+#         self.gt_shape = tuple(
+#             _exact_integer(v, name="gt_shape value", minimum=1)
+#             for v in gt_shape
+#         )
+#         self.coords = _integer_array(coords, name="coords")
+#         supplied_labels = _integer_array(labels, name="labels").reshape(-1)
+#         original_labels = _integer_array(
+#             protocol["original_labels"], name="protocol original_labels"
+#         ).reshape(-1)
+#         global_labels = _integer_array(
+#             protocol["global_labels"], name="protocol global labels"
+#         ).reshape(-1)
+#         if (
+#             np.array_equal(
+#                 supplied_labels,
+#                 original_labels,
 #             )
-
-#         # Settings.
-#         self.base_classes = int(base_classes)
-#         self.increment = int(increment)
-#         self.train_ratio = float(train_ratio)
-#         self.val_ratio = float(val_ratio)
-#         self.seed = int(seed)
-#         self.device = str(device)
-#         self.min_train_per_class = int(min_train_per_class)
-#         self.num_workers = int(num_workers)
-#         self.strict_non_exemplar = bool(strict_non_exemplar)
-#         self.class_balanced_train_batches = bool(class_balanced_train_batches)
-#         self.geometry_batch_classes = int(geometry_batch_classes)
-#         self.geometry_samples_per_class = int(geometry_samples_per_class)
-#         self.return_metadata = bool(return_metadata)
-#         self.target_names = target_names
-#         self.label_policy = self._normalize_label_policy(label_policy)
-#         self.has_background = bool(self.label_policy.get("has_background", True))
-#         self.background_label = self.label_policy.get("background_label", 0 if self.has_background else None)
-#         self.raw_class_values = [int(v) for v in self.label_policy.get("raw_class_values", [])]
-
-#         self.pin_memory = self.device.startswith("cuda")
-
-#         # Cache for semantic tokens / concept tokens.
-#         self._semantic_token_cache: Dict[Tuple[int, str], torch.Tensor] = {}
-
-#         # Protocol state.
-#         self.current_phase: int = 0
-#         self.finalized_phases: Set[int] = set()
-#         self.finalized_classes: Set[int] = set()
-#         self._memory_build_active: bool = False
-#         self._memory_build_classes: Set[int] = set()
-
-#         # Class order and remapping.
-#         # labels may already be 0..K-1, but we still remap to sequential IDs
-#         # according to class_order. If label 0 exists, it is included.
-#         self.all_classes = sorted(int(x) for x in np.unique(self.labels).tolist())
-#         if self.all_classes[0] != 0:
-#             print(
-#                 f"[IncrementalHSIDataset:WARN] smallest label is {self.all_classes[0]}, "
-#                 f"not 0. The manager will remap to sequential IDs."
+#             or np.array_equal(
+#                 supplied_labels,
+#                 global_labels,
 #             )
-
-#         self.num_classes = len(self.all_classes)
-
-#         if self.base_classes <= 0 or self.base_classes > self.num_classes:
-#             raise ValueError(f"base_classes={self.base_classes} invalid for num_classes={self.num_classes}")
-#         if self.increment <= 0:
-#             raise ValueError(f"increment must be > 0, got {self.increment}")
-
-#         if shuffle_order:
-#             rng = np.random.RandomState(self.seed)
-#             self.class_order = rng.permutation(self.all_classes).tolist()
+#         ):
+#             self.labels = global_labels
 #         else:
-#             self.class_order = list(self.all_classes)
+#             raise ValueError(
+#                 "labels do not match the protocol"
+#             )
 
-#         self.label_map = {global_id: seq_id for seq_id, global_id in enumerate(self.class_order)}
-#         self.inv_label_map = {v: k for k, v in self.label_map.items()}
+#         protocol_class_count = _exact_integer(
+#             protocol["class_count"],
+#             name="protocol class_count",
+#             minimum=1,
+#         )
+#         observed_global_classes = sorted(
+#             int(value)
+#             for value in np.unique(self.labels)
+#         )
+#         if observed_global_classes != list(
+#             range(protocol_class_count)
+#         ):
+#             raise ValueError(
+#                 "protocol global labels must contain exactly contiguous "
+#                 f"class IDs 0..{protocol_class_count - 1}; "
+#                 f"observed={observed_global_classes}"
+#             )
 
-#         self.remapped_labels = np.array(
-#             [self.label_map[int(l)] for l in self.labels],
-#             dtype=np.int64,
+#         if (
+#             self.processed_cube.ndim != 3
+#             or self.processed_cube.shape[:2] != self.gt_shape
+#             or self.processed_cube.shape[2] <= 0
+#             or not np.isfinite(self.processed_cube).all()
+#         ):
+#             raise ValueError("processed_cube must be finite and match gt_shape")
+#         if self.coords.shape != (len(self.labels), 2):
+#             raise ValueError("coords must align with labels")
+#         if np.unique(self.coords, axis=0).shape[0] != self.coords.shape[0]:
+#             raise ValueError("coords contain duplicate labelled-pixel locations")
+#         if (
+#             np.any(self.coords[:, 0] < 0)
+#             or np.any(self.coords[:, 0] >= self.gt_shape[0])
+#             or np.any(self.coords[:, 1] < 0)
+#             or np.any(self.coords[:, 1] >= self.gt_shape[1])
+#         ):
+#             raise ValueError("coords contain positions outside gt_shape")
+
+#         if ordered_spectral_cube is None:
+#             raise ValueError(
+#                 "ordered_spectral_cube is required for the raw spectral branch"
+#             )
+#         ordered = np.asarray(ordered_spectral_cube, dtype=np.float32)
+#         if (
+#             ordered.ndim != 3
+#             or ordered.shape[:2] != self.gt_shape
+#             or ordered.shape[2] <= 0
+#             or not np.isfinite(ordered).all()
+#         ):
+#             raise ValueError("ordered_spectral_cube is invalid")
+#         self.ordered_spectral_cube = np.ascontiguousarray(ordered)
+
+#         self.patch_size = _exact_integer(
+#             patch_size, name="patch_size", minimum=1
+#         )
+#         if self.patch_size % 2 == 0:
+#             raise ValueError("patch_size must be odd")
+#         radius = self.patch_size // 2
+#         self.padded_cube = np.pad(
+#             self.processed_cube,
+#             ((radius, radius), (radius, radius), (0, 0)),
+#             mode="reflect",
 #         )
 
-#         # target_names provided by the loader are indexed by input label id
-#         # after ImageCubes mapping. Convert them once to sequential phase ids.
-#         self.target_names_by_seq = self._build_target_names_by_seq(target_names)
-
-#         self._validate_class_zero_policy()
-#         self._validate_full_class_coverage()
-
-#         # Phase partition in sequential label space.
-#         remaining_classes = self.num_classes - self.base_classes
-#         self.num_phases = 1 + int(np.ceil(remaining_classes / self.increment))
-
-#         self.phase_to_classes: Dict[int, List[int]] = {}
-#         self.class_to_phase: Dict[int, int] = {}
-
-#         for phase in range(self.num_phases):
-#             if phase == 0:
-#                 cls_list = list(range(self.base_classes))
-#             else:
-#                 start = self.base_classes + (phase - 1) * self.increment
-#                 end = min(start + self.increment, self.num_classes)
-#                 cls_list = list(range(start, end))
-
-#             self.phase_to_classes[phase] = cls_list
-#             for cls in cls_list:
-#                 self.class_to_phase[int(cls)] = int(phase)
-
-#         self._create_splits()
-#         self._print_stats()
-
-#     # ============================================================
-#     # Label policy helpers
-#     # ============================================================
-#     def _normalize_label_policy(self, label_policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-#         """
-#         Normalize dataset label metadata.
-
-#         The incremental manager receives sequential training labels. Raw GT
-#         background handling must be decided in the loader/ImageCubes stage. This
-#         policy is carried here only for validation, reporting, and visualization.
-
-#         Rules:
-#             - if has_background=True, raw background is display-only and should
-#               not appear in self.labels;
-#             - if has_background=False, raw class 0 is allowed to be a real class;
-#             - model/trainer class ids remain sequential 0..K-1 either way.
-#         """
-#         policy = dict(label_policy or {})
-
-#         if "has_background" not in policy:
-#             # Conservative default: most classic HSI datasets use raw 0 as background.
-#             # Datasets with raw class 0 real must pass has_background=False from the loader.
-#             policy["has_background"] = True
-
-#         policy["has_background"] = bool(policy["has_background"])
-
-#         if policy["has_background"]:
-#             try:
-#                 policy["background_label"] = int(policy.get("background_label", 0))
-#             except Exception:
-#                 policy["background_label"] = 0
-#         else:
-#             policy["background_label"] = None
-
-#         raw_values = policy.get("raw_class_values", None)
-#         if raw_values is None:
-#             raw_values = []
-#         policy["raw_class_values"] = [int(v) for v in raw_values]
-
-#         return policy
-
-#     # ============================================================
-#     # Validation
-#     # ============================================================
-#     def _validate_class_zero_policy(self) -> None:
-#         """
-#         Validate class-0/background semantics without deleting label 0.
-
-#         Important:
-#             self.labels are already training labels from ImageCubes. They are
-#             not necessarily raw GT labels. Therefore this method never assumes
-#             input label 0 is background. It only checks consistency between the
-#             loader-provided label_policy and the sequential label space.
-#         """
-#         input_has_zero = 0 in set(int(x) for x in self.labels.tolist())
-#         remap_has_zero = 0 in set(int(x) for x in self.remapped_labels.tolist())
-
-#         if input_has_zero and not remap_has_zero:
-#             raise RuntimeError(
-#                 "Input label 0 existed but disappeared after incremental remapping. "
-#                 "This is invalid for datasets where class 0 is real and also invalid "
-#                 "for already-remapped foreground labels."
+#         self.phase_to_classes = {
+#             _exact_integer(phase, name="phase ID", minimum=0): _ids(
+#                 classes, name=f"phase_to_classes[{phase}]"
+#             )
+#             for phase, classes in protocol["phase_to_classes"].items()
+#         }
+#         if sorted(self.phase_to_classes) != list(range(len(self.phase_to_classes))):
+#             raise ValueError("phase IDs must be contiguous from zero")
+#         class_count = protocol_class_count
+#         flattened = [
+#             class_id
+#             for phase in range(len(self.phase_to_classes))
+#             for class_id in self.phase_to_classes[phase]
+#         ]
+#         if flattened != list(range(class_count)):
+#             raise ValueError(
+#                 "phase schedule must cover global class IDs once in order"
 #             )
 
-#         if not self.has_background:
-#             # Raw class 0 may be a real class. This is valid. Do not warn just
-#             # because sequential class 0 exists; it must exist in any sequential
-#             # class space.
-#             if self.raw_class_values and 0 not in self.raw_class_values:
-#                 print(
-#                     "[IncrementalHSIDataset:WARN] label_policy says has_background=False, "
-#                     "but raw_class_values does not include raw class 0. This may still be "
-#                     "valid, but check the loader metadata."
-#                 )
-#         else:
-#             # Background must have been removed before this manager. If raw
-#             # background label was 0, sequential class 0 is still allowed because
-#             # it now means the first foreground class, not background.
-#             if self.background_label is None:
-#                 print(
-#                     "[IncrementalHSIDataset:WARN] has_background=True but background_label is None. "
-#                     "Visualization/reporting will treat display value 0 as background/unlabeled."
-#                 )
-
-
-#     def _build_target_names_by_seq(self, target_names: Optional[List[str]]) -> Optional[List[str]]:
-#         if target_names is None:
-#             return None
-
-#         out: List[str] = []
-#         for sid in range(len(self.all_classes)):
-#             gid = self.inv_label_map.get(sid, sid)
-#             if int(gid) < len(target_names):
-#                 out.append(str(target_names[int(gid)]))
-#             else:
-#                 out.append(f"Class {gid}")
-#         return out
-
-#     def _validate_full_class_coverage(self) -> None:
-#         present = set(int(x) for x in np.unique(self.remapped_labels).tolist())
-#         expected = set(range(self.num_classes))
-#         missing = sorted(expected - present)
-#         extra = sorted(present - expected)
-
-#         if missing or extra:
-#             raise RuntimeError(
-#                 f"Remapped label space is broken. Missing={missing}, extra={extra}, "
-#                 f"num_classes={self.num_classes}, class_order={self.class_order}"
+#         # The protocol must expose one canonical base-training membership for
+#         # preprocessing, and it must be exactly the phase-0 training split.
+#         if "base_train_indices" not in protocol:
+#             raise ValueError("protocol is missing base_train_indices")
+#         if "phase_train_indices" not in protocol:
+#             raise ValueError("protocol is missing phase_train_indices")
+#         phase_train_indices = protocol["phase_train_indices"]
+#         if not isinstance(phase_train_indices, Mapping) or 0 not in phase_train_indices:
+#             raise ValueError("protocol phase_train_indices must contain phase 0")
+#         base_train_indices = _integer_array(
+#             protocol["base_train_indices"],
+#             name="protocol base_train_indices",
+#         ).reshape(-1)
+#         phase0_train_indices = _integer_array(
+#             phase_train_indices[0],
+#             name="protocol phase_train_indices[0]",
+#         ).reshape(-1)
+#         if (
+#             base_train_indices.size == 0
+#             or phase0_train_indices.size == 0
+#             or not np.array_equal(
+#                 np.sort(base_train_indices),
+#                 np.sort(phase0_train_indices),
 #             )
+#         ):
+#             raise ValueError(
+#                 "protocol base_train_indices must equal phase_train_indices[0]"
+#             )
+#         self.base_train_indices = base_train_indices.copy()
+
+#         self._split_by_class = {
+#             _exact_integer(class_id, name="split class ID", minimum=0): {
+#                 name: _integer_array(
+#                     values, name=f"class {class_id} {name} indices"
+#                 )
+#                 for name, values in row.items()
+#             }
+#             for class_id, row in protocol["split_by_class"].items()
+#         }
+#         _validate_split_by_class(
+#             self._split_by_class, self.labels, class_count
+#         )
+
+#         # Validate every protocol membership field against the single canonical
+#         # split_by_class state.  This prevents preprocessing/training/reporting
+#         # from silently consuming different sample memberships.
+#         for field, split_name in (
+#             ("phase_train_indices", "train"),
+#             ("phase_val_indices", "val"),
+#             ("phase_test_indices", "test"),
+#         ):
+#             raw = protocol.get(field)
+#             if not isinstance(raw, Mapping):
+#                 raise ValueError(f"protocol {field} must be a phase mapping")
+#             if set(int(key) for key in raw) != set(self.phase_to_classes):
+#                 raise ValueError(
+#                     f"protocol {field} must contain every phase exactly once"
+#                 )
+
+#             for phase_id, classes in self.phase_to_classes.items():
+#                 declared = _integer_array(
+#                     raw[phase_id],
+#                     name=f"protocol {field}[{phase_id}]",
+#                 ).reshape(-1)
+#                 expected = _collect_indices(
+#                     self._split_by_class,
+#                     classes,
+#                     split_name,
+#                 )
+#                 if not np.array_equal(
+#                     np.sort(declared),
+#                     np.sort(expected),
+#                 ):
+#                     raise ValueError(
+#                         f"protocol {field}[{phase_id}] disagrees with split_by_class"
+#                     )
+
+#         cumulative_test = protocol.get("cumulative_test_indices")
+#         if not isinstance(cumulative_test, Mapping):
+#             raise ValueError(
+#                 "protocol cumulative_test_indices must be a phase mapping"
+#             )
+#         if set(int(key) for key in cumulative_test) != set(self.phase_to_classes):
+#             raise ValueError(
+#                 "protocol cumulative_test_indices must contain every phase"
+#             )
+#         for phase_id in self.phase_to_classes:
+#             declared = _integer_array(
+#                 cumulative_test[phase_id],
+#                 name=f"protocol cumulative_test_indices[{phase_id}]",
+#             ).reshape(-1)
+#             expected = _collect_indices(
+#                 self._split_by_class,
+#                 self.get_seen_classes(phase_id),
+#                 "test",
+#             )
+#             if not np.array_equal(
+#                 np.sort(declared),
+#                 np.sort(expected),
+#             ):
+#                 raise ValueError(
+#                     "protocol cumulative_test_indices "
+#                     f"[{phase_id}] disagrees with split_by_class"
+#                 )
+
+#         preprocessing_fit_phase = _exact_integer(
+#             protocol.get("preprocessing_fit_phase", 0),
+#             name="protocol preprocessing_fit_phase",
+#             minimum=0,
+#         )
+#         if preprocessing_fit_phase != 0:
+#             raise ValueError("persistent HSI preprocessing must be fitted in phase 0")
+
+#         preprocessing_frozen = _exact_bool(
+#             protocol.get("preprocessing_frozen_across_phases", True),
+#             name="protocol preprocessing_frozen_across_phases",
+#         )
+#         if not preprocessing_frozen:
+#             raise ValueError(
+#                 "persistent HSI preprocessing must remain frozen across phases"
+#             )
+
+#         names = [str(v) for v in target_names]
+#         global_names = [
+#             str(v) for v in protocol.get("global_target_names", [])
+#         ]
+#         if global_names and len(global_names) != class_count:
+#             raise ValueError("protocol global_target_names has wrong length")
+#         if not global_names and len(names) != class_count:
+#             raise ValueError("target_names must contain one name per class")
+#         self.class_order_original_ids = _ids(
+#             protocol["class_order_original_ids"],
+#             name="class_order_original_ids",
+#         )
+#         if set(self.class_order_original_ids) != set(range(class_count)):
+#             raise ValueError(
+#                 "class_order_original_ids must be a complete original-class permutation"
+#             )
+#         self.target_names = global_names or [
+#             names[index] for index in self.class_order_original_ids
+#         ]
+
+#         self.global_to_original = {
+#             _exact_integer(k, name="global class ID", minimum=0):
+#             _exact_integer(v, name="original class ID", minimum=0)
+#             for k, v in protocol["global_to_original"].items()
+#         }
+#         expected_global_to_original = {
+#             global_id: original_id
+#             for global_id, original_id in enumerate(self.class_order_original_ids)
+#         }
+#         if self.global_to_original != expected_global_to_original:
+#             raise ValueError(
+#                 "global_to_original disagrees with class_order_original_ids"
+#             )
+
+#         self.split_strategy = str(protocol["split_strategy"]).strip().lower()
+#         self.spatial_partition_mode = str(
+#             protocol.get("spatial_partition_mode", "pixel_indices")
+#         )
+
+#         validation_presence = [
+#             bool(self._split_by_class[class_id]["val"].size)
+#             for class_id in range(class_count)
+#         ]
+#         if any(validation_presence) and not all(validation_presence):
+#             raise ValueError(
+#                 "validation must be present for every class or absent for every class"
+#             )
+#         actual_validation_enabled = all(validation_presence)
+#         declared_validation_enabled = _exact_bool(
+#             protocol.get("validation_enabled", actual_validation_enabled),
+#             name="protocol validation_enabled",
+#         )
+#         if declared_validation_enabled != actual_validation_enabled:
+#             raise ValueError(
+#                 "protocol validation_enabled disagrees with validation split membership"
+#             )
+#         self.validation_enabled = actual_validation_enabled
+
+#         self.require_patch_disjoint = _exact_bool(
+#             require_patch_disjoint,
+#             name="require_patch_disjoint",
+#         )
+#         self.require_phase_context_isolation = (
+#             self.require_patch_disjoint
+#             if require_phase_context_isolation is None
+#             else _exact_bool(
+#                 require_phase_context_isolation,
+#                 name="require_phase_context_isolation",
+#             )
+#         )
+#         self.context_policy = str(context_policy).strip()
+#         if self.context_policy != "full_scene_reflect":
+#             raise ValueError(
+#                 "only context_policy='full_scene_reflect' is implemented"
+#             )
+
+#         protocol_seed = _exact_integer(
+#             protocol["seed"], name="protocol seed", minimum=0
+#         )
+#         self.seed = (
+#             protocol_seed
+#             if seed is None
+#             else _exact_integer(seed, name="dataset-manager seed", minimum=0)
+#         )
+#         if self.seed != protocol_seed:
+#             raise ValueError("dataset-manager seed disagrees with protocol seed")
+
+#         self.num_workers = _exact_integer(
+#             num_workers, name="num_workers", minimum=0
+#         )
+#         self.pin_memory = str(device).startswith("cuda")
+#         self.current_phase: Optional[int] = None
+#         self.finalized_phases: List[int] = []
+
+#         self._split_patch_disjoint = self._audit_split_patch_disjoint()
+#         self._phase_context_isolated = self._audit_phase_context_isolation()
+
+#         if self.require_patch_disjoint and not self._split_patch_disjoint:
+#             raise RuntimeError(
+#                 "train/val/test patch footprints overlap. A random-pixel centre "
+#                 "split is not spatial-leakage-free for patch models. Use a "
+#                 "guarded/predefined spatial split or explicitly disable the "
+#                 "strict audit only for benchmark-comparability experiments."
+#             )
+#         if (
+#             self.require_phase_context_isolation
+#             and not self._phase_context_isolated
+#         ):
+#             raise RuntimeError(
+#                 "at least one phase-training patch contains an annotated labeled "
+#                 "center unavailable in that phase (old, future, validation, or test). "
+#                 "This violates strict spatial phase isolation."
+#             )
+
+#     @property
+#     def nb_tasks(self) -> int:
+#         return len(self.phase_to_classes)
+
+#     @property
+#     def base_classes(self) -> List[int]:
+#         return list(self.phase_to_classes[0])
 
 #     def _validate_phase(self, phase: int) -> int:
-#         phase = int(phase)
-#         if phase < 0 or phase >= self.num_phases:
-#             raise ValueError(f"Invalid phase {phase}. Valid range: 0..{self.num_phases - 1}")
-#         return phase
+#         value = _exact_integer(phase, name="phase", minimum=0)
+#         if value not in self.phase_to_classes:
+#             raise ValueError(f"unknown phase {phase}")
+#         return value
 
-#     # ============================================================
-#     # Basic mapping helpers
-#     # ============================================================
-#     def seq_to_global(self, seq_id: int) -> int:
-#         return int(self.inv_label_map[int(seq_id)])
-
-#     def global_to_seq(self, global_id: int) -> int:
-#         return int(self.label_map[int(global_id)])
-
-#     def get_phase_classes(self, phase: int) -> List[int]:
-#         phase = self._validate_phase(phase)
-#         return list(self.phase_to_classes[phase])
-
-#     def get_classes_up_to_phase(self, phase: int) -> List[int]:
-#         phase = self._validate_phase(phase)
-#         classes: List[int] = []
-#         for p in range(phase + 1):
-#             classes.extend(self.phase_to_classes[p])
-#         return classes
-
-#     # ============================================================
-#     # Protocol controls
-#     # ============================================================
 #     def start_phase(self, phase: int) -> None:
-#         phase = self._validate_phase(phase)
-#         self.current_phase = phase
-#         self._invalidate_train_caches_for_locked_classes()
+#         value = self._validate_phase(phase)
+#         if self.current_phase is not None:
+#             raise RuntimeError(f"phase {self.current_phase} is already active")
+#         if value in self.finalized_phases:
+#             raise RuntimeError(f"phase {value} is already finalized")
+#         if self.finalized_phases != list(range(value)):
+#             raise RuntimeError(
+#                 "phases must start in order after prior finalization"
+#             )
+#         self.current_phase = value
 
 #     def finalize_phase(self, phase: int) -> None:
-#         phase = self._validate_phase(phase)
+#         value = self._validate_phase(phase)
+#         if self.current_phase != value:
+#             raise RuntimeError(f"phase {value} is not the active phase")
+#         self.finalized_phases.append(value)
+#         self.current_phase = None
 
-#         self.finalized_phases.add(phase)
-#         self.finalized_classes.update(self.phase_to_classes[phase])
-#         self._memory_build_active = False
-#         self._memory_build_classes.clear()
-#         self._invalidate_train_caches_for_locked_classes()
-
-#     def is_phase_finalized(self, phase: int) -> bool:
-#         return int(phase) in self.finalized_phases
-
-#     def is_class_finalized(self, cls: int) -> bool:
-#         return int(cls) in self.finalized_classes
-
-#     def get_accessible_train_classes(self) -> List[int]:
-#         if not self.strict_non_exemplar:
-#             return list(range(self.num_classes))
-#         return list(self.phase_to_classes[self.current_phase])
-
-#     def _invalidate_train_caches_for_locked_classes(self) -> None:
-#         keys_to_delete = []
-#         accessible = set(self.get_accessible_train_classes())
-
-#         for key in list(self._semantic_token_cache.keys()):
-#             cls, descriptor = key
-#             if "_train" not in descriptor:
-#                 continue
-#             if self.strict_non_exemplar and int(cls) not in accessible:
-#                 keys_to_delete.append(key)
-
-#         for k in keys_to_delete:
-#             del self._semantic_token_cache[k]
-
-#     def _is_train_access_allowed(self, cls: int) -> bool:
-#         cls = int(cls)
-
-#         if not self.strict_non_exemplar:
-#             return True
-
-#         if cls in self.phase_to_classes[self.current_phase]:
-#             return True
-
-#         if self._memory_build_active and cls in self._memory_build_classes:
-#             return True
-
-#         return False
-
-#     def _check_class_split_access(self, cls: int, split: str) -> None:
-#         cls = int(cls)
-#         split = str(split).lower()
-
-#         if split != "train":
-#             return
-
-#         if not self._is_train_access_allowed(cls):
-#             phase_of_cls = self.class_to_phase.get(cls, None)
-#             raise PermissionError(
-#                 f"Strict non-exemplar protocol violation: raw TRAIN access denied for class {cls} "
-#                 f"(phase={phase_of_cls}, current_phase={self.current_phase}, finalized={cls in self.finalized_classes}). "
-#                 f"Use stored geometry memory instead of old raw training patches."
+#     def restore_finalized_phases(
+#         self,
+#         phases: Sequence[int],
+#     ) -> None:
+#         """Restore checkpoint protocol state without exposing historical data."""
+#         if self.current_phase is not None:
+#             raise RuntimeError(
+#                 "cannot restore finalized phases while a phase is active"
 #             )
-
-#     @contextmanager
-#     def memory_build_context(self, phase: int):
-#         phase = int(phase)
-#         if phase != self.current_phase:
+#         if self.finalized_phases:
+#             raise RuntimeError(
+#                 "restore_finalized_phases requires a fresh unfinalized manager"
+#             )
+#         values = [
+#             self._validate_phase(value)
+#             for value in phases
+#         ]
+#         if values != list(range(len(values))):
 #             raise ValueError(
-#                 f"memory_build_context phase={phase} must match current_phase={self.current_phase}"
+#                 "restored finalized phases must be contiguous from zero"
 #             )
+#         self.finalized_phases = values
 
-#         allowed_classes = set(self.phase_to_classes[phase])
+#     def get_task_size(self, phase: int) -> int:
+#         return len(self.phase_to_classes[self._validate_phase(phase)])
 
-#         prev_active = self._memory_build_active
-#         prev_classes = set(self._memory_build_classes)
+#     def get_new_classes(self, phase: int) -> List[int]:
+#         return list(self.phase_to_classes[self._validate_phase(phase)])
 
-#         self._memory_build_active = True
-#         self._memory_build_classes = allowed_classes
+#     def get_old_classes(self, phase: int) -> List[int]:
+#         value = self._validate_phase(phase)
+#         return [
+#             class_id
+#             for previous in range(value)
+#             for class_id in self.phase_to_classes[previous]
+#         ]
 
-#         try:
-#             yield
-#         finally:
-#             self._memory_build_active = prev_active
-#             self._memory_build_classes = prev_classes
+#     def get_seen_classes(self, phase: int) -> List[int]:
+#         return self.get_old_classes(phase) + self.get_new_classes(phase)
 
-#     # ============================================================
-#     # Split creation
-#     # ============================================================
-#     def _create_splits(self) -> None:
-#         self.train_indices: List[int] = []
-#         self.val_indices: List[int] = []
-#         self.test_indices: List[int] = []
+#     def extract_patch(self, row: int, col: int) -> np.ndarray:
+#         row_id = _exact_integer(row, name="patch row", minimum=0)
+#         col_id = _exact_integer(col, name="patch col", minimum=0)
+#         if row_id >= self.gt_shape[0] or col_id >= self.gt_shape[1]:
+#             raise ValueError("patch centre lies outside gt_shape")
+#         return self.padded_cube[
+#             row_id : row_id + self.patch_size,
+#             col_id : col_id + self.patch_size,
+#         ]
 
-#         for seq_id in range(self.num_classes):
-#             class_indices = np.where(self.remapped_labels == seq_id)[0]
-#             n_samples = len(class_indices)
+#     def _indices_mask(self, indices: np.ndarray) -> np.ndarray:
+#         mask = np.zeros(self.gt_shape, dtype=bool)
+#         values = _integer_array(indices, name="audit indices").reshape(-1)
+#         if values.size:
+#             if values.min() < 0 or values.max() >= len(self.labels):
+#                 raise ValueError("audit indices are outside labelled samples")
+#             if np.unique(values).size != values.size:
+#                 raise ValueError("audit indices contain duplicates")
+#             xy = self.coords[values]
+#             mask[xy[:, 0], xy[:, 1]] = True
+#         return mask
 
-#             if n_samples == 0:
-#                 continue
+#     def _patch_overlap_count(
+#         self,
+#         left_indices: np.ndarray,
+#         right_indices: np.ndarray,
+#     ) -> int:
+#         """Count left centers whose extracted patch overlaps a right patch."""
+#         left = _integer_array(left_indices, name="left indices").reshape(-1)
+#         right = _integer_array(right_indices, name="right indices").reshape(-1)
+#         if left.size == 0 or right.size == 0:
+#             return 0
 
-#             rng = np.random.RandomState(self.seed + seq_id)
-#             shuffled = rng.permutation(class_indices)
+#         # Two odd P x P patches overlap when center Chebyshev distance <= P-1.
+#         from scipy.ndimage import maximum_filter
 
-#             if n_samples == 1:
-#                 self.train_indices.extend(shuffled.tolist())
-#                 continue
-
-#             if n_samples == 2:
-#                 self.train_indices.append(int(shuffled[0]))
-#                 self.test_indices.append(int(shuffled[1]))
-#                 continue
-
-#             n_train = max(self.min_train_per_class, int(round(n_samples * self.train_ratio)))
-#             n_val = max(1, int(round(n_samples * self.val_ratio)))
-
-#             if n_train + n_val >= n_samples:
-#                 overflow = (n_train + n_val) - (n_samples - 1)
-
-#                 reduce_val = min(overflow, max(0, n_val - 1))
-#                 n_val -= reduce_val
-#                 overflow -= reduce_val
-
-#                 if overflow > 0:
-#                     n_train = max(1, n_train - overflow)
-
-#             n_train = max(1, min(n_train, n_samples - 2))
-#             n_val = max(1, min(n_val, n_samples - n_train - 1))
-#             n_test = n_samples - n_train - n_val
-
-#             assert n_train >= 1
-#             assert n_val >= 1
-#             assert n_test >= 1
-#             assert n_train + n_val + n_test == n_samples
-
-#             self.train_indices.extend(shuffled[:n_train].tolist())
-#             self.val_indices.extend(shuffled[n_train:n_train + n_val].tolist())
-#             self.test_indices.extend(shuffled[n_train + n_val:].tolist())
-
-#         self.train_indices = np.array(self.train_indices, dtype=np.int64)
-#         self.val_indices = np.array(self.val_indices, dtype=np.int64)
-#         self.test_indices = np.array(self.test_indices, dtype=np.int64)
-
-#     # ============================================================
-#     # Diagnostics
-#     # ============================================================
-#     def _print_stats(self) -> None:
-#         print("[IncrementalHSIDataset] Initialized")
-#         print(f"  Total classes: {self.num_classes} | Phases: {self.num_phases}")
-#         print(f"  Input classes: {self.all_classes}")
-#         print(f"  Class order: {self.class_order}")
-#         print(f"  Strict non-exemplar: {self.strict_non_exemplar}")
-#         print(
-#             f"  Label policy: has_background={self.has_background}, "
-#             f"background_label={self.background_label}, raw_class_values={self.raw_class_values}"
+#         right_mask = self._indices_mask(right)
+#         radius = self.patch_size - 1
+#         dilated = (
+#             right_mask
+#             if radius == 0
+#             else maximum_filter(
+#                 right_mask.astype(np.uint8),
+#                 size=2 * radius + 1,
+#                 mode="constant",
+#                 cval=0,
+#             ).astype(bool)
 #         )
-#         print(
-#             "  Sequential class 0 present: "
-#             f"{0 in self.all_classes} "
-#             "(this is a real training class id, not automatically background)"
+#         xy = self.coords[left]
+#         return int(dilated[xy[:, 0], xy[:, 1]].sum())
+
+#     def _forbidden_center_in_patch_count(
+#         self,
+#         train_indices: np.ndarray,
+#         forbidden_indices: np.ndarray,
+#     ) -> int:
+#         """Count train patches containing an unavailable labeled center.
+
+#         This differs from patch-vs-patch overlap. During phase-t training the
+#         unavailable old/future/validation/test sample is not itself extracted as
+#         a patch. The strict observable leakage event is that its labeled center
+#         spectrum lies inside the current train patch.
+#         """
+#         train = _integer_array(train_indices, name="train indices").reshape(-1)
+#         forbidden = _integer_array(
+#             forbidden_indices, name="forbidden indices"
+#         ).reshape(-1)
+#         if train.size == 0 or forbidden.size == 0:
+#             return 0
+
+#         from scipy.ndimage import maximum_filter
+
+#         forbidden_mask = self._indices_mask(forbidden)
+#         radius = self.patch_size // 2
+#         dilated = (
+#             forbidden_mask
+#             if radius == 0
+#             else maximum_filter(
+#                 forbidden_mask.astype(np.uint8),
+#                 size=2 * radius + 1,
+#                 mode="constant",
+#                 cval=0,
+#             ).astype(bool)
 #         )
+#         xy = self.coords[train]
+#         return int(dilated[xy[:, 0], xy[:, 1]].sum())
 
-#         for p in range(self.num_phases):
-#             global_ids = [self.seq_to_global(sid) for sid in self.phase_to_classes[p]]
-#             names = []
-#             if self.target_names_by_seq is not None:
-#                 for sid in self.phase_to_classes[p]:
-#                     if int(sid) < len(self.target_names_by_seq):
-#                         names.append(self.target_names_by_seq[int(sid)])
-#                     else:
-#                         names.append(f"Class {self.seq_to_global(sid)}")
-#             print(f"  Phase {p}: Sequential {self.phase_to_classes[p]} (Input labels {global_ids})")
-#             if names:
-#                 print(f"           Names: {names}")
+#     def _audit_split_patch_disjoint(self) -> bool:
+#         all_classes = list(range(len(self._split_by_class)))
+#         split_indices = {
+#             split: _collect_indices(
+#                 self._split_by_class, all_classes, split
+#             )
+#             for split in _SPLITS
+#         }
+#         for left_index, left_name in enumerate(_SPLITS):
+#             for right_name in _SPLITS[left_index + 1 :]:
+#                 if self._patch_overlap_count(
+#                     split_indices[left_name],
+#                     split_indices[right_name],
+#                 ):
+#                     return False
+#         return True
 
-#     def get_label_policy_summary(self) -> Dict[str, Any]:
+#     def _audit_phase_context_isolation(self) -> bool:
+#         all_indices = np.arange(len(self.labels), dtype=np.int64)
+#         for phase in range(self.nb_tasks):
+#             available = _collect_indices(
+#                 self._split_by_class,
+#                 self.phase_to_classes[phase],
+#                 "train",
+#             )
+#             available_set = np.zeros(len(self.labels), dtype=bool)
+#             available_set[available] = True
+#             forbidden = all_indices[~available_set]
+#             if self._forbidden_center_in_patch_count(available, forbidden):
+#                 return False
+#         return True
+
+#     def spatial_leakage_report(self) -> Dict[str, Any]:
 #         return {
-#             "has_background": bool(self.has_background),
-#             "background_label": self.background_label,
-#             "raw_class_values": list(self.raw_class_values),
-#             "class_order": [int(c) for c in self.class_order],
-#             "label_map": {int(k): int(v) for k, v in self.label_map.items()},
-#             "inv_label_map": {int(k): int(v) for k, v in self.inv_label_map.items()},
-#             "note": (
-#                 "Training labels are sequential 0..K-1. Display value 0 in maps "
-#                 "is reserved for background/unseen/suppressed; class c is displayed as c+1."
+#             "patch_size": self.patch_size,
+#             "split_patch_disjoint": bool(self._split_patch_disjoint),
+#             "phase_training_context_isolated": bool(
+#                 self._phase_context_isolated
+#             ),
+#             "strict_split_required": self.require_patch_disjoint,
+#             "strict_phase_context_required": self.require_phase_context_isolation,
+#             "context_policy": self.context_policy,
+#             "guarantee_scope": (
+#                 "train/val/test extracted patch footprints plus unavailable annotated "
+#                 "labeled centers inside phase-training patches; unlabeled/background "
+#                 "scene pixels cannot be assigned a task identity by the benchmark"
 #             ),
 #         }
 
-#     def get_class_spectra(self, cls: int, split: str = "train") -> torch.Tensor:
-#         """Return per-sample physical center spectra for one class/split.
-
-#         This follows the same strict non-exemplar access rule as get_class_patches:
-#         old train spectra are denied after their phase is finalized. They are not
-#         stored as memory; they are used only while building the current class row.
-#         """
-#         if self.raw_spectra is None:
-#             raise AttributeError("No raw/physical center spectra are available in this dataset.")
-#         idx = self.get_class_indices(int(cls), split=split)
-#         if len(idx) == 0:
-#             raise ValueError(f"No spectra found for class {cls} in split '{split}'")
-#         return torch.from_numpy(np.ascontiguousarray(self.raw_spectra[idx])).float()
-
-#     def get_class_center_spectra(self, cls: int, split: str = "train") -> torch.Tensor:
-#         return self.get_class_spectra(cls, split=split)
-
-#     def get_class_raw_spectra(self, cls: int, split: str = "train") -> torch.Tensor:
-#         return self.get_class_spectra(cls, split=split)
-
-#     def get_class_spectral_summary(self, cls: int, split: str = "train") -> torch.Tensor:
-#         return self.get_class_spectra(cls, split=split)
-
-#     def get_class_counts(self) -> Dict[int, int]:
-#         return {
-#             int(c): int((self.remapped_labels == int(c)).sum())
-#             for c in range(self.num_classes)
-#         }
-
-#     def get_split_class_counts(self, split: str = "train") -> Dict[int, int]:
-#         indices = self._get_split_indices(split)
-#         return {
-#             int(c): int((self.remapped_labels[indices] == int(c)).sum())
-#             for c in range(self.num_classes)
-#         }
-
-#     def protocol_state(self) -> Dict[str, object]:
-#         return {
-#             "current_phase": int(self.current_phase),
-#             "strict_non_exemplar": bool(self.strict_non_exemplar),
-#             "finalized_phases": sorted(int(p) for p in self.finalized_phases),
-#             "finalized_classes": sorted(int(c) for c in self.finalized_classes),
-#             "accessible_train_classes": self.get_accessible_train_classes(),
-#             "memory_build_active": bool(self._memory_build_active),
-#             "memory_build_classes": sorted(int(c) for c in self._memory_build_classes),
-#         }
-
-#     def assert_no_old_train_access(self, cls: int) -> None:
-#         self._check_class_split_access(int(cls), "train")
-
-#     def _make_loader(
+#     def _make_dataset(
 #         self,
-#         idx: np.ndarray,
+#         class_ids: Sequence[int],
+#         split: str,
+#     ) -> IncrementalHSIPatchDataset:
+#         return IncrementalHSIPatchDataset(
+#             self,
+#             _collect_indices(self._split_by_class, class_ids, split),
+#         )
+
+#     def _loader(
+#         self,
+#         dataset: Dataset,
+#         *,
 #         batch_size: int,
 #         shuffle: bool,
-#         *,
-#         balanced: bool = False,
-#         active_classes: Optional[List[int]] = None,
+#         phase: int,
+#         split: str,
 #     ) -> DataLoader:
-#         idx = np.asarray(idx, dtype=np.int64)
-#         if idx.size == 0:
-#             raise ValueError(
-#                 "Requested DataLoader has zero samples. Check phase split, class order, "
-#                 "or strict non-exemplar access policy."
-#             )
-
-#         dataset = HSIPatchDataset(
-#             self.patches[idx],
-#             self.remapped_labels[idx],
-#             coords=self.coords[idx],
-#             return_metadata=self.return_metadata,
-#             center_spectra=(self.raw_spectra[idx] if self.raw_spectra is not None else None),
+#         size = _exact_integer(batch_size, name="batch_size", minimum=1)
+#         phase_id = self._validate_phase(phase)
+#         offset = {"train": 11, "val": 17, "test": 23, "all": 29}[split]
+#         generator = torch.Generator().manual_seed(
+#             self.seed + 1009 * phase_id + offset
 #         )
-
-#         if balanced:
-#             present = sorted(int(c) for c in dataset.labels.unique().tolist())
-#             if len(present) <= 1:
-#                 return DataLoader(
-#                     dataset,
-#                     batch_size=int(batch_size),
-#                     shuffle=bool(shuffle),
-#                     pin_memory=self.pin_memory,
-#                     num_workers=self.num_workers,
-#                     drop_last=False,
-#                 )
-
-#             classes_per_batch = int(self.geometry_batch_classes)
-#             if classes_per_batch <= 0:
-#                 classes_per_batch = len(active_classes) if active_classes is not None else len(present)
-#             classes_per_batch = max(2, min(classes_per_batch, len(present), int(batch_size)))
-
-#             samples_per_class = int(self.geometry_samples_per_class)
-#             if samples_per_class <= 0:
-#                 samples_per_class = max(2, int(batch_size) // classes_per_batch)
-
-#             sampler = ClassBalancedBatchSampler(
-#                 labels=dataset.labels,
-#                 batch_size=int(batch_size),
-#                 classes_per_batch=classes_per_batch,
-#                 samples_per_class=samples_per_class,
-#                 seed=self.seed + self.current_phase * 1009,
-#                 drop_last=False,
-#             )
-
-#             return DataLoader(
-#                 dataset,
-#                 batch_sampler=sampler,
-#                 pin_memory=self.pin_memory,
-#                 num_workers=self.num_workers,
-#             )
-
 #         return DataLoader(
 #             dataset,
-#             batch_size=int(batch_size),
+#             batch_size=size,
 #             shuffle=bool(shuffle),
-#             pin_memory=self.pin_memory,
 #             num_workers=self.num_workers,
+#             pin_memory=self.pin_memory,
 #             drop_last=False,
+#             persistent_workers=self.num_workers > 0,
+#             worker_init_fn=_seed_worker if self.num_workers > 0 else None,
+#             generator=generator,
 #         )
 
-#     # ============================================================
-#     # Split access helpers
-#     # ============================================================
-#     def _get_split_indices(self, split: str) -> np.ndarray:
-#         split = split.lower()
-#         if split == "train":
-#             return self.train_indices
-#         if split == "val":
-#             return self.val_indices
-#         if split == "test":
-#             return self.test_indices
-#         if split == "all":
-#             return np.arange(len(self.remapped_labels), dtype=np.int64)
-#         raise ValueError(f"Unknown split '{split}'. Use one of: train, val, test, all")
-
-#     def get_class_indices(self, cls: int, split: str = "train") -> np.ndarray:
-#         cls = int(cls)
-#         split = split.lower()
-#         self._check_class_split_access(cls, split)
-
-#         indices = self._get_split_indices(split)
-#         mask = self.remapped_labels[indices] == cls
-#         return indices[mask]
-
-#     def get_class_patches(self, cls: int, split: str = "train") -> np.ndarray:
-#         idx = self.get_class_indices(cls, split=split)
-#         if len(idx) == 0:
-#             raise ValueError(f"No samples found for class {cls} in split '{split}'")
-#         return self.patches[idx]
-
-#     # ============================================================
-#     # DataLoaders
-#     # ============================================================
 #     def get_phase_dataloader(
 #         self,
 #         phase: int,
@@ -2175,195 +2929,146 @@ class IncrementalHSIDataset:
 #         batch_size: int = 64,
 #         shuffle: bool = True,
 #     ) -> DataLoader:
-#         phase = self._validate_phase(phase)
-#         split = split.lower()
-
-#         active_classes = self.phase_to_classes[phase]
-
-#         if split == "train":
-#             if self.strict_non_exemplar and phase != self.current_phase:
-#                 raise PermissionError(
-#                     f"Raw TRAIN loader requested for phase {phase}, but current_phase is {self.current_phase}. "
-#                     "Strict non-exemplar mode only allows current-phase raw train access."
-#                 )
-
-#         indices = self._get_split_indices(split)
-#         mask = np.isin(self.remapped_labels[indices], active_classes)
-#         idx = indices[mask]
-
-#         use_balanced = (
-#             split == "train"
-#             and bool(self.class_balanced_train_batches)
-#             and bool(shuffle)
+#         phase_id = self._validate_phase(phase)
+#         if self.current_phase != phase_id:
+#             raise RuntimeError(
+#                 "phase train/validation loaders require an active phase"
+#             )
+#         token = _normalize_split_name(split)
+#         if token not in {"train", "val"}:
+#             raise ValueError("active phase loaders are train/val only")
+#         if token == "val" and not self.validation_enabled:
+#             raise RuntimeError("validation is disabled by this experiment protocol")
+#         dataset = self._make_dataset(
+#             self.get_new_classes(phase_id), token
 #         )
-
-#         return self._make_loader(
-#             idx,
+#         return self._loader(
+#             dataset,
 #             batch_size=batch_size,
-#             shuffle=(shuffle if split == "train" else False),
-#             balanced=use_balanced,
-#             active_classes=active_classes,
+#             shuffle=shuffle if token == "train" else False,
+#             phase=phase_id,
+#             split=token,
 #         )
 
 #     def get_cumulative_dataloader(
 #         self,
-#         up_to_phase: int,
-#         split: str = "train",
-#         batch_size: int = 64,
-#         shuffle: bool = True,
-#         allow_train_old: bool = False,
+#         phase: int,
+#         split: str = "test",
+#         batch_size: int = 256,
+#         shuffle: bool = False,
 #     ) -> DataLoader:
-#         up_to_phase = self._validate_phase(up_to_phase)
-#         split = split.lower()
-
-#         if split == "train" and self.strict_non_exemplar and not allow_train_old:
-#             # Critical protocol rule: training loaders never expose old raw samples.
-#             active_classes = list(self.phase_to_classes[self.current_phase])
-#         else:
-#             active_classes: List[int] = []
-#             for p in range(up_to_phase + 1):
-#                 active_classes.extend(self.phase_to_classes[p])
-
-#         indices = self._get_split_indices(split)
-#         mask = np.isin(self.remapped_labels[indices], active_classes)
-#         idx = indices[mask]
-
-#         use_balanced = (
-#             split == "train"
-#             and bool(self.class_balanced_train_batches)
-#             and bool(shuffle)
-#         )
-
-#         return self._make_loader(
-#             idx,
-#             batch_size=batch_size,
-#             shuffle=(shuffle if split == "train" else False),
-#             balanced=use_balanced,
-#             active_classes=active_classes,
-#         )
-
-#     def get_cumulative_test_data(self, phase: int):
-#         phase = self._validate_phase(phase)
-#         active_classes = self.get_classes_up_to_phase(phase)
-#         mask = np.isin(self.remapped_labels[self.test_indices], active_classes)
-#         idx = self.test_indices[mask]
-#         return self.patches[idx], self.remapped_labels[idx], self.coords[idx]
-
-#     # ============================================================
-#     # K-means concept extraction
-#     # ============================================================
-#     def _kmeans_numpy(
-#         self,
-#         x: np.ndarray,
-#         k: int,
-#         seed: int = 42,
-#         max_iters: int = 30,
-#     ) -> np.ndarray:
-#         if x.ndim != 2:
-#             raise ValueError(f"Expected x to be 2D, got shape={x.shape}")
-
-#         n, d = x.shape
-#         if n == 0:
-#             raise ValueError("Empty input to k-means")
-
-#         k = max(1, min(int(k), n))
-#         rng = np.random.RandomState(seed)
-
-#         centers = np.empty((k, d), dtype=np.float32)
-#         first = rng.randint(0, n)
-#         centers[0] = x[first]
-#         dist2 = ((x - centers[0]) ** 2).sum(axis=1)
-
-#         for i in range(1, k):
-#             probs = dist2 / max(dist2.sum(), 1e-12)
-#             idx = rng.choice(n, p=probs)
-#             centers[i] = x[idx]
-#             dist2 = np.minimum(dist2, ((x - centers[i]) ** 2).sum(axis=1))
-
-#         for _ in range(max_iters):
-#             assign = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
-#             new_centers = centers.copy()
-#             for i in range(k):
-#                 mask = assign == i
-#                 if mask.any():
-#                     new_centers[i] = x[mask].mean(axis=0)
-
-#             if np.allclose(new_centers, centers, atol=1e-5):
-#                 centers = new_centers
-#                 break
-#             centers = new_centers
-
-#         return centers.astype(np.float32)
-
-#     # ============================================================
-#     # Semantic concept / token access
-#     # ============================================================
-#     def get_class_concept_tokens(
-#         self,
-#         cls: int,
-#         split: str = "train",
-#         num_concepts: int = 4,
-#         use_cache: bool = True,
-#     ) -> torch.Tensor:
-#         cls = int(cls)
-#         split = split.lower()
-#         num_concepts = int(max(1, num_concepts))
-
-#         self._check_class_split_access(cls, split)
-
-#         cache_key = (cls, f"concept_{split}_{num_concepts}")
-#         if use_cache and cache_key in self._semantic_token_cache:
-#             return self._semantic_token_cache[cache_key].clone()
-
-#         class_indices = self.get_class_indices(cls, split=split)
-#         if len(class_indices) == 0:
-#             raise ValueError(f"No samples found for class {cls} in split '{split}'")
-
-#         class_patches = self.patches[class_indices]
-#         per_sample_summaries = class_patches.mean(axis=(2, 3)).astype(np.float32)
-
-#         if per_sample_summaries.shape[0] <= num_concepts:
-#             concepts = per_sample_summaries
-#         else:
-#             concepts = self._kmeans_numpy(
-#                 per_sample_summaries,
-#                 k=num_concepts,
-#                 seed=self.seed + cls,
+#         phase_id = self._validate_phase(phase)
+#         if phase_id not in self.finalized_phases:
+#             raise RuntimeError(
+#                 "cumulative evaluation requires a finalized phase"
 #             )
-
-#         token = torch.from_numpy(concepts).float()
-
-#         if use_cache:
-#             self._semantic_token_cache[cache_key] = token.clone()
-
-#         return token
-
-#     def get_class_semantic_token(
-#         self,
-#         cls: int,
-#         split: str = "train",
-#         use_cache: bool = True,
-#     ) -> torch.Tensor:
-#         cls = int(cls)
-#         split = split.lower()
-#         self._check_class_split_access(cls, split)
-
-#         cache_key = (cls, f"coarse_{split}")
-#         if use_cache and cache_key in self._semantic_token_cache:
-#             return self._semantic_token_cache[cache_key].clone()
-
-#         concepts = self.get_class_concept_tokens(
-#             cls=cls,
-#             split=split,
-#             num_concepts=4,
-#             use_cache=use_cache,
+#         token = _normalize_split_name(split)
+#         if token not in {"val", "test"}:
+#             raise ValueError("cumulative loaders are evaluation-only")
+#         if token == "val" and not self.validation_enabled:
+#             raise RuntimeError("validation is disabled by this experiment protocol")
+#         dataset = self._make_dataset(
+#             self.get_seen_classes(phase_id), token
 #         )
-#         token = concepts.mean(dim=0, keepdim=True)
+#         return self._loader(
+#             dataset,
+#             batch_size=batch_size,
+#             shuffle=bool(shuffle),
+#             phase=phase_id,
+#             split=token,
+#         )
 
-#         if use_cache:
-#             self._semantic_token_cache[cache_key] = token.clone()
+#     def get_reporting_dataloader(
+#         self,
+#         phase: int,
+#         *,
+#         batch_size: int = 256,
+#     ) -> DataLoader:
+#         """Test-only reporting loader. Never mixes train/val samples into metrics."""
+#         return self.get_cumulative_dataloader(
+#             phase,
+#             split="test",
+#             batch_size=batch_size,
+#             shuffle=False,
+#         )
 
-#         return token
+#     def get_map_dataloader(
+#         self,
+#         phase: int,
+#         *,
+#         batch_size: int = 256,
+#     ) -> DataLoader:
+#         """All labelled seen-class pixels for qualitative maps only."""
+#         phase_id = self._validate_phase(phase)
+#         if phase_id not in self.finalized_phases:
+#             raise RuntimeError("map generation requires a finalized phase")
+#         dataset = self._make_dataset(
+#             self.get_seen_classes(phase_id), "all"
+#         )
+#         return self._loader(
+#             dataset,
+#             batch_size=batch_size,
+#             shuffle=False,
+#             phase=phase_id,
+#             split="all",
+#         )
 
-#     def clear_semantic_token_cache(self) -> None:
-#         self._semantic_token_cache.clear()
+#     def protocol_report(self) -> Dict[str, Any]:
+#         return {
+#             "training_mode": "non_exemplar_class_incremental",
+#             "tasks": self.nb_tasks,
+#             "phase_to_classes": {
+#                 phase: list(classes)
+#                 for phase, classes in self.phase_to_classes.items()
+#             },
+#             "class_order_original_ids": list(self.class_order_original_ids),
+#             "split_strategy": self.split_strategy,
+#             "spatial_partition_mode": self.spatial_partition_mode,
+#             "current_phase": self.current_phase,
+#             "finalized_phases": list(self.finalized_phases),
+#             "single_head_global_labels": True,
+#             "current_phase_training_classes_only": True,
+#             "cumulative_seen_class_evaluation": True,
+#             "old_training_data_public_api": False,
+#             "stores_old_training_samples": False,
+#             "validation_enabled": bool(self.validation_enabled),
+#             "preprocessing_fit_phase": 0,
+#             "base_train_sample_count": int(self.base_train_indices.size),
+#             "preprocessing_frozen_across_phases": True,
+#             "spatial_leakage": self.spatial_leakage_report(),
+#         }
+
+#     def assert_exemplar_free_contract(self) -> bool:
+#         if self.finalized_phases != list(range(len(self.finalized_phases))):
+#             raise RuntimeError("finalized phase state is not contiguous")
+#         if self.current_phase is not None:
+#             if self.current_phase in self.finalized_phases:
+#                 raise RuntimeError(
+#                     "an active phase cannot also be finalized"
+#                 )
+#             if self.current_phase != len(self.finalized_phases):
+#                 raise RuntimeError(
+#                     "active phase must immediately follow finalized phases"
+#                 )
+#         if any(
+#             token in self.__dict__
+#             for token in ("exemplars", "replay_buffer", "memory_samples")
+#         ):
+#             raise RuntimeError("dataset manager contains forbidden replay state")
+#         if self.require_patch_disjoint and not self._split_patch_disjoint:
+#             raise RuntimeError("strict split patch-disjoint contract is violated")
+#         if (
+#             self.require_phase_context_isolation
+#             and not self._phase_context_isolated
+#         ):
+#             raise RuntimeError(
+#                 "strict phase-context isolation contract is violated"
+#             )
+#         return True
+
+
+# __all__ = [
+#     "build_incremental_protocol",
+#     "IncrementalHSIPatchDataset",
+#     "IncrementalHSIDatasetManager",
+# ]
