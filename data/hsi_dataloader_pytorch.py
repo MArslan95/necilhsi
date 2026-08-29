@@ -2,12 +2,18 @@ from __future__ import annotations
 
 """HSI loading and preprocessing for class-incremental experiments.
 
-The loader maps foreground labels once, keeps the processed spectral-spatial
-cube consistent across phases, and exposes ordinary PyTorch dataset helpers.
-The incremental protocol decides which samples and classes are available.
-Training-only spatial symmetry augmentation is deliberately not performed here;
-the base trainer applies it after batch loading so preprocessing and all
-evaluation/reference loaders remain deterministic and unchanged.
+The loader maps foreground labels once and fits persistent preprocessing from
+phase-0 TRAIN centres only.
+
+Input roles are explicit:
+* ``processed_cube`` is the standardized/PCA cube used to extract the spatial patch;
+* ``ordered_spectral_cube`` is the original ordered full-band HSI used only for
+  the center-spectrum spectral path.
+
+These are two input views of the same pixel, not two learned representations.
+They are fused by the backbone into the single canonical Q used downstream.
+Training-only spatial augmentation is deliberately outside preprocessing so
+reference/evaluation loaders remain deterministic.
 """
 
 import os
@@ -638,6 +644,7 @@ def FitHSIPreprocessorFromProtocol(
         "phase_train_indices",
         "phase_to_classes",
         "global_labels",
+        "split_by_class",
     }
     missing = required - set(protocol)
     if missing:
@@ -759,6 +766,43 @@ def FitHSIPreprocessorFromProtocol(
             "base_train_indices must contain exactly the phase-0 classes; "
             f"observed={sorted(observed_base_labels)}, "
             f"expected={sorted(base_classes)}"
+        )
+
+    split_by_class = protocol["split_by_class"]
+    if not isinstance(split_by_class, Mapping):
+        raise ValueError("protocol split_by_class must be a mapping")
+    expected_base_train_rows: list[np.ndarray] = []
+    for class_id in base_classes:
+        if class_id not in split_by_class:
+            raise ValueError(
+                f"protocol split_by_class lacks base class {class_id}"
+            )
+        row = split_by_class[class_id]
+        if not isinstance(row, Mapping) or "train" not in row:
+            raise ValueError(
+                f"protocol split_by_class[{class_id}] lacks train indices"
+            )
+        class_train = _integer_array(
+            row["train"],
+            name=f"split_by_class[{class_id}]['train']",
+        ).reshape(-1)
+        if class_train.size == 0:
+            raise ValueError(
+                f"base class {class_id} has an empty TRAIN split"
+            )
+        expected_base_train_rows.append(class_train)
+
+    expected_base_train = np.concatenate(expected_base_train_rows)
+    if (
+        expected_base_train.size != fit_indices.size
+        or not np.array_equal(
+            np.sort(expected_base_train),
+            np.sort(fit_indices),
+        )
+    ):
+        raise ValueError(
+            "base_train_indices must equal the union of the phase-0 "
+            "class TRAIN splits in split_by_class"
         )
 
     fit_mask = BuildPreprocessFitMask(
@@ -991,9 +1035,9 @@ def create_dataloader(
     return DataLoader(
         HSICubeDataset(patches, labels),
         batch_size=size,
-        shuffle=bool(shuffle),
+        shuffle=_exact_bool(shuffle, name="shuffle"),
         num_workers=workers,
-        pin_memory=bool(pin_memory),
+        pin_memory=_exact_bool(pin_memory, name="pin_memory"),
     )
 
 
@@ -1013,12 +1057,6 @@ __all__ = [
     "HSICubeDataset",
     "create_dataloader",
 ]
-
-
-
-
-
-
 
 
 

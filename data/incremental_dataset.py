@@ -10,6 +10,8 @@ Protocol contract
   available only after the phase is finalized.
 * The spatial branch receives the processed/PCA patch.
 * The spectral branch receives the raw ordered full-band centre spectrum.
+* Those two inputs are fused by the backbone; the dataset does not create a
+  second learned representation.
 * No optimization/model-selection API returns historical training samples after its phase.
 * A finalized-phase map loader may read all labelled seen-class pixels strictly for
   post-training qualitative reporting; those rows are never an optimization source.
@@ -1370,7 +1372,7 @@ class IncrementalHSIDatasetManager:
         return DataLoader(
             dataset,
             batch_size=size,
-            shuffle=bool(shuffle),
+            shuffle=_exact_bool(shuffle, name="shuffle"),
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
@@ -1455,7 +1457,7 @@ class IncrementalHSIDatasetManager:
         *,
         batch_size: int = 256,
     ) -> DataLoader:
-        """All labelled seen-class pixels for qualitative maps only."""
+        """All labeled seen-class pixels for qualitative maps only; never metrics/training."""
         phase_id = self._validate_phase(phase)
         if phase_id not in self.finalized_phases:
             raise RuntimeError("map generation requires a finalized phase")
@@ -1469,6 +1471,57 @@ class IncrementalHSIDatasetManager:
             phase=phase_id,
             split="all",
         )
+
+    def base_phase_contract_report(self) -> Dict[str, Any]:
+        """Return read-only checks for the finalized phase-0 data contract."""
+        base_ids = self.get_new_classes(0)
+        train_indices = _collect_indices(
+            self._split_by_class,
+            base_ids,
+            "train",
+        )
+        val_indices = _collect_indices(
+            self._split_by_class,
+            base_ids,
+            "val",
+        )
+        test_indices = _collect_indices(
+            self._split_by_class,
+            base_ids,
+            "test",
+        )
+        if not np.array_equal(
+            np.sort(train_indices),
+            np.sort(self.base_train_indices),
+        ):
+            raise RuntimeError(
+                "base TRAIN membership disagrees with preprocessing membership"
+            )
+        if (
+            np.intersect1d(train_indices, val_indices).size
+            or np.intersect1d(train_indices, test_indices).size
+            or np.intersect1d(val_indices, test_indices).size
+        ):
+            raise RuntimeError("base train/val/test centre indices overlap")
+        observed = sorted(
+            int(v)
+            for v in np.unique(self.labels[train_indices])
+        )
+        if observed != sorted(base_ids):
+            raise RuntimeError(
+                "base TRAIN split does not contain exactly the base classes"
+            )
+        return {
+            "base_class_ids": list(base_ids),
+            "train_count": int(train_indices.size),
+            "validation_count": int(val_indices.size),
+            "test_count": int(test_indices.size),
+            "preprocess_fit_count": int(self.base_train_indices.size),
+            "train_equals_preprocess_fit": True,
+            "center_splits_disjoint": True,
+            "validation_enabled": bool(self.validation_enabled),
+            "spatial_leakage": self.spatial_leakage_report(),
+        }
 
     def protocol_report(self) -> Dict[str, Any]:
         return {
@@ -1529,8 +1582,6 @@ __all__ = [
     "IncrementalHSIPatchDataset",
     "IncrementalHSIDatasetManager",
 ]
-
-
 
 
 
