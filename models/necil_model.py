@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-"""SCOPE-HSI model integration with one canonical representation.
+"""NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
 
-The architecture has one learned sample representation:
+Q[K,D] is the only learned discriminative sample representation. P[B,3] is a
+deterministic phase-stable physical spectral structure built from the complete
+pre-PCA centre spectrum; B is dataset-derived and independent of K.
 
-    HSI -> backbone -> Q_raw -> global RMS canonicalization -> Q in R^{K x D}.
-
-The persistent angular classifier W and historical class state {I,S,N} are
-defined in this same Q coordinate. Phase 0 learns Q and W. After a class is
-finalized, I/S/N are estimated from its real TRAIN Q. During incremental
-learning the backbone is frozen, so historical state remains valid. Real
-current-class Q and retained historical I/S jointly supervise the same
-persistent classifier, including historical rows.
-
-There is no feature transport, second representation, geometry prediction head,
-phase-specific classifier, replay, or analytic classifier.
+Persistent class state is exactly
+    {I_Q[K,D], V_Q[K,K,D], I_P[B,3], V_P[B,B,3], N}.
+A single bias-free normalized cosine classifier supplies the all-seen decision
+rule. The *whole* HSI CDS constrains incremental learning: I_Q supplies ordered
+historical identity, V_Q supplies complete learned intra-class relation spread,
+all seen I_Q,V_Q derive learned inter-class structure, and I_P,V_P derive native
+full-band physical spectral confusability. Historical CDS directly supervises the
+same classifier during every incremental epoch; no pseudo-feature, inversion,
+second classifier, or post-hoc calibration stage is used.
 """
 
-from dataclasses import dataclass, replace
-import math
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Sequence
 
@@ -26,86 +25,79 @@ import torch
 import torch.nn as nn
 
 from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
-from models.classifier import ClassifierOutput, PersistentCosineClassifier
-from models.geometry_bank import HSIClassDiscriminativeGeometry
+from models.classifier import ClassifierOutput, SpectralCDSClassifier
+from models.geometry_bank import (
+    ClassDiscriminativeStructureState,
+    PhysicalSpectralStructureBatch,
+    ClassStructureBatch,
+    HSIClassDiscriminativeStructureBank,
+)
+from models.spectral_evidence import OrderedPhysicalSpectralEvidence
 
 Tensor = torch.Tensor
 
 
 def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
-    if torch.is_tensor(values):
-        if values.ndim != 1 or values.numel() == 0:
-            raise ValueError("class_ids tensor must be non-empty and rank one")
-        if values.dtype != torch.long:
-            raise TypeError("class_ids tensor must use torch.long")
-        source = values.detach().cpu().tolist()
-    else:
-        source = list(values)
+    source = values.detach().cpu().tolist() if torch.is_tensor(values) else list(values)
     result: list[int] = []
     for value in source:
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            raise TypeError("class_ids must contain integer IDs")
-        class_id = int(value)
-        if class_id < 0:
-            raise ValueError("class_ids must be non-negative")
-        result.append(class_id)
+        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+            raise ValueError("class_ids must contain non-negative integers")
+        result.append(int(value))
     output = tuple(result)
-    if not output:
-        raise ValueError("class_ids cannot be empty")
-    if len(output) != len(set(output)):
-        raise ValueError("class_ids must be unique")
+    if not output or len(output) != len(set(output)):
+        raise ValueError("class_ids must be non-empty and unique")
     return output
+
+
+def _physical_band_positions(backbone: HSIMambaFeatureExtractor) -> Tensor | None:
+    positions = backbone.spectral_encoder.band_positions.detach().cpu()
+    return positions if positions.numel() == int(backbone.spectral_bands) else None
 
 
 @dataclass(frozen=True)
 class NECILOutput:
     backbone: BackboneOutput
+    spectral_evidence: Tensor
     classification: ClassifierOutput
-
-@dataclass(frozen=True)
-class BoundarySafetyOutput:
-    historical_class_ids: tuple[int, ...]
-    rival_class_ids: tuple[int, ...]
-    mean_gap: Tensor
-    dispersion_upper_bound: Tensor
-    score: Tensor
-
 
 
 class NECILModel(nn.Module):
-    """One Q-space + persistent angular classifier + Q-derived class statistics."""
+    """One plastic HSI representation, one physical spectral reference, one CDS."""
 
     def __init__(self, args: Any) -> None:
         super().__init__()
-
         self.backbone = HSIMambaFeatureExtractor(args)
-        for name in ("spectral_token_count", "spectral_token_dim"):
-            if not hasattr(self.backbone, name):
-                raise RuntimeError(f"backbone must expose {name}")
-
         reference = next(self.backbone.parameters(), None)
         if reference is None:
-            raise RuntimeError("backbone must contain trainable parameters")
+            raise RuntimeError("backbone must contain parameters")
         if reference.dtype not in (torch.float32, torch.float64):
             raise TypeError("backbone parameters must use float32 or float64")
 
-        self.classifier = PersistentCosineClassifier(
-            spectral_token_count=int(self.backbone.spectral_token_count),
-            spectral_token_dim=int(self.backbone.spectral_token_dim),
+        band_positions = _physical_band_positions(self.backbone)
+        self.spectral_evidence_extractor = OrderedPhysicalSpectralEvidence(
+            band_count=int(self.backbone.spectral_bands),
+            band_positions=band_positions,
         )
-        self.geometry_bank = HSIClassDiscriminativeGeometry(
+        self.structure_bank = HSIClassDiscriminativeStructureBank(
             spectral_token_count=int(self.backbone.spectral_token_count),
             spectral_token_dim=int(self.backbone.spectral_token_dim),
+            spectral_bands=int(self.backbone.spectral_bands),
+            spectral_band_positions=band_positions,
             device=reference.device,
             dtype=reference.dtype,
         )
+        total_class_count = int(getattr(args, "class_count", 0))
+        if total_class_count < 2:
+            raise ValueError("args.class_count must be set before NECILModel construction")
+        self.classifier = SpectralCDSClassifier(
+            spectral_token_count=int(self.backbone.spectral_token_count),
+            spectral_token_dim=int(self.backbone.spectral_token_dim),
+            total_class_count=total_class_count,
+        )
         self.validate_model_state()
 
-    # ------------------------------------------------------------------
-    # Basic model contract
-    # ------------------------------------------------------------------
-
-    def _backbone_reference(self) -> Tensor:
+    def _reference_parameter(self) -> Tensor:
         reference = next(self.backbone.parameters(), None)
         if reference is None:
             raise RuntimeError("backbone has no parameters")
@@ -113,14 +105,11 @@ class NECILModel(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self._backbone_reference().device
+        return self._reference_parameter().device
 
     @property
     def dtype(self) -> torch.dtype:
-        dtype = self._backbone_reference().dtype
-        if dtype not in (torch.float32, torch.float64):
-            raise RuntimeError("backbone parameters must use float32 or float64")
-        return dtype
+        return self._reference_parameter().dtype
 
     @property
     def spectral_token_count(self) -> int:
@@ -131,169 +120,74 @@ class NECILModel(nn.Module):
         return int(self.backbone.spectral_token_dim)
 
     @property
-    def classifier_class_ids(self) -> tuple[int, ...]:
-        return tuple(self.classifier.seen_class_ids)
+    def spectral_bands(self) -> int:
+        return int(self.backbone.spectral_bands)
 
     @property
     def committed_class_ids(self) -> tuple[int, ...]:
-        return tuple(self.geometry_bank.seen_class_ids)
+        return self.structure_bank.seen_class_ids
 
     @property
     def spectral_normalization_fitted(self) -> bool:
-        return bool(self.backbone.spectral_normalization_fitted)
-
-    def _validate_geometry_contract(
-        self,
-        geometry_bank: HSIClassDiscriminativeGeometry,
-    ) -> None:
-        if not isinstance(geometry_bank, HSIClassDiscriminativeGeometry):
-            raise TypeError(
-                "geometry_bank must be HSIClassDiscriminativeGeometry"
-            )
-        if geometry_bank.spectral_token_count != self.spectral_token_count:
-            raise RuntimeError(
-                "backbone and geometry bank disagree on spectral_token_count"
-            )
-        if geometry_bank.spectral_token_dim != self.spectral_token_dim:
-            raise RuntimeError(
-                "backbone and geometry bank disagree on spectral_token_dim"
-            )
+        return bool(self.backbone.spectral_normalization_fitted) and bool(
+            self.spectral_evidence_extractor.fitted.item()
+        )
 
     def validate_model_state(self) -> bool:
-        if not isinstance(self.classifier, PersistentCosineClassifier):
-            raise RuntimeError("classifier must be PersistentCosineClassifier")
-        self.classifier.validate_state()
-        self._validate_geometry_contract(self.geometry_bank)
-        self.geometry_bank.validate_state()
-
-        if self.classifier.spectral_token_count != self.spectral_token_count:
-            raise RuntimeError(
-                "backbone and classifier disagree on spectral_token_count"
-            )
-        if self.classifier.spectral_token_dim != self.spectral_token_dim:
-            raise RuntimeError(
-                "backbone and classifier disagree on spectral_token_dim"
-            )
-        if self.classifier.weight.device != self.device:
-            raise RuntimeError("classifier and backbone use different devices")
-        if self.classifier.weight.dtype != self.dtype:
-            raise RuntimeError("classifier and backbone use different dtypes")
-        if self.geometry_bank.device != self.device:
-            raise RuntimeError("geometry bank and backbone use different devices")
-        if self.geometry_bank.dtype != self.dtype:
-            raise RuntimeError("geometry bank and backbone use different dtypes")
-
-        # A committed historical class must always have a decision row.  During
-        # an open incremental phase the classifier may legitimately contain new
-        # rows whose final geometry has not yet been committed.
-        committed = set(self.committed_class_ids)
-        classified = set(self.classifier_class_ids)
-        if not committed.issubset(classified):
-            missing = sorted(committed - classified)
-            raise RuntimeError(
-                "committed geometry lacks classifier rows for classes "
-                f"{missing}"
-            )
-
-        if len(self.geometry_bank) > 0 and not self.spectral_normalization_fitted:
-            raise RuntimeError(
-                "stored class geometry requires fitted spectral normalization"
-            )
+        if not isinstance(self.classifier, SpectralCDSClassifier):
+            raise RuntimeError("classifier must be SpectralCDSClassifier")
+        if self.classifier.parameter_count <= 0:
+            raise RuntimeError("cosine classifier must contain trainable class rows")
+        scale = self.classifier.logit_scale_value
+        if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+            raise RuntimeError("shared cosine classifier scale is invalid")
+        if not isinstance(self.structure_bank, HSIClassDiscriminativeStructureBank):
+            raise RuntimeError("structure_bank must be HSIClassDiscriminativeStructureBank")
+        self.structure_bank.validate_state()
+        if self.structure_bank.device != self.device or self.structure_bank.dtype != self.dtype:
+            raise RuntimeError("backbone and structure bank use different device/dtype")
+        if self.structure_bank.spectral_token_count != self.spectral_token_count:
+            raise RuntimeError("backbone and bank disagree on K")
+        if self.structure_bank.spectral_token_dim != self.spectral_token_dim:
+            raise RuntimeError("backbone and bank disagree on D")
+        if self.structure_bank.spectral_bands != self.spectral_bands:
+            raise RuntimeError("backbone and bank disagree on native band count B")
+        if len(self.structure_bank) and not self.spectral_normalization_fitted:
+            raise RuntimeError("stored CDS requires fitted Phase-0 spectral normalization")
         return True
 
-    def load_state_dict(
-        self,
-        state_dict: Any,
-        strict: bool = True,
-        **kwargs: Any,
-    ) -> Any:
-        result = super().load_state_dict(
-            state_dict,
-            strict=strict,
-            **kwargs,
-        )
-        self.validate_model_state()
-        return result
-
-    # ------------------------------------------------------------------
-    # Fixed HSI spectral normalization owned by the backbone
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
-    def set_spectral_normalization(
-        self,
-        mean: Tensor | Sequence[float],
-        scale: Tensor | Sequence[float],
-        *,
-        overwrite: bool = False,
-    ) -> None:
-        if len(self.geometry_bank) != 0:
-            raise RuntimeError(
-                "spectral normalization cannot change after historical geometry "
-                "has been committed"
-            )
-        self.backbone.set_spectral_normalization(
-            mean,
-            scale,
-            overwrite=overwrite,
-        )
+    def fit_spectral_normalization(self, base_center_spectra: Tensor, *, overwrite: bool = False) -> None:
+        if len(self.structure_bank):
+            raise RuntimeError("spectral normalization cannot change after Phase 0")
+        self.backbone.fit_spectral_normalization(base_center_spectra, overwrite=overwrite)
+        self.spectral_evidence_extractor.fit(base_center_spectra, overwrite=overwrite)
         if not self.spectral_normalization_fitted:
-            raise RuntimeError("spectral normalization did not enter fitted state")
+            raise RuntimeError("spectral normalization was not fitted")
 
-    @torch.no_grad()
-    def fit_spectral_normalization(
+    def set_base_trainability(self) -> None:
+        self.backbone.set_base_trainability()
+
+    def set_incremental_trainability(self) -> None:
+        self.validate_finalized_state()
+        self.backbone.set_incremental_trainability()
+        if not tuple(self.backbone.incremental_trainable_parameters()):
+            raise RuntimeError("incremental representation has no plastic parameters")
+
+    def extract_features_with_backbone(
         self,
-        base_center_spectra: Tensor,
+        backbone: nn.Module,
+        patch: Tensor,
         *,
-        overwrite: bool = False,
-    ) -> None:
-        if len(self.geometry_bank) != 0:
-            raise RuntimeError(
-                "spectral normalization cannot change after historical geometry "
-                "has been committed"
-            )
-        self.backbone.fit_spectral_normalization(
-            base_center_spectra,
-            overwrite=overwrite,
-        )
-        if not self.spectral_normalization_fitted:
-            raise RuntimeError("spectral normalization did not enter fitted state")
-
-    # ------------------------------------------------------------------
-    # Canonical structural coordinate
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def structural_coordinates(ordered_features_raw: Tensor) -> Tensor:
-        """Remove one global positive scale degree of freedom per HSI sample.
-
-        The normalization uses a single scalar for the whole K x D tensor.  It
-        therefore preserves spectral-region order and all within-sample entry
-        ratios.  The only floor is the dtype's numerical tiny value; there is
-        no research threshold or tunable normalization constant.
-        """
-        features = torch.as_tensor(ordered_features_raw)
-        if features.ndim != 3 or features.size(0) == 0:
-            raise ValueError("ordered_features_raw must be non-empty [N,K,D]")
-        if not torch.is_floating_point(features) or features.is_complex():
-            raise TypeError("ordered_features_raw must be real floating point")
-        if not bool(torch.isfinite(features).all()):
-            raise ValueError("ordered_features_raw contains NaN or Inf")
-
-        flat = features.reshape(features.size(0), -1)
-        if flat.size(1) == 0:
-            raise ValueError("ordered_features_raw contains no feature entries")
-        rms = torch.linalg.vector_norm(flat, ord=2, dim=1, keepdim=True)
-        rms = rms / math.sqrt(float(flat.size(1)))
-        floor = torch.as_tensor(
-            torch.finfo(features.dtype).tiny,
-            device=features.device,
-            dtype=features.dtype,
-        )
-        normalized = features / rms.clamp_min(floor).view(-1, 1, 1)
-        if not bool(torch.isfinite(normalized).all()):
-            raise RuntimeError("structural RMS normalization produced NaN or Inf")
-        return normalized
+        center_spectrum: Tensor,
+        return_aux: bool = False,
+    ) -> BackboneOutput:
+        output = backbone(patch, center_spectrum=center_spectrum, return_aux=return_aux)
+        q = output.ordered_features
+        expected = (patch.size(0), self.spectral_token_count, self.spectral_token_dim)
+        if q.shape != expected or not bool(torch.isfinite(q).all()):
+            raise RuntimeError("backbone produced invalid ordered features")
+        return output
 
     def extract_features(
         self,
@@ -302,270 +196,129 @@ class NECILModel(nn.Module):
         center_spectrum: Tensor,
         return_aux: bool = False,
     ) -> BackboneOutput:
-        """Return the one canonical Q(x) used by classifier and geometry."""
         if not self.spectral_normalization_fitted:
-            raise RuntimeError(
-                "spectral normalization must be fitted before feature extraction"
-            )
-
-        raw_output = self.backbone(
+            raise RuntimeError("spectral normalization must be fitted before feature extraction")
+        return self.extract_features_with_backbone(
+            self.backbone,
             patch,
             center_spectrum=center_spectrum,
             return_aux=return_aux,
         )
-        raw = raw_output.ordered_features
-        expected = (
-            patch.size(0),
-            self.spectral_token_count,
-            self.spectral_token_dim,
-        )
-        if tuple(raw.shape) != expected:
-            raise RuntimeError(
-                "backbone ordered_features have shape "
-                f"{tuple(raw.shape)}, expected {expected}"
-            )
-        if raw.device != self.device:
-            raise RuntimeError("backbone output and model use different devices")
-        if raw.dtype != self.dtype:
-            raise RuntimeError("backbone output and model use different dtypes")
 
-        canonical = self.structural_coordinates(raw)
-        return replace(raw_output, ordered_features=canonical)
+    def spectral_evidence(self, center_spectrum: Tensor) -> Tensor:
+        if not self.spectral_normalization_fitted:
+            raise RuntimeError("spectral normalization must be fitted before spectral evidence")
+        evidence = self.spectral_evidence_extractor(center_spectrum)
+        if evidence.device != self.device or evidence.dtype != self.dtype:
+            evidence = evidence.to(device=self.device, dtype=self.dtype)
+        if evidence.ndim != 3 or tuple(evidence.shape[1:]) != (self.spectral_bands, 3):
+            raise RuntimeError("full-band physical spectral evidence has invalid shape")
+        return evidence
 
-    # ------------------------------------------------------------------
-    # Classifier: decision only
-    # ------------------------------------------------------------------
-
-    def add_classifier_classes(
+    def _resolve_cds(
         self,
-        class_ids: Sequence[int] | Tensor,
         *,
-        initial_identity: Tensor | None = None,
-    ) -> None:
-        """Append decision rows in the same Q-space used by class statistics.
+        cds: ClassDiscriminativeStructureState | None,
+        structures: ClassStructureBatch | None,
+        class_ids: Sequence[int] | Tensor | None,
+    ) -> ClassDiscriminativeStructureState:
+        if cds is not None:
+            if structures is not None or class_ids is not None:
+                raise ValueError("cds cannot be combined with structures/class_ids")
+            return cds
+        if structures is not None:
+            if class_ids is not None:
+                requested = _class_id_tuple(class_ids)
+                actual = tuple(int(v) for v in structures.class_ids.detach().cpu().tolist())
+                if requested != actual:
+                    raise ValueError("class_ids must match supplied structures")
+            return self.structure_bank.build_cds(structures)
+        if len(self.structure_bank) == 0:
+            raise RuntimeError("classification requires a working CDS")
+        return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
 
-        For an incremental phase, pass the phase-start current-class identities
-        I_c^- with shape [C,K,D].  They are flattened only to initialize the new
-        classifier directions; no alternate representation is formed.
-        """
-        initial_rows = None
-        if initial_identity is not None:
-            identity = torch.as_tensor(
-                initial_identity,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-            if identity.ndim != 3 or tuple(identity.shape[1:]) != expected_tail:
-                raise ValueError(
-                    "initial_identity must have shape "
-                    f"[C,{expected_tail[0]},{expected_tail[1]}]"
-                )
-            initial_rows = identity.reshape(identity.size(0), -1)
-        self.classifier.add_classes(class_ids, initial_rows=initial_rows)
-        self.validate_model_state()
+    def build_class_discriminative_structure(
+        self,
+        structures: ClassStructureBatch,
+    ) -> ClassDiscriminativeStructureState:
+        return self.structure_bank.build_cds(structures)
 
     def classify_features(
         self,
         ordered_features: Tensor,
         *,
+        center_spectrum: Tensor | None = None,
+        cds: ClassDiscriminativeStructureState | None = None,
+        structures: ClassStructureBatch | None = None,
         class_ids: Sequence[int] | Tensor | None = None,
     ) -> ClassifierOutput:
-        return self.classifier(
-            ordered_features,
-            class_ids=class_ids,
-        )
-
-    # ------------------------------------------------------------------
-    # Geometry: historical statistics only
-    # ------------------------------------------------------------------
+        q = torch.as_tensor(ordered_features)
+        if q.ndim != 3 or tuple(q.shape[1:]) != (self.spectral_token_count, self.spectral_token_dim):
+            raise ValueError("ordered_features have invalid shape")
+        resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+        return self.classifier(q, cds=resolved)
 
     @torch.no_grad()
-    def estimate_class_statistics(
+    def estimate_physical_class_structure(
         self,
-        ordered_features: Tensor,
+        raw_center_spectra: Tensor,
         labels: Tensor,
         *,
         class_ids: Sequence[int] | Tensor,
-    ):
-        """Estimate current-phase class statistics without committing state."""
-        features = torch.as_tensor(ordered_features)
-        self._validate_canonical_q(features, name="class-statistic estimation")
-        return self.geometry_bank.estimate_classes(
-            features, labels, class_ids=class_ids
-        )
-
-    def _validate_canonical_q(self, features: Tensor, *, name: str) -> None:
-        expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-        if (
-            features.ndim != 3
-            or features.size(0) == 0
-            or tuple(features.shape[1:]) != expected_tail
-        ):
-            raise ValueError(
-                f"{name} requires non-empty Q with shape "
-                f"[N,{expected_tail[0]},{expected_tail[1]}]"
-            )
-        if features.device != self.device or features.dtype != self.dtype:
-            raise ValueError(f"{name} Q has wrong device/dtype")
-        if not bool(torch.isfinite(features).all()):
-            raise ValueError(f"{name} Q contains NaN or Inf")
-        flat = features.reshape(features.size(0), -1)
-        rms = torch.linalg.vector_norm(flat, ord=2, dim=1) / math.sqrt(
-            float(flat.size(1))
-        )
-        tolerance = 2e-5 if features.dtype == torch.float32 else 1e-10
-        if not bool(torch.allclose(
-            rms, torch.ones_like(rms), rtol=tolerance, atol=tolerance
-        )):
-            raise RuntimeError(f"{name} requires canonical global-RMS Q")
-
-    def boundary_safety_scores(
-        self,
-        *,
-        historical_class_ids: Sequence[int] | Tensor,
-        rival_class_ids: Sequence[int] | Tensor,
-    ) -> BoundarySafetyOutput:
-        """Evaluate historical class safety against deployed classifier rivals.
-
-        For historical class c and rival j, with normalized classifier
-        directions u_c and u_j,
-
-            d_cj = u_c - u_j,
-            mu_cj = <I_c, d_cj>_F.
-
-        The geometry bank uses the full S_c[K,K,D] to compute a conservative
-        upper bound sigma_bar_cj on the decision-gap standard deviation. For
-        non-zero spread the score is the dimensionless standardized gap
-
-            score_cj = mu_cj / sigma_bar_cj.
-
-        For numerical zero spread, score_cj = mu_cj because there is no
-        distributional variation to standardize. Positive values place the
-        historical identity on its own side of the boundary; larger values
-        indicate more separation relative to retained intra-class spectral
-        structure. No distributional assumption is made.
-        """
-        historical_ids = _class_id_tuple(historical_class_ids)
-        rival_ids = _class_id_tuple(rival_class_ids)
-        missing_geometry = sorted(set(historical_ids) - set(self.committed_class_ids))
-        if missing_geometry:
-            raise RuntimeError(
-                f"historical class structure is missing classes {missing_geometry}"
-            )
-        missing_classifier = sorted(
-            (set(historical_ids) | set(rival_ids)) - set(self.classifier_class_ids)
-        )
-        if missing_classifier:
-            raise RuntimeError(
-                f"classifier is missing boundary classes {missing_classifier}"
-            )
-
-        historical_u, historical_returned = self.classifier.normalized_rows(
-            historical_ids
-        )
-        rival_u, rival_returned = self.classifier.normalized_rows(rival_ids)
-        if tuple(int(v) for v in historical_returned.detach().cpu().tolist()) != historical_ids:
-            raise RuntimeError("historical classifier row order changed")
-        if tuple(int(v) for v in rival_returned.detach().cpu().tolist()) != rival_ids:
-            raise RuntimeError("rival classifier row order changed")
-
-        direction = (
-            historical_u[:, None, :] - rival_u[None, :, :]
-        ).reshape(
-            len(historical_ids),
-            len(rival_ids),
-            self.spectral_token_count,
-            self.spectral_token_dim,
-        )
-        geometry = self.geometry_bank.class_geometries(historical_ids)
-        mean_gap = torch.einsum("crkd,ckd->cr", direction, geometry.identity)
-        dispersion = self.geometry_bank.boundary_standard_deviation_upper_bound(
-            historical_ids,
-            direction,
-        )
-        # Standardize only when historical structural dispersion is
-        # numerically non-zero. If the retained spread is zero, the class is
-        # deterministic in this boundary direction and the raw mean gap is the
-        # correct decision quantity. This is a numerical branch, not a method
-        # threshold, and avoids gap/tiny overflow for zero-variance classes.
-        scale = torch.maximum(
-            dispersion.detach().amax(),
-            torch.ones((), device=self.device, dtype=self.dtype),
-        )
-        zero_tol = 64.0 * torch.finfo(self.dtype).eps * scale
-        standardized = dispersion.detach() > zero_tol
-        denominator = torch.where(
-            standardized, dispersion, torch.ones_like(dispersion)
-        )
-        score = torch.where(
-            standardized, mean_gap / denominator, mean_gap
-        )
-        if not bool(torch.isfinite(score).all()):
-            raise RuntimeError("boundary safety score contains NaN or Inf")
-
-        return BoundarySafetyOutput(
-            historical_class_ids=historical_ids,
-            rival_class_ids=rival_ids,
-            mean_gap=mean_gap,
-            dispersion_upper_bound=dispersion,
-            score=score,
-        )
-
-    def validate_finalized_state(self) -> bool:
-        """Require exact classifier/statistic class alignment at phase boundary."""
-        self.validate_model_state()
-        if self.classifier_class_ids != self.committed_class_ids:
-            raise RuntimeError(
-                "finalized phase requires classifier rows and class statistics "
-                "for exactly the same classes in the same order"
-            )
-        return True
+    ) -> PhysicalSpectralStructureBatch:
+        p = self.spectral_evidence(raw_center_spectra)
+        return self.structure_bank.estimate_physical(p, labels, class_ids=class_ids)
 
     @torch.no_grad()
-    def add_classes(
+    def estimate_class_structure(
         self,
         ordered_features: Tensor,
+        raw_center_spectra: Tensor | None,
         labels: Tensor,
         *,
         class_ids: Sequence[int] | Tensor,
-    ) -> None:
-        """Commit {I_c,S_c,N_c} from canonical TRAIN Q(x)."""
-        if not self.spectral_normalization_fitted:
-            raise RuntimeError(
-                "spectral normalization must be fitted before geometry commit"
-            )
-
-        requested = _class_id_tuple(class_ids)
-        classifier_ids = set(self.classifier_class_ids)
-        missing = [class_id for class_id in requested if class_id not in classifier_ids]
-        if missing:
-            raise RuntimeError(
-                "cannot commit geometry before classifier rows exist for classes "
-                f"{missing}"
-            )
-
-        features = torch.as_tensor(ordered_features)
-        if features.size(0) != int(torch.as_tensor(labels).numel()):
-            raise ValueError("class-statistic features/labels have different rows")
-        self._validate_canonical_q(features, name="class-statistic commit")
-
-        self.geometry_bank.add_classes(
-            features,
+        physical_structure: PhysicalSpectralStructureBatch | None = None,
+    ) -> ClassStructureBatch:
+        q = torch.as_tensor(ordered_features)
+        p = None if physical_structure is not None else self.spectral_evidence(raw_center_spectra)
+        return self.structure_bank.estimate_classes(
+            q,
+            p,
             labels,
             class_ids=class_ids,
+            physical_structure=physical_structure,
         )
+
+    @torch.no_grad()
+    def commit_class_structure(self, estimated: ClassStructureBatch) -> None:
+        self.structure_bank.append_estimate(estimated)
+
+    @torch.no_grad()
+    def replace_class_structure(self, structures: ClassStructureBatch) -> None:
+        self.structure_bank.replace_all(structures)
         self.validate_model_state()
 
-    # ------------------------------------------------------------------
-    # End-to-end prediction path
-    # ------------------------------------------------------------------
+    def class_discriminative_structure(
+        self,
+        class_ids: Sequence[int] | Tensor | None = None,
+    ) -> ClassDiscriminativeStructureState:
+        return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+    def validate_finalized_state(self) -> bool:
+        self.validate_model_state()
+        if len(self.structure_bank) == 0:
+            raise RuntimeError("finalized phase requires non-empty CDS")
+        if not self.spectral_normalization_fitted:
+            raise RuntimeError("finalized phase requires fitted spectral normalization")
+        return True
 
     def forward(
         self,
         patch: Tensor,
         *,
         center_spectrum: Tensor,
+        cds: ClassDiscriminativeStructureState | None = None,
+        structures: ClassStructureBatch | None = None,
         class_ids: Sequence[int] | Tensor | None = None,
         return_aux: bool = False,
     ) -> NECILOutput:
@@ -574,26 +327,17 @@ class NECILModel(nn.Module):
             center_spectrum=center_spectrum,
             return_aux=return_aux,
         )
-        classification = self.classify_features(
-            backbone_output.ordered_features,
-            class_ids=class_ids,
-        )
+        p = self.spectral_evidence(center_spectrum)
+        resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+        classification = self.classifier(backbone_output.ordered_features, cds=resolved)
         return NECILOutput(
             backbone=backbone_output,
+            spectral_evidence=p,
             classification=classification,
         )
 
 
-__all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
-
-
-
-
-
-
-
-
-
+__all__ = ["NECILModel", "NECILOutput"]
 
 
 
@@ -604,25 +348,22 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 
 # from __future__ import annotations
 
-# """SCOPE-HSI model integration with one canonical representation.
+# """NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
 
-# The architecture has one learned sample representation:
+# Q[K,D] is the only learned discriminative sample representation. P[B,3] is a
+# deterministic phase-stable physical spectral structure built from the complete
+# pre-PCA centre spectrum; B is dataset-derived and independent of K.
 
-#     HSI -> backbone -> Q_raw -> global RMS canonicalization -> Q in R^{K x D}.
-
-# The persistent angular classifier W and historical class state {I,S,N} are
-# defined in this same Q coordinate. Phase 0 learns Q and W. After a class is
-# finalized, I/S/N are estimated from its real TRAIN Q. During incremental
-# learning the backbone is frozen, so historical state remains valid. Real
-# current-class Q and retained historical I/S jointly supervise the same
-# persistent classifier, including historical rows.
-
-# There is no feature transport, second representation, geometry prediction head,
-# phase-specific classifier, replay, or analytic classifier.
+# Persistent class state is exactly
+#     {I_Q[K,D], V_Q[K,K,D], I_P[B,3], V_P[B,B,3], N}.
+# A single bias-free normalized cosine classifier supplies the all-seen decision
+# rule from Q only. The *whole* HSI CDS constrains incremental learning: I_Q and
+# V_Q define learned decision-region structure, while I_P and V_P define native
+# full-band physical spectral confusability used to prioritize preservation. Physical
+# spectral evidence is not concatenated with Q and is not a second classifier input.
 # """
 
-# from dataclasses import dataclass, replace
-# import math
+# from dataclasses import dataclass
 # from numbers import Integral
 # from typing import Any, Sequence
 
@@ -630,86 +371,79 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 # import torch.nn as nn
 
 # from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
-# from models.classifier import ClassifierOutput, PersistentCosineClassifier
-# from models.geometry_bank import HSIClassDiscriminativeGeometry
+# from models.classifier import ClassifierOutput, SpectralCDSClassifier
+# from models.geometry_bank import (
+#     ClassDiscriminativeStructureState,
+#     PhysicalSpectralStructureBatch,
+#     ClassStructureBatch,
+#     HSIClassDiscriminativeStructureBank,
+# )
+# from models.spectral_evidence import OrderedPhysicalSpectralEvidence
 
 # Tensor = torch.Tensor
 
 
 # def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
-#     if torch.is_tensor(values):
-#         if values.ndim != 1 or values.numel() == 0:
-#             raise ValueError("class_ids tensor must be non-empty and rank one")
-#         if values.dtype != torch.long:
-#             raise TypeError("class_ids tensor must use torch.long")
-#         source = values.detach().cpu().tolist()
-#     else:
-#         source = list(values)
+#     source = values.detach().cpu().tolist() if torch.is_tensor(values) else list(values)
 #     result: list[int] = []
 #     for value in source:
-#         if isinstance(value, bool) or not isinstance(value, Integral):
-#             raise TypeError("class_ids must contain integer IDs")
-#         class_id = int(value)
-#         if class_id < 0:
-#             raise ValueError("class_ids must be non-negative")
-#         result.append(class_id)
+#         if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+#             raise ValueError("class_ids must contain non-negative integers")
+#         result.append(int(value))
 #     output = tuple(result)
-#     if not output:
-#         raise ValueError("class_ids cannot be empty")
-#     if len(output) != len(set(output)):
-#         raise ValueError("class_ids must be unique")
+#     if not output or len(output) != len(set(output)):
+#         raise ValueError("class_ids must be non-empty and unique")
 #     return output
+
+
+# def _physical_band_positions(backbone: HSIMambaFeatureExtractor) -> Tensor | None:
+#     positions = backbone.spectral_encoder.band_positions.detach().cpu()
+#     return positions if positions.numel() == int(backbone.spectral_bands) else None
 
 
 # @dataclass(frozen=True)
 # class NECILOutput:
 #     backbone: BackboneOutput
+#     spectral_evidence: Tensor
 #     classification: ClassifierOutput
-
-# @dataclass(frozen=True)
-# class BoundarySafetyOutput:
-#     historical_class_ids: tuple[int, ...]
-#     rival_class_ids: tuple[int, ...]
-#     mean_gap: Tensor
-#     dispersion_upper_bound: Tensor
-#     score: Tensor
-
 
 
 # class NECILModel(nn.Module):
-#     """One Q-space + persistent angular classifier + Q-derived class statistics."""
+#     """One plastic HSI representation, one physical spectral reference, one CDS."""
 
 #     def __init__(self, args: Any) -> None:
 #         super().__init__()
-
 #         self.backbone = HSIMambaFeatureExtractor(args)
-#         for name in ("spectral_token_count", "spectral_token_dim"):
-#             if not hasattr(self.backbone, name):
-#                 raise RuntimeError(f"backbone must expose {name}")
-
 #         reference = next(self.backbone.parameters(), None)
 #         if reference is None:
-#             raise RuntimeError("backbone must contain trainable parameters")
+#             raise RuntimeError("backbone must contain parameters")
 #         if reference.dtype not in (torch.float32, torch.float64):
 #             raise TypeError("backbone parameters must use float32 or float64")
 
-#         self.classifier = PersistentCosineClassifier(
-#             spectral_token_count=int(self.backbone.spectral_token_count),
-#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#         band_positions = _physical_band_positions(self.backbone)
+#         self.spectral_evidence_extractor = OrderedPhysicalSpectralEvidence(
+#             band_count=int(self.backbone.spectral_bands),
+#             band_positions=band_positions,
 #         )
-#         self.geometry_bank = HSIClassDiscriminativeGeometry(
+#         self.structure_bank = HSIClassDiscriminativeStructureBank(
 #             spectral_token_count=int(self.backbone.spectral_token_count),
 #             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             spectral_bands=int(self.backbone.spectral_bands),
+#             spectral_band_positions=band_positions,
 #             device=reference.device,
 #             dtype=reference.dtype,
 #         )
+#         total_class_count = int(getattr(args, "class_count", 0))
+#         if total_class_count < 2:
+#             raise ValueError("args.class_count must be set before NECILModel construction")
+#         self.classifier = SpectralCDSClassifier(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             total_class_count=total_class_count,
+#         )
 #         self.validate_model_state()
 
-#     # ------------------------------------------------------------------
-#     # Basic model contract
-#     # ------------------------------------------------------------------
-
-#     def _backbone_reference(self) -> Tensor:
+#     def _reference_parameter(self) -> Tensor:
 #         reference = next(self.backbone.parameters(), None)
 #         if reference is None:
 #             raise RuntimeError("backbone has no parameters")
@@ -717,14 +451,11 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 
 #     @property
 #     def device(self) -> torch.device:
-#         return self._backbone_reference().device
+#         return self._reference_parameter().device
 
 #     @property
 #     def dtype(self) -> torch.dtype:
-#         dtype = self._backbone_reference().dtype
-#         if dtype not in (torch.float32, torch.float64):
-#             raise RuntimeError("backbone parameters must use float32 or float64")
-#         return dtype
+#         return self._reference_parameter().dtype
 
 #     @property
 #     def spectral_token_count(self) -> int:
@@ -735,169 +466,74 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 #         return int(self.backbone.spectral_token_dim)
 
 #     @property
-#     def classifier_class_ids(self) -> tuple[int, ...]:
-#         return tuple(self.classifier.seen_class_ids)
+#     def spectral_bands(self) -> int:
+#         return int(self.backbone.spectral_bands)
 
 #     @property
 #     def committed_class_ids(self) -> tuple[int, ...]:
-#         return tuple(self.geometry_bank.seen_class_ids)
+#         return self.structure_bank.seen_class_ids
 
 #     @property
 #     def spectral_normalization_fitted(self) -> bool:
-#         return bool(self.backbone.spectral_normalization_fitted)
-
-#     def _validate_geometry_contract(
-#         self,
-#         geometry_bank: HSIClassDiscriminativeGeometry,
-#     ) -> None:
-#         if not isinstance(geometry_bank, HSIClassDiscriminativeGeometry):
-#             raise TypeError(
-#                 "geometry_bank must be HSIClassDiscriminativeGeometry"
-#             )
-#         if geometry_bank.spectral_token_count != self.spectral_token_count:
-#             raise RuntimeError(
-#                 "backbone and geometry bank disagree on spectral_token_count"
-#             )
-#         if geometry_bank.spectral_token_dim != self.spectral_token_dim:
-#             raise RuntimeError(
-#                 "backbone and geometry bank disagree on spectral_token_dim"
-#             )
+#         return bool(self.backbone.spectral_normalization_fitted) and bool(
+#             self.spectral_evidence_extractor.fitted.item()
+#         )
 
 #     def validate_model_state(self) -> bool:
-#         if not isinstance(self.classifier, PersistentCosineClassifier):
-#             raise RuntimeError("classifier must be PersistentCosineClassifier")
-#         self.classifier.validate_state()
-#         self._validate_geometry_contract(self.geometry_bank)
-#         self.geometry_bank.validate_state()
-
-#         if self.classifier.spectral_token_count != self.spectral_token_count:
-#             raise RuntimeError(
-#                 "backbone and classifier disagree on spectral_token_count"
-#             )
-#         if self.classifier.spectral_token_dim != self.spectral_token_dim:
-#             raise RuntimeError(
-#                 "backbone and classifier disagree on spectral_token_dim"
-#             )
-#         if self.classifier.weight.device != self.device:
-#             raise RuntimeError("classifier and backbone use different devices")
-#         if self.classifier.weight.dtype != self.dtype:
-#             raise RuntimeError("classifier and backbone use different dtypes")
-#         if self.geometry_bank.device != self.device:
-#             raise RuntimeError("geometry bank and backbone use different devices")
-#         if self.geometry_bank.dtype != self.dtype:
-#             raise RuntimeError("geometry bank and backbone use different dtypes")
-
-#         # A committed historical class must always have a decision row.  During
-#         # an open incremental phase the classifier may legitimately contain new
-#         # rows whose final geometry has not yet been committed.
-#         committed = set(self.committed_class_ids)
-#         classified = set(self.classifier_class_ids)
-#         if not committed.issubset(classified):
-#             missing = sorted(committed - classified)
-#             raise RuntimeError(
-#                 "committed geometry lacks classifier rows for classes "
-#                 f"{missing}"
-#             )
-
-#         if len(self.geometry_bank) > 0 and not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "stored class geometry requires fitted spectral normalization"
-#             )
+#         if not isinstance(self.classifier, SpectralCDSClassifier):
+#             raise RuntimeError("classifier must be SpectralCDSClassifier")
+#         if self.classifier.parameter_count <= 0:
+#             raise RuntimeError("cosine classifier must contain trainable class rows")
+#         scale = self.classifier.logit_scale_value
+#         if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+#             raise RuntimeError("shared cosine classifier scale is invalid")
+#         if not isinstance(self.structure_bank, HSIClassDiscriminativeStructureBank):
+#             raise RuntimeError("structure_bank must be HSIClassDiscriminativeStructureBank")
+#         self.structure_bank.validate_state()
+#         if self.structure_bank.device != self.device or self.structure_bank.dtype != self.dtype:
+#             raise RuntimeError("backbone and structure bank use different device/dtype")
+#         if self.structure_bank.spectral_token_count != self.spectral_token_count:
+#             raise RuntimeError("backbone and bank disagree on K")
+#         if self.structure_bank.spectral_token_dim != self.spectral_token_dim:
+#             raise RuntimeError("backbone and bank disagree on D")
+#         if self.structure_bank.spectral_bands != self.spectral_bands:
+#             raise RuntimeError("backbone and bank disagree on native band count B")
+#         if len(self.structure_bank) and not self.spectral_normalization_fitted:
+#             raise RuntimeError("stored CDS requires fitted Phase-0 spectral normalization")
 #         return True
 
-#     def load_state_dict(
-#         self,
-#         state_dict: Any,
-#         strict: bool = True,
-#         **kwargs: Any,
-#     ) -> Any:
-#         result = super().load_state_dict(
-#             state_dict,
-#             strict=strict,
-#             **kwargs,
-#         )
-#         self.validate_model_state()
-#         return result
-
-#     # ------------------------------------------------------------------
-#     # Fixed HSI spectral normalization owned by the backbone
-#     # ------------------------------------------------------------------
-
 #     @torch.no_grad()
-#     def set_spectral_normalization(
-#         self,
-#         mean: Tensor | Sequence[float],
-#         scale: Tensor | Sequence[float],
-#         *,
-#         overwrite: bool = False,
-#     ) -> None:
-#         if len(self.geometry_bank) != 0:
-#             raise RuntimeError(
-#                 "spectral normalization cannot change after historical geometry "
-#                 "has been committed"
-#             )
-#         self.backbone.set_spectral_normalization(
-#             mean,
-#             scale,
-#             overwrite=overwrite,
-#         )
+#     def fit_spectral_normalization(self, base_center_spectra: Tensor, *, overwrite: bool = False) -> None:
+#         if len(self.structure_bank):
+#             raise RuntimeError("spectral normalization cannot change after Phase 0")
+#         self.backbone.fit_spectral_normalization(base_center_spectra, overwrite=overwrite)
+#         self.spectral_evidence_extractor.fit(base_center_spectra, overwrite=overwrite)
 #         if not self.spectral_normalization_fitted:
-#             raise RuntimeError("spectral normalization did not enter fitted state")
+#             raise RuntimeError("spectral normalization was not fitted")
 
-#     @torch.no_grad()
-#     def fit_spectral_normalization(
+#     def set_base_trainability(self) -> None:
+#         self.backbone.set_base_trainability()
+
+#     def set_incremental_trainability(self) -> None:
+#         self.validate_finalized_state()
+#         self.backbone.set_incremental_trainability()
+#         if not tuple(self.backbone.incremental_trainable_parameters()):
+#             raise RuntimeError("incremental representation has no plastic parameters")
+
+#     def extract_features_with_backbone(
 #         self,
-#         base_center_spectra: Tensor,
+#         backbone: nn.Module,
+#         patch: Tensor,
 #         *,
-#         overwrite: bool = False,
-#     ) -> None:
-#         if len(self.geometry_bank) != 0:
-#             raise RuntimeError(
-#                 "spectral normalization cannot change after historical geometry "
-#                 "has been committed"
-#             )
-#         self.backbone.fit_spectral_normalization(
-#             base_center_spectra,
-#             overwrite=overwrite,
-#         )
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError("spectral normalization did not enter fitted state")
-
-#     # ------------------------------------------------------------------
-#     # Canonical structural coordinate
-#     # ------------------------------------------------------------------
-
-#     @staticmethod
-#     def structural_coordinates(ordered_features_raw: Tensor) -> Tensor:
-#         """Remove one global positive scale degree of freedom per HSI sample.
-
-#         The normalization uses a single scalar for the whole K x D tensor.  It
-#         therefore preserves spectral-region order and all within-sample entry
-#         ratios.  The only floor is the dtype's numerical tiny value; there is
-#         no research threshold or tunable normalization constant.
-#         """
-#         features = torch.as_tensor(ordered_features_raw)
-#         if features.ndim != 3 or features.size(0) == 0:
-#             raise ValueError("ordered_features_raw must be non-empty [N,K,D]")
-#         if not torch.is_floating_point(features) or features.is_complex():
-#             raise TypeError("ordered_features_raw must be real floating point")
-#         if not bool(torch.isfinite(features).all()):
-#             raise ValueError("ordered_features_raw contains NaN or Inf")
-
-#         flat = features.reshape(features.size(0), -1)
-#         if flat.size(1) == 0:
-#             raise ValueError("ordered_features_raw contains no feature entries")
-#         rms = torch.linalg.vector_norm(flat, ord=2, dim=1, keepdim=True)
-#         rms = rms / math.sqrt(float(flat.size(1)))
-#         floor = torch.as_tensor(
-#             torch.finfo(features.dtype).tiny,
-#             device=features.device,
-#             dtype=features.dtype,
-#         )
-#         normalized = features / rms.clamp_min(floor).view(-1, 1, 1)
-#         if not bool(torch.isfinite(normalized).all()):
-#             raise RuntimeError("structural RMS normalization produced NaN or Inf")
-#         return normalized
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         output = backbone(patch, center_spectrum=center_spectrum, return_aux=return_aux)
+#         q = output.ordered_features
+#         expected = (patch.size(0), self.spectral_token_count, self.spectral_token_dim)
+#         if q.shape != expected or not bool(torch.isfinite(q).all()):
+#             raise RuntimeError("backbone produced invalid ordered features")
+#         return output
 
 #     def extract_features(
 #         self,
@@ -906,270 +542,128 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 #         center_spectrum: Tensor,
 #         return_aux: bool = False,
 #     ) -> BackboneOutput:
-#         """Return the one canonical Q(x) used by classifier and geometry."""
 #         if not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "spectral normalization must be fitted before feature extraction"
-#             )
-
-#         raw_output = self.backbone(
+#             raise RuntimeError("spectral normalization must be fitted before feature extraction")
+#         return self.extract_features_with_backbone(
+#             self.backbone,
 #             patch,
 #             center_spectrum=center_spectrum,
 #             return_aux=return_aux,
 #         )
-#         raw = raw_output.ordered_features
-#         expected = (
-#             patch.size(0),
-#             self.spectral_token_count,
-#             self.spectral_token_dim,
-#         )
-#         if tuple(raw.shape) != expected:
-#             raise RuntimeError(
-#                 "backbone ordered_features have shape "
-#                 f"{tuple(raw.shape)}, expected {expected}"
-#             )
-#         if raw.device != self.device:
-#             raise RuntimeError("backbone output and model use different devices")
-#         if raw.dtype != self.dtype:
-#             raise RuntimeError("backbone output and model use different dtypes")
 
-#         canonical = self.structural_coordinates(raw)
-#         return replace(raw_output, ordered_features=canonical)
+#     def spectral_evidence(self, center_spectrum: Tensor) -> Tensor:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before spectral evidence")
+#         evidence = self.spectral_evidence_extractor(center_spectrum)
+#         if evidence.device != self.device or evidence.dtype != self.dtype:
+#             evidence = evidence.to(device=self.device, dtype=self.dtype)
+#         if evidence.ndim != 3 or tuple(evidence.shape[1:]) != (self.spectral_bands, 3):
+#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
+#         return evidence
 
-#     # ------------------------------------------------------------------
-#     # Classifier: decision only
-#     # ------------------------------------------------------------------
-
-#     def add_classifier_classes(
+#     def _resolve_cds(
 #         self,
-#         class_ids: Sequence[int] | Tensor,
 #         *,
-#         initial_identity: Tensor | None = None,
-#     ) -> None:
-#         """Append decision rows in the same Q-space used by class statistics.
+#         cds: ClassDiscriminativeStructureState | None,
+#         structures: ClassStructureBatch | None,
+#         class_ids: Sequence[int] | Tensor | None,
+#     ) -> ClassDiscriminativeStructureState:
+#         if cds is not None:
+#             if structures is not None or class_ids is not None:
+#                 raise ValueError("cds cannot be combined with structures/class_ids")
+#             return cds
+#         if structures is not None:
+#             if class_ids is not None:
+#                 requested = _class_id_tuple(class_ids)
+#                 actual = tuple(int(v) for v in structures.class_ids.detach().cpu().tolist())
+#                 if requested != actual:
+#                     raise ValueError("class_ids must match supplied structures")
+#             return self.structure_bank.build_cds(structures)
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("classification requires a working CDS")
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
 
-#         For an incremental phase, pass the phase-start current-class identities
-#         I_c^- with shape [C,K,D].  They are flattened only to initialize the new
-#         classifier directions; no alternate representation is formed.
-#         """
-#         initial_rows = None
-#         if initial_identity is not None:
-#             identity = torch.as_tensor(
-#                 initial_identity,
-#                 device=self.device,
-#                 dtype=self.dtype,
-#             )
-#             expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-#             if identity.ndim != 3 or tuple(identity.shape[1:]) != expected_tail:
-#                 raise ValueError(
-#                     "initial_identity must have shape "
-#                     f"[C,{expected_tail[0]},{expected_tail[1]}]"
-#                 )
-#             initial_rows = identity.reshape(identity.size(0), -1)
-#         self.classifier.add_classes(class_ids, initial_rows=initial_rows)
-#         self.validate_model_state()
+#     def build_class_discriminative_structure(
+#         self,
+#         structures: ClassStructureBatch,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(structures)
 
 #     def classify_features(
 #         self,
 #         ordered_features: Tensor,
 #         *,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
 #         class_ids: Sequence[int] | Tensor | None = None,
 #     ) -> ClassifierOutput:
-#         return self.classifier(
-#             ordered_features,
-#             class_ids=class_ids,
-#         )
-
-#     # ------------------------------------------------------------------
-#     # Geometry: historical statistics only
-#     # ------------------------------------------------------------------
+#         q = torch.as_tensor(ordered_features)
+#         if q.ndim != 3 or tuple(q.shape[1:]) != (self.spectral_token_count, self.spectral_token_dim):
+#             raise ValueError("ordered_features have invalid shape")
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         return self.classifier(q, cds=resolved)
 
 #     @torch.no_grad()
-#     def estimate_class_statistics(
+#     def estimate_physical_class_structure(
 #         self,
-#         ordered_features: Tensor,
+#         raw_center_spectra: Tensor,
 #         labels: Tensor,
 #         *,
 #         class_ids: Sequence[int] | Tensor,
-#     ):
-#         """Estimate current-phase class statistics without committing state."""
-#         features = torch.as_tensor(ordered_features)
-#         self._validate_canonical_q(features, name="class-statistic estimation")
-#         return self.geometry_bank.estimate_classes(
-#             features, labels, class_ids=class_ids
-#         )
-
-#     def _validate_canonical_q(self, features: Tensor, *, name: str) -> None:
-#         expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-#         if (
-#             features.ndim != 3
-#             or features.size(0) == 0
-#             or tuple(features.shape[1:]) != expected_tail
-#         ):
-#             raise ValueError(
-#                 f"{name} requires non-empty Q with shape "
-#                 f"[N,{expected_tail[0]},{expected_tail[1]}]"
-#             )
-#         if features.device != self.device or features.dtype != self.dtype:
-#             raise ValueError(f"{name} Q has wrong device/dtype")
-#         if not bool(torch.isfinite(features).all()):
-#             raise ValueError(f"{name} Q contains NaN or Inf")
-#         flat = features.reshape(features.size(0), -1)
-#         rms = torch.linalg.vector_norm(flat, ord=2, dim=1) / math.sqrt(
-#             float(flat.size(1))
-#         )
-#         tolerance = 2e-5 if features.dtype == torch.float32 else 1e-10
-#         if not bool(torch.allclose(
-#             rms, torch.ones_like(rms), rtol=tolerance, atol=tolerance
-#         )):
-#             raise RuntimeError(f"{name} requires canonical global-RMS Q")
-
-#     def boundary_safety_scores(
-#         self,
-#         *,
-#         historical_class_ids: Sequence[int] | Tensor,
-#         rival_class_ids: Sequence[int] | Tensor,
-#     ) -> BoundarySafetyOutput:
-#         """Evaluate historical class safety against deployed classifier rivals.
-
-#         For historical class c and rival j, with normalized classifier
-#         directions u_c and u_j,
-
-#             d_cj = u_c - u_j,
-#             mu_cj = <I_c, d_cj>_F.
-
-#         The geometry bank uses the full S_c[K,K,D] to compute a conservative
-#         upper bound sigma_bar_cj on the decision-gap standard deviation. For
-#         non-zero spread the score is the dimensionless standardized gap
-
-#             score_cj = mu_cj / sigma_bar_cj.
-
-#         For numerical zero spread, score_cj = mu_cj because there is no
-#         distributional variation to standardize. Positive values place the
-#         historical identity on its own side of the boundary; larger values
-#         indicate more separation relative to retained intra-class spectral
-#         structure. No distributional assumption is made.
-#         """
-#         historical_ids = _class_id_tuple(historical_class_ids)
-#         rival_ids = _class_id_tuple(rival_class_ids)
-#         missing_geometry = sorted(set(historical_ids) - set(self.committed_class_ids))
-#         if missing_geometry:
-#             raise RuntimeError(
-#                 f"historical class structure is missing classes {missing_geometry}"
-#             )
-#         missing_classifier = sorted(
-#             (set(historical_ids) | set(rival_ids)) - set(self.classifier_class_ids)
-#         )
-#         if missing_classifier:
-#             raise RuntimeError(
-#                 f"classifier is missing boundary classes {missing_classifier}"
-#             )
-
-#         historical_u, historical_returned = self.classifier.normalized_rows(
-#             historical_ids
-#         )
-#         rival_u, rival_returned = self.classifier.normalized_rows(rival_ids)
-#         if tuple(int(v) for v in historical_returned.detach().cpu().tolist()) != historical_ids:
-#             raise RuntimeError("historical classifier row order changed")
-#         if tuple(int(v) for v in rival_returned.detach().cpu().tolist()) != rival_ids:
-#             raise RuntimeError("rival classifier row order changed")
-
-#         direction = (
-#             historical_u[:, None, :] - rival_u[None, :, :]
-#         ).reshape(
-#             len(historical_ids),
-#             len(rival_ids),
-#             self.spectral_token_count,
-#             self.spectral_token_dim,
-#         )
-#         geometry = self.geometry_bank.class_geometries(historical_ids)
-#         mean_gap = torch.einsum("crkd,ckd->cr", direction, geometry.identity)
-#         dispersion = self.geometry_bank.boundary_standard_deviation_upper_bound(
-#             historical_ids,
-#             direction,
-#         )
-#         # Standardize only when historical structural dispersion is
-#         # numerically non-zero. If the retained spread is zero, the class is
-#         # deterministic in this boundary direction and the raw mean gap is the
-#         # correct decision quantity. This is a numerical branch, not a method
-#         # threshold, and avoids gap/tiny overflow for zero-variance classes.
-#         scale = torch.maximum(
-#             dispersion.detach().amax(),
-#             torch.ones((), device=self.device, dtype=self.dtype),
-#         )
-#         zero_tol = 64.0 * torch.finfo(self.dtype).eps * scale
-#         standardized = dispersion.detach() > zero_tol
-#         denominator = torch.where(
-#             standardized, dispersion, torch.ones_like(dispersion)
-#         )
-#         score = torch.where(
-#             standardized, mean_gap / denominator, mean_gap
-#         )
-#         if not bool(torch.isfinite(score).all()):
-#             raise RuntimeError("boundary safety score contains NaN or Inf")
-
-#         return BoundarySafetyOutput(
-#             historical_class_ids=historical_ids,
-#             rival_class_ids=rival_ids,
-#             mean_gap=mean_gap,
-#             dispersion_upper_bound=dispersion,
-#             score=score,
-#         )
-
-#     def validate_finalized_state(self) -> bool:
-#         """Require exact classifier/statistic class alignment at phase boundary."""
-#         self.validate_model_state()
-#         if self.classifier_class_ids != self.committed_class_ids:
-#             raise RuntimeError(
-#                 "finalized phase requires classifier rows and class statistics "
-#                 "for exactly the same classes in the same order"
-#             )
-#         return True
+#     ) -> PhysicalSpectralStructureBatch:
+#         p = self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_physical(p, labels, class_ids=class_ids)
 
 #     @torch.no_grad()
-#     def add_classes(
+#     def estimate_class_structure(
 #         self,
 #         ordered_features: Tensor,
+#         raw_center_spectra: Tensor | None,
 #         labels: Tensor,
 #         *,
 #         class_ids: Sequence[int] | Tensor,
-#     ) -> None:
-#         """Commit {I_c,S_c,N_c} from canonical TRAIN Q(x)."""
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "spectral normalization must be fitted before geometry commit"
-#             )
-
-#         requested = _class_id_tuple(class_ids)
-#         classifier_ids = set(self.classifier_class_ids)
-#         missing = [class_id for class_id in requested if class_id not in classifier_ids]
-#         if missing:
-#             raise RuntimeError(
-#                 "cannot commit geometry before classifier rows exist for classes "
-#                 f"{missing}"
-#             )
-
-#         features = torch.as_tensor(ordered_features)
-#         if features.size(0) != int(torch.as_tensor(labels).numel()):
-#             raise ValueError("class-statistic features/labels have different rows")
-#         self._validate_canonical_q(features, name="class-statistic commit")
-
-#         self.geometry_bank.add_classes(
-#             features,
+#         physical_structure: PhysicalSpectralStructureBatch | None = None,
+#     ) -> ClassStructureBatch:
+#         q = torch.as_tensor(ordered_features)
+#         p = None if physical_structure is not None else self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_classes(
+#             q,
+#             p,
 #             labels,
 #             class_ids=class_ids,
+#             physical_structure=physical_structure,
 #         )
+
+#     @torch.no_grad()
+#     def commit_class_structure(self, estimated: ClassStructureBatch) -> None:
+#         self.structure_bank.append_estimate(estimated)
+
+#     @torch.no_grad()
+#     def replace_class_structure(self, structures: ClassStructureBatch) -> None:
+#         self.structure_bank.replace_all(structures)
 #         self.validate_model_state()
 
-#     # ------------------------------------------------------------------
-#     # End-to-end prediction path
-#     # ------------------------------------------------------------------
+#     def class_discriminative_structure(
+#         self,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def validate_finalized_state(self) -> bool:
+#         self.validate_model_state()
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("finalized phase requires non-empty CDS")
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("finalized phase requires fitted spectral normalization")
+#         return True
 
 #     def forward(
 #         self,
 #         patch: Tensor,
 #         *,
 #         center_spectrum: Tensor,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
 #         class_ids: Sequence[int] | Tensor | None = None,
 #         return_aux: bool = False,
 #     ) -> NECILOutput:
@@ -1178,544 +672,1078 @@ __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
 #             center_spectrum=center_spectrum,
 #             return_aux=return_aux,
 #         )
-#         classification = self.classify_features(
-#             backbone_output.ordered_features,
-#             class_ids=class_ids,
-#         )
+#         p = self.spectral_evidence(center_spectrum)
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         classification = self.classifier(backbone_output.ordered_features, cds=resolved)
 #         return NECILOutput(
 #             backbone=backbone_output,
-#             classification=classification,
-#         )
-
-
-# __all__ = ["BoundarySafetyOutput", "NECILModel", "NECILOutput"]
-
-
-
-# from __future__ import annotations
-
-# """SCOPE-HSI model integration with one representation and one coordinate law.
-
-# The architecture has exactly one learned sample representation:
-
-#     HSI -> backbone -> Q_raw -> global RMS canonicalization -> Q in R^{K x D}.
-
-# Both downstream states are defined in that same Q coordinate:
-
-#     classifier row W_c     : decision direction acting on Q,
-#     class statistics G_c   : {I_c,S_c,N_c} estimated from Q.
-
-# They have different roles but are not independent coordinate systems.  During
-# incremental learning, if paired current-class observations estimate one common
-# orthogonal movement R from Q_old to Q_new, all historical Q-derived state is
-# propagated atomically with that same movement:
-
-#     I_c -> R I_c,
-#     S_c[:,:,d] -> R S_c[:,:,d] R^T,
-#     W_c -> R W_c.
-
-# This keeps historical class structure and its decision direction mutually
-# consistent in the current Q-space.  No second representation, geometry head,
-# or independent preservation coordinate exists.
-# """
-
-# from dataclasses import dataclass, replace
-# import math
-# from numbers import Integral
-# from typing import Any, Sequence
-
-# import torch
-# import torch.nn as nn
-
-# from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
-# from models.classifier import ClassifierOutput, PersistentCosineClassifier
-# from models.geometry_bank import HSIClassDiscriminativeGeometry
-
-# Tensor = torch.Tensor
-
-
-# def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
-#     if torch.is_tensor(values):
-#         if values.ndim != 1 or values.numel() == 0:
-#             raise ValueError("class_ids tensor must be non-empty and rank one")
-#         if values.dtype != torch.long:
-#             raise TypeError("class_ids tensor must use torch.long")
-#         source = values.detach().cpu().tolist()
-#     else:
-#         source = list(values)
-#     result: list[int] = []
-#     for value in source:
-#         if isinstance(value, bool) or not isinstance(value, Integral):
-#             raise TypeError("class_ids must contain integer IDs")
-#         class_id = int(value)
-#         if class_id < 0:
-#             raise ValueError("class_ids must be non-negative")
-#         result.append(class_id)
-#     output = tuple(result)
-#     if not output:
-#         raise ValueError("class_ids cannot be empty")
-#     if len(output) != len(set(output)):
-#         raise ValueError("class_ids must be unique")
-#     return output
-
-
-# @dataclass(frozen=True)
-# class NECILOutput:
-#     backbone: BackboneOutput
-#     classification: ClassifierOutput
-
-
-# class NECILModel(nn.Module):
-#     """One Q-space + persistent angular classifier + Q-derived class statistics."""
-
-#     def __init__(self, args: Any) -> None:
-#         super().__init__()
-
-#         self.backbone = HSIMambaFeatureExtractor(args)
-#         for name in ("spectral_token_count", "spectral_token_dim"):
-#             if not hasattr(self.backbone, name):
-#                 raise RuntimeError(f"backbone must expose {name}")
-
-#         reference = next(self.backbone.parameters(), None)
-#         if reference is None:
-#             raise RuntimeError("backbone must contain trainable parameters")
-#         if reference.dtype not in (torch.float32, torch.float64):
-#             raise TypeError("backbone parameters must use float32 or float64")
-
-#         self.classifier = PersistentCosineClassifier(
-#             spectral_token_count=int(self.backbone.spectral_token_count),
-#             spectral_token_dim=int(self.backbone.spectral_token_dim),
-#         )
-#         self.geometry_bank = HSIClassDiscriminativeGeometry(
-#             spectral_token_count=int(self.backbone.spectral_token_count),
-#             spectral_token_dim=int(self.backbone.spectral_token_dim),
-#             device=reference.device,
-#             dtype=reference.dtype,
-#         )
-#         self.validate_model_state()
-
-#     # ------------------------------------------------------------------
-#     # Basic model contract
-#     # ------------------------------------------------------------------
-
-#     def _backbone_reference(self) -> Tensor:
-#         reference = next(self.backbone.parameters(), None)
-#         if reference is None:
-#             raise RuntimeError("backbone has no parameters")
-#         return reference
-
-#     @property
-#     def device(self) -> torch.device:
-#         return self._backbone_reference().device
-
-#     @property
-#     def dtype(self) -> torch.dtype:
-#         dtype = self._backbone_reference().dtype
-#         if dtype not in (torch.float32, torch.float64):
-#             raise RuntimeError("backbone parameters must use float32 or float64")
-#         return dtype
-
-#     @property
-#     def spectral_token_count(self) -> int:
-#         return int(self.backbone.spectral_token_count)
-
-#     @property
-#     def spectral_token_dim(self) -> int:
-#         return int(self.backbone.spectral_token_dim)
-
-#     @property
-#     def classifier_class_ids(self) -> tuple[int, ...]:
-#         return tuple(self.classifier.seen_class_ids)
-
-#     @property
-#     def committed_class_ids(self) -> tuple[int, ...]:
-#         return tuple(self.geometry_bank.seen_class_ids)
-
-#     @property
-#     def spectral_normalization_fitted(self) -> bool:
-#         return bool(self.backbone.spectral_normalization_fitted)
-
-#     def _validate_geometry_contract(
-#         self,
-#         geometry_bank: HSIClassDiscriminativeGeometry,
-#     ) -> None:
-#         if not isinstance(geometry_bank, HSIClassDiscriminativeGeometry):
-#             raise TypeError(
-#                 "geometry_bank must be HSIClassDiscriminativeGeometry"
-#             )
-#         if geometry_bank.spectral_token_count != self.spectral_token_count:
-#             raise RuntimeError(
-#                 "backbone and geometry bank disagree on spectral_token_count"
-#             )
-#         if geometry_bank.spectral_token_dim != self.spectral_token_dim:
-#             raise RuntimeError(
-#                 "backbone and geometry bank disagree on spectral_token_dim"
-#             )
-
-#     def validate_model_state(self) -> bool:
-#         if not isinstance(self.classifier, PersistentCosineClassifier):
-#             raise RuntimeError("classifier must be PersistentCosineClassifier")
-#         self.classifier.validate_state()
-#         self._validate_geometry_contract(self.geometry_bank)
-#         self.geometry_bank.validate_state()
-
-#         if self.classifier.spectral_token_count != self.spectral_token_count:
-#             raise RuntimeError(
-#                 "backbone and classifier disagree on spectral_token_count"
-#             )
-#         if self.classifier.spectral_token_dim != self.spectral_token_dim:
-#             raise RuntimeError(
-#                 "backbone and classifier disagree on spectral_token_dim"
-#             )
-#         if self.classifier.weight.device != self.device:
-#             raise RuntimeError("classifier and backbone use different devices")
-#         if self.classifier.weight.dtype != self.dtype:
-#             raise RuntimeError("classifier and backbone use different dtypes")
-#         if self.geometry_bank.device != self.device:
-#             raise RuntimeError("geometry bank and backbone use different devices")
-#         if self.geometry_bank.dtype != self.dtype:
-#             raise RuntimeError("geometry bank and backbone use different dtypes")
-
-#         # A committed historical class must always have a decision row.  During
-#         # an open incremental phase the classifier may legitimately contain new
-#         # rows whose final geometry has not yet been committed.
-#         committed = set(self.committed_class_ids)
-#         classified = set(self.classifier_class_ids)
-#         if not committed.issubset(classified):
-#             missing = sorted(committed - classified)
-#             raise RuntimeError(
-#                 "committed geometry lacks classifier rows for classes "
-#                 f"{missing}"
-#             )
-
-#         if len(self.geometry_bank) > 0 and not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "stored class geometry requires fitted spectral normalization"
-#             )
-#         return True
-
-#     def load_state_dict(
-#         self,
-#         state_dict: Any,
-#         strict: bool = True,
-#         **kwargs: Any,
-#     ) -> Any:
-#         result = super().load_state_dict(
-#             state_dict,
-#             strict=strict,
-#             **kwargs,
-#         )
-#         self.validate_model_state()
-#         return result
-
-#     # ------------------------------------------------------------------
-#     # Fixed HSI spectral normalization owned by the backbone
-#     # ------------------------------------------------------------------
-
-#     @torch.no_grad()
-#     def set_spectral_normalization(
-#         self,
-#         mean: Tensor | Sequence[float],
-#         scale: Tensor | Sequence[float],
-#         *,
-#         overwrite: bool = False,
-#     ) -> None:
-#         if len(self.geometry_bank) != 0:
-#             raise RuntimeError(
-#                 "spectral normalization cannot change after historical geometry "
-#                 "has been committed"
-#             )
-#         self.backbone.set_spectral_normalization(
-#             mean,
-#             scale,
-#             overwrite=overwrite,
-#         )
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError("spectral normalization did not enter fitted state")
-
-#     @torch.no_grad()
-#     def fit_spectral_normalization(
-#         self,
-#         base_center_spectra: Tensor,
-#         *,
-#         overwrite: bool = False,
-#     ) -> None:
-#         if len(self.geometry_bank) != 0:
-#             raise RuntimeError(
-#                 "spectral normalization cannot change after historical geometry "
-#                 "has been committed"
-#             )
-#         self.backbone.fit_spectral_normalization(
-#             base_center_spectra,
-#             overwrite=overwrite,
-#         )
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError("spectral normalization did not enter fitted state")
-
-#     # ------------------------------------------------------------------
-#     # Canonical structural coordinate
-#     # ------------------------------------------------------------------
-
-#     @staticmethod
-#     def structural_coordinates(ordered_features_raw: Tensor) -> Tensor:
-#         """Remove one global positive scale degree of freedom per HSI sample.
-
-#         The normalization uses a single scalar for the whole K x D tensor.  It
-#         therefore preserves spectral-region order and all within-sample entry
-#         ratios.  The only floor is the dtype's numerical tiny value; there is
-#         no research threshold or tunable normalization constant.
-#         """
-#         features = torch.as_tensor(ordered_features_raw)
-#         if features.ndim != 3 or features.size(0) == 0:
-#             raise ValueError("ordered_features_raw must be non-empty [N,K,D]")
-#         if not torch.is_floating_point(features) or features.is_complex():
-#             raise TypeError("ordered_features_raw must be real floating point")
-#         if not bool(torch.isfinite(features).all()):
-#             raise ValueError("ordered_features_raw contains NaN or Inf")
-
-#         flat = features.reshape(features.size(0), -1)
-#         if flat.size(1) == 0:
-#             raise ValueError("ordered_features_raw contains no feature entries")
-#         rms = torch.linalg.vector_norm(flat, ord=2, dim=1, keepdim=True)
-#         rms = rms / math.sqrt(float(flat.size(1)))
-#         floor = torch.as_tensor(
-#             torch.finfo(features.dtype).tiny,
-#             device=features.device,
-#             dtype=features.dtype,
-#         )
-#         normalized = features / rms.clamp_min(floor).view(-1, 1, 1)
-#         if not bool(torch.isfinite(normalized).all()):
-#             raise RuntimeError("structural RMS normalization produced NaN or Inf")
-#         return normalized
-
-#     def extract_features(
-#         self,
-#         patch: Tensor,
-#         *,
-#         center_spectrum: Tensor,
-#         return_aux: bool = False,
-#     ) -> BackboneOutput:
-#         """Return the one canonical Q(x) used by classifier and geometry."""
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "spectral normalization must be fitted before feature extraction"
-#             )
-
-#         raw_output = self.backbone(
-#             patch,
-#             center_spectrum=center_spectrum,
-#             return_aux=return_aux,
-#         )
-#         raw = raw_output.ordered_features
-#         expected = (
-#             patch.size(0),
-#             self.spectral_token_count,
-#             self.spectral_token_dim,
-#         )
-#         if tuple(raw.shape) != expected:
-#             raise RuntimeError(
-#                 "backbone ordered_features have shape "
-#                 f"{tuple(raw.shape)}, expected {expected}"
-#             )
-#         if raw.device != self.device:
-#             raise RuntimeError("backbone output and model use different devices")
-#         if raw.dtype != self.dtype:
-#             raise RuntimeError("backbone output and model use different dtypes")
-
-#         canonical = self.structural_coordinates(raw)
-#         return replace(raw_output, ordered_features=canonical)
-
-#     # ------------------------------------------------------------------
-#     # Classifier: decision only
-#     # ------------------------------------------------------------------
-
-#     def add_classifier_classes(
-#         self,
-#         class_ids: Sequence[int] | Tensor,
-#         *,
-#         initial_identity: Tensor | None = None,
-#     ) -> None:
-#         """Append decision rows in the same Q-space used by class statistics.
-
-#         For an incremental phase, pass the phase-start current-class identities
-#         I_c^- with shape [C,K,D].  They are flattened only to initialize the new
-#         classifier directions; no alternate representation is formed.
-#         """
-#         initial_rows = None
-#         if initial_identity is not None:
-#             identity = torch.as_tensor(
-#                 initial_identity,
-#                 device=self.device,
-#                 dtype=self.dtype,
-#             )
-#             expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-#             if identity.ndim != 3 or tuple(identity.shape[1:]) != expected_tail:
-#                 raise ValueError(
-#                     "initial_identity must have shape "
-#                     f"[C,{expected_tail[0]},{expected_tail[1]}]"
-#                 )
-#             initial_rows = identity.reshape(identity.size(0), -1)
-#         self.classifier.add_classes(class_ids, initial_rows=initial_rows)
-#         self.validate_model_state()
-
-#     def classify_features(
-#         self,
-#         ordered_features: Tensor,
-#         *,
-#         class_ids: Sequence[int] | Tensor | None = None,
-#     ) -> ClassifierOutput:
-#         return self.classifier(
-#             ordered_features,
-#             class_ids=class_ids,
-#         )
-
-#     # ------------------------------------------------------------------
-#     # Geometry: historical statistics only
-#     # ------------------------------------------------------------------
-
-#     @torch.no_grad()
-#     def estimate_class_statistics(
-#         self,
-#         ordered_features: Tensor,
-#         labels: Tensor,
-#         *,
-#         class_ids: Sequence[int] | Tensor,
-#     ):
-#         """Estimate current-phase class statistics without committing state."""
-#         features = torch.as_tensor(ordered_features)
-#         self._validate_canonical_q(features, name="class-statistic estimation")
-#         return self.geometry_bank.estimate_classes(
-#             features, labels, class_ids=class_ids
-#         )
-
-#     def _validate_canonical_q(self, features: Tensor, *, name: str) -> None:
-#         expected_tail = (self.spectral_token_count, self.spectral_token_dim)
-#         if (
-#             features.ndim != 3
-#             or features.size(0) == 0
-#             or tuple(features.shape[1:]) != expected_tail
-#         ):
-#             raise ValueError(
-#                 f"{name} requires non-empty Q with shape "
-#                 f"[N,{expected_tail[0]},{expected_tail[1]}]"
-#             )
-#         if features.device != self.device or features.dtype != self.dtype:
-#             raise ValueError(f"{name} Q has wrong device/dtype")
-#         if not bool(torch.isfinite(features).all()):
-#             raise ValueError(f"{name} Q contains NaN or Inf")
-#         flat = features.reshape(features.size(0), -1)
-#         rms = torch.linalg.vector_norm(flat, ord=2, dim=1) / math.sqrt(
-#             float(flat.size(1))
-#         )
-#         tolerance = 2e-5 if features.dtype == torch.float32 else 1e-10
-#         if not bool(torch.allclose(
-#             rms, torch.ones_like(rms), rtol=tolerance, atol=tolerance
-#         )):
-#             raise RuntimeError(f"{name} requires canonical global-RMS Q")
-
-#     @torch.no_grad()
-#     def transport_historical_state(
-#         self,
-#         transform: Tensor,
-#         *,
-#         class_ids: Sequence[int] | Tensor,
-#     ) -> None:
-#         """Atomically propagate historical {I,S,W} with one common R.
-
-#         Geometry/classifier roles stay separate, but their coordinate movement
-#         cannot diverge.  If either update fails, both are restored.
-#         """
-#         requested = _class_id_tuple(class_ids)
-#         if not set(requested).issubset(set(self.committed_class_ids)):
-#             raise RuntimeError("transport requires committed historical class statistics")
-#         if not set(requested).issubset(set(self.classifier_class_ids)):
-#             raise RuntimeError("transport requires historical classifier rows")
-
-#         identity_before = self.geometry_bank.identity_bank.detach().clone()
-#         structure_before = self.geometry_bank.structure_bank.detach().clone()
-#         classifier_before = self.classifier.weight.detach().clone()
-#         try:
-#             self.geometry_bank.transport_classes(transform, class_ids=requested)
-#             self.classifier.transport_classes(transform, class_ids=requested)
-#             self.validate_model_state()
-#         except Exception:
-#             self.geometry_bank.identity_bank.copy_(identity_before)
-#             self.geometry_bank.structure_bank.copy_(structure_before)
-#             self.classifier.weight.copy_(classifier_before)
-#             self.validate_model_state()
-#             raise
-
-#     def validate_finalized_state(self) -> bool:
-#         """Require exact classifier/statistic class alignment at phase boundary."""
-#         self.validate_model_state()
-#         if self.classifier_class_ids != self.committed_class_ids:
-#             raise RuntimeError(
-#                 "finalized phase requires classifier rows and class statistics "
-#                 "for exactly the same classes in the same order"
-#             )
-#         return True
-
-#     @torch.no_grad()
-#     def add_classes(
-#         self,
-#         ordered_features: Tensor,
-#         labels: Tensor,
-#         *,
-#         class_ids: Sequence[int] | Tensor,
-#     ) -> None:
-#         """Commit {I_c,S_c,N_c} from canonical TRAIN Q(x)."""
-#         if not self.spectral_normalization_fitted:
-#             raise RuntimeError(
-#                 "spectral normalization must be fitted before geometry commit"
-#             )
-
-#         requested = _class_id_tuple(class_ids)
-#         classifier_ids = set(self.classifier_class_ids)
-#         missing = [class_id for class_id in requested if class_id not in classifier_ids]
-#         if missing:
-#             raise RuntimeError(
-#                 "cannot commit geometry before classifier rows exist for classes "
-#                 f"{missing}"
-#             )
-
-#         features = torch.as_tensor(ordered_features)
-#         if features.size(0) != int(torch.as_tensor(labels).numel()):
-#             raise ValueError("class-statistic features/labels have different rows")
-#         self._validate_canonical_q(features, name="class-statistic commit")
-
-#         self.geometry_bank.add_classes(
-#             features,
-#             labels,
-#             class_ids=class_ids,
-#         )
-#         self.validate_model_state()
-
-#     # ------------------------------------------------------------------
-#     # End-to-end prediction path
-#     # ------------------------------------------------------------------
-
-#     def forward(
-#         self,
-#         patch: Tensor,
-#         *,
-#         center_spectrum: Tensor,
-#         class_ids: Sequence[int] | Tensor | None = None,
-#         return_aux: bool = False,
-#     ) -> NECILOutput:
-#         backbone_output = self.extract_features(
-#             patch,
-#             center_spectrum=center_spectrum,
-#             return_aux=return_aux,
-#         )
-#         classification = self.classify_features(
-#             backbone_output.ordered_features,
-#             class_ids=class_ids,
-#         )
-#         return NECILOutput(
-#             backbone=backbone_output,
+#             spectral_evidence=p,
 #             classification=classification,
 #         )
 
 
 # __all__ = ["NECILModel", "NECILOutput"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# """NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
+
+# Q[K,D] is the only learned discriminative sample representation. P[B,3] is a
+# deterministic phase-stable physical spectral structure built from the complete
+# pre-PCA centre spectrum; B is dataset-derived and independent of K.
+
+# Persistent class state is exactly
+#     {I_Q[K,D], V_Q[K,K,D], I_P[B,3], V_P[B,B,3], N}.
+# A single bias-free normalized cosine classifier supplies the all-seen decision
+# rule from Q only. The *whole* HSI CDS constrains incremental learning: I_Q and
+# V_Q define learned decision-region structure, while I_P and V_P define native
+# full-band physical spectral confusability used to prioritize preservation. Physical
+# spectral evidence is not concatenated with Q and is not a second classifier input.
+# """
+
+# from dataclasses import dataclass
+# from numbers import Integral
+# from typing import Any, Sequence
+
+# import torch
+# import torch.nn as nn
+
+# from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
+# from models.classifier import ClassifierOutput, SpectralCDSClassifier
+# from models.geometry_bank import (
+#     ClassDiscriminativeStructureState,
+#     PhysicalSpectralStructureBatch,
+#     ClassStructureBatch,
+#     HSIClassDiscriminativeStructureBank,
+# )
+# from models.spectral_evidence import OrderedPhysicalSpectralEvidence
+
+# Tensor = torch.Tensor
+
+
+# def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
+#     source = values.detach().cpu().tolist() if torch.is_tensor(values) else list(values)
+#     result: list[int] = []
+#     for value in source:
+#         if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+#             raise ValueError("class_ids must contain non-negative integers")
+#         result.append(int(value))
+#     output = tuple(result)
+#     if not output or len(output) != len(set(output)):
+#         raise ValueError("class_ids must be non-empty and unique")
+#     return output
+
+
+# def _physical_band_positions(backbone: HSIMambaFeatureExtractor) -> Tensor | None:
+#     positions = backbone.spectral_encoder.band_positions.detach().cpu()
+#     return positions if positions.numel() == int(backbone.spectral_bands) else None
+
+
+# @dataclass(frozen=True)
+# class NECILOutput:
+#     backbone: BackboneOutput
+#     spectral_evidence: Tensor
+#     classification: ClassifierOutput
+
+
+# class NECILModel(nn.Module):
+#     """One plastic HSI representation, one physical spectral reference, one CDS."""
+
+#     def __init__(self, args: Any) -> None:
+#         super().__init__()
+#         self.backbone = HSIMambaFeatureExtractor(args)
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone must contain parameters")
+#         if reference.dtype not in (torch.float32, torch.float64):
+#             raise TypeError("backbone parameters must use float32 or float64")
+
+#         band_positions = _physical_band_positions(self.backbone)
+#         self.spectral_evidence_extractor = OrderedPhysicalSpectralEvidence(
+#             band_count=int(self.backbone.spectral_bands),
+#             band_positions=band_positions,
+#         )
+#         self.structure_bank = HSIClassDiscriminativeStructureBank(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             spectral_bands=int(self.backbone.spectral_bands),
+#             spectral_band_positions=band_positions,
+#             device=reference.device,
+#             dtype=reference.dtype,
+#         )
+#         total_class_count = int(getattr(args, "class_count", 0))
+#         if total_class_count < 2:
+#             raise ValueError("args.class_count must be set before NECILModel construction")
+#         self.classifier = SpectralCDSClassifier(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             total_class_count=total_class_count,
+#         )
+#         self.validate_model_state()
+
+#     def _reference_parameter(self) -> Tensor:
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone has no parameters")
+#         return reference
+
+#     @property
+#     def device(self) -> torch.device:
+#         return self._reference_parameter().device
+
+#     @property
+#     def dtype(self) -> torch.dtype:
+#         return self._reference_parameter().dtype
+
+#     @property
+#     def spectral_token_count(self) -> int:
+#         return int(self.backbone.spectral_token_count)
+
+#     @property
+#     def spectral_token_dim(self) -> int:
+#         return int(self.backbone.spectral_token_dim)
+
+#     @property
+#     def spectral_bands(self) -> int:
+#         return int(self.backbone.spectral_bands)
+
+#     @property
+#     def committed_class_ids(self) -> tuple[int, ...]:
+#         return self.structure_bank.seen_class_ids
+
+#     @property
+#     def spectral_normalization_fitted(self) -> bool:
+#         return bool(self.backbone.spectral_normalization_fitted) and bool(
+#             self.spectral_evidence_extractor.fitted.item()
+#         )
+
+#     def validate_model_state(self) -> bool:
+#         if not isinstance(self.classifier, SpectralCDSClassifier):
+#             raise RuntimeError("classifier must be SpectralCDSClassifier")
+#         if self.classifier.parameter_count <= 0:
+#             raise RuntimeError("cosine classifier must contain trainable class rows")
+#         scale = self.classifier.logit_scale_value
+#         if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+#             raise RuntimeError("shared cosine classifier scale is invalid")
+#         if not isinstance(self.structure_bank, HSIClassDiscriminativeStructureBank):
+#             raise RuntimeError("structure_bank must be HSIClassDiscriminativeStructureBank")
+#         self.structure_bank.validate_state()
+#         if self.structure_bank.device != self.device or self.structure_bank.dtype != self.dtype:
+#             raise RuntimeError("backbone and structure bank use different device/dtype")
+#         if self.structure_bank.spectral_token_count != self.spectral_token_count:
+#             raise RuntimeError("backbone and bank disagree on K")
+#         if self.structure_bank.spectral_token_dim != self.spectral_token_dim:
+#             raise RuntimeError("backbone and bank disagree on D")
+#         if self.structure_bank.spectral_bands != self.spectral_bands:
+#             raise RuntimeError("backbone and bank disagree on native band count B")
+#         if len(self.structure_bank) and not self.spectral_normalization_fitted:
+#             raise RuntimeError("stored CDS requires fitted Phase-0 spectral normalization")
+#         return True
+
+#     @torch.no_grad()
+#     def fit_spectral_normalization(self, base_center_spectra: Tensor, *, overwrite: bool = False) -> None:
+#         if len(self.structure_bank):
+#             raise RuntimeError("spectral normalization cannot change after Phase 0")
+#         self.backbone.fit_spectral_normalization(base_center_spectra, overwrite=overwrite)
+#         self.spectral_evidence_extractor.fit(base_center_spectra, overwrite=overwrite)
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization was not fitted")
+
+#     def set_base_trainability(self) -> None:
+#         self.backbone.set_base_trainability()
+
+#     def set_incremental_trainability(self) -> None:
+#         self.validate_finalized_state()
+#         self.backbone.set_incremental_trainability()
+#         if not tuple(self.backbone.incremental_trainable_parameters()):
+#             raise RuntimeError("incremental representation has no plastic parameters")
+
+#     def extract_features_with_backbone(
+#         self,
+#         backbone: nn.Module,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         output = backbone(patch, center_spectrum=center_spectrum, return_aux=return_aux)
+#         q = output.ordered_features
+#         expected = (patch.size(0), self.spectral_token_count, self.spectral_token_dim)
+#         if q.shape != expected or not bool(torch.isfinite(q).all()):
+#             raise RuntimeError("backbone produced invalid ordered features")
+#         return output
+
+#     def extract_features(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before feature extraction")
+#         return self.extract_features_with_backbone(
+#             self.backbone,
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+
+#     def spectral_evidence(self, center_spectrum: Tensor) -> Tensor:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before spectral evidence")
+#         evidence = self.spectral_evidence_extractor(center_spectrum)
+#         if evidence.device != self.device or evidence.dtype != self.dtype:
+#             evidence = evidence.to(device=self.device, dtype=self.dtype)
+#         if evidence.ndim != 3 or tuple(evidence.shape[1:]) != (self.spectral_bands, 3):
+#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
+#         return evidence
+
+#     def _resolve_cds(
+#         self,
+#         *,
+#         cds: ClassDiscriminativeStructureState | None,
+#         structures: ClassStructureBatch | None,
+#         class_ids: Sequence[int] | Tensor | None,
+#     ) -> ClassDiscriminativeStructureState:
+#         if cds is not None:
+#             if structures is not None or class_ids is not None:
+#                 raise ValueError("cds cannot be combined with structures/class_ids")
+#             return cds
+#         if structures is not None:
+#             if class_ids is not None:
+#                 requested = _class_id_tuple(class_ids)
+#                 actual = tuple(int(v) for v in structures.class_ids.detach().cpu().tolist())
+#                 if requested != actual:
+#                     raise ValueError("class_ids must match supplied structures")
+#             return self.structure_bank.build_cds(structures)
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("classification requires a working CDS")
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def build_class_discriminative_structure(
+#         self,
+#         structures: ClassStructureBatch,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(structures)
+
+#     def classify_features(
+#         self,
+#         ordered_features: Tensor,
+#         *,
+#         center_spectrum: Tensor | None = None,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassifierOutput:
+#         q = torch.as_tensor(ordered_features)
+#         if q.ndim != 3 or tuple(q.shape[1:]) != (self.spectral_token_count, self.spectral_token_dim):
+#             raise ValueError("ordered_features have invalid shape")
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         return self.classifier(q, cds=resolved)
+
+#     @torch.no_grad()
+#     def estimate_physical_class_structure(
+#         self,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#     ) -> PhysicalSpectralStructureBatch:
+#         p = self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_physical(p, labels, class_ids=class_ids)
+
+#     @torch.no_grad()
+#     def estimate_class_structure(
+#         self,
+#         ordered_features: Tensor,
+#         raw_center_spectra: Tensor | None,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#         physical_structure: PhysicalSpectralStructureBatch | None = None,
+#     ) -> ClassStructureBatch:
+#         q = torch.as_tensor(ordered_features)
+#         p = None if physical_structure is not None else self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_classes(
+#             q,
+#             p,
+#             labels,
+#             class_ids=class_ids,
+#             physical_structure=physical_structure,
+#         )
+
+#     @torch.no_grad()
+#     def commit_class_structure(self, estimated: ClassStructureBatch) -> None:
+#         self.structure_bank.append_estimate(estimated)
+
+#     @torch.no_grad()
+#     def replace_class_structure(self, structures: ClassStructureBatch) -> None:
+#         self.structure_bank.replace_all(structures)
+#         self.validate_model_state()
+
+#     def class_discriminative_structure(
+#         self,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def validate_finalized_state(self) -> bool:
+#         self.validate_model_state()
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("finalized phase requires non-empty CDS")
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("finalized phase requires fitted spectral normalization")
+#         return True
+
+#     def forward(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#         return_aux: bool = False,
+#     ) -> NECILOutput:
+#         backbone_output = self.extract_features(
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+#         p = self.spectral_evidence(center_spectrum)
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         classification = self.classifier(backbone_output.ordered_features, cds=resolved)
+#         return NECILOutput(
+#             backbone=backbone_output,
+#             spectral_evidence=p,
+#             classification=classification,
+#         )
+
+
+# __all__ = ["NECILModel", "NECILOutput"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# """NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
+
+# Q[K,D] is the only learned discriminative sample representation. P[B,3] is a
+# deterministic phase-stable physical spectral structure built from the complete
+# pre-PCA centre spectrum; B is dataset-derived and independent of K.
+
+# Persistent class state is exactly
+#     {I_Q[K,D], V_Q[K,K,D], I_P[B,3], V_P[B,B,3], N}.
+# A single bias-free normalized cosine classifier supplies the all-seen decision
+# rule from Q only. The *whole* HSI CDS constrains incremental learning: I_Q and
+# V_Q define learned decision-region structure, while I_P and V_P define native
+# full-band physical spectral confusability used to prioritize preservation. Physical
+# spectral evidence is not concatenated with Q and is not a second classifier input.
+# """
+
+# from dataclasses import dataclass
+# from numbers import Integral
+# from typing import Any, Sequence
+
+# import torch
+# import torch.nn as nn
+
+# from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
+# from models.classifier import ClassifierOutput, SpectralCDSClassifier
+# from models.geometry_bank import (
+#     ClassDiscriminativeStructureState,
+#     PhysicalSpectralStructureBatch,
+#     ClassStructureBatch,
+#     HSIClassDiscriminativeStructureBank,
+# )
+# from models.spectral_evidence import OrderedPhysicalSpectralEvidence
+
+# Tensor = torch.Tensor
+
+
+# def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
+#     source = values.detach().cpu().tolist() if torch.is_tensor(values) else list(values)
+#     result: list[int] = []
+#     for value in source:
+#         if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+#             raise ValueError("class_ids must contain non-negative integers")
+#         result.append(int(value))
+#     output = tuple(result)
+#     if not output or len(output) != len(set(output)):
+#         raise ValueError("class_ids must be non-empty and unique")
+#     return output
+
+
+# def _physical_band_positions(backbone: HSIMambaFeatureExtractor) -> Tensor | None:
+#     positions = backbone.spectral_encoder.band_positions.detach().cpu()
+#     return positions if positions.numel() == int(backbone.spectral_bands) else None
+
+
+# @dataclass(frozen=True)
+# class NECILOutput:
+#     backbone: BackboneOutput
+#     spectral_evidence: Tensor
+#     classification: ClassifierOutput
+
+
+# class NECILModel(nn.Module):
+#     """One plastic HSI representation, one physical spectral reference, one CDS."""
+
+#     def __init__(self, args: Any) -> None:
+#         super().__init__()
+#         self.backbone = HSIMambaFeatureExtractor(args)
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone must contain parameters")
+#         if reference.dtype not in (torch.float32, torch.float64):
+#             raise TypeError("backbone parameters must use float32 or float64")
+
+#         band_positions = _physical_band_positions(self.backbone)
+#         self.spectral_evidence_extractor = OrderedPhysicalSpectralEvidence(
+#             band_count=int(self.backbone.spectral_bands),
+#             band_positions=band_positions,
+#         )
+#         self.structure_bank = HSIClassDiscriminativeStructureBank(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             spectral_bands=int(self.backbone.spectral_bands),
+#             spectral_band_positions=band_positions,
+#             device=reference.device,
+#             dtype=reference.dtype,
+#         )
+#         total_class_count = int(getattr(args, "class_count", 0))
+#         if total_class_count < 2:
+#             raise ValueError("args.class_count must be set before NECILModel construction")
+#         self.classifier = SpectralCDSClassifier(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             total_class_count=total_class_count,
+#         )
+#         self.validate_model_state()
+
+#     def _reference_parameter(self) -> Tensor:
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone has no parameters")
+#         return reference
+
+#     @property
+#     def device(self) -> torch.device:
+#         return self._reference_parameter().device
+
+#     @property
+#     def dtype(self) -> torch.dtype:
+#         return self._reference_parameter().dtype
+
+#     @property
+#     def spectral_token_count(self) -> int:
+#         return int(self.backbone.spectral_token_count)
+
+#     @property
+#     def spectral_token_dim(self) -> int:
+#         return int(self.backbone.spectral_token_dim)
+
+#     @property
+#     def spectral_bands(self) -> int:
+#         return int(self.backbone.spectral_bands)
+
+#     @property
+#     def committed_class_ids(self) -> tuple[int, ...]:
+#         return self.structure_bank.seen_class_ids
+
+#     @property
+#     def spectral_normalization_fitted(self) -> bool:
+#         return bool(self.backbone.spectral_normalization_fitted) and bool(
+#             self.spectral_evidence_extractor.fitted.item()
+#         )
+
+#     def validate_model_state(self) -> bool:
+#         if not isinstance(self.classifier, SpectralCDSClassifier):
+#             raise RuntimeError("classifier must be SpectralCDSClassifier")
+#         if self.classifier.parameter_count <= 0:
+#             raise RuntimeError("cosine classifier must contain trainable class rows")
+#         scale = self.classifier.logit_scale_value
+#         if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+#             raise RuntimeError("shared cosine classifier scale is invalid")
+#         if not isinstance(self.structure_bank, HSIClassDiscriminativeStructureBank):
+#             raise RuntimeError("structure_bank must be HSIClassDiscriminativeStructureBank")
+#         self.structure_bank.validate_state()
+#         if self.structure_bank.device != self.device or self.structure_bank.dtype != self.dtype:
+#             raise RuntimeError("backbone and structure bank use different device/dtype")
+#         if self.structure_bank.spectral_token_count != self.spectral_token_count:
+#             raise RuntimeError("backbone and bank disagree on K")
+#         if self.structure_bank.spectral_token_dim != self.spectral_token_dim:
+#             raise RuntimeError("backbone and bank disagree on D")
+#         if self.structure_bank.spectral_bands != self.spectral_bands:
+#             raise RuntimeError("backbone and bank disagree on native band count B")
+#         if len(self.structure_bank) and not self.spectral_normalization_fitted:
+#             raise RuntimeError("stored CDS requires fitted Phase-0 spectral normalization")
+#         return True
+
+#     @torch.no_grad()
+#     def fit_spectral_normalization(self, base_center_spectra: Tensor, *, overwrite: bool = False) -> None:
+#         if len(self.structure_bank):
+#             raise RuntimeError("spectral normalization cannot change after Phase 0")
+#         self.backbone.fit_spectral_normalization(base_center_spectra, overwrite=overwrite)
+#         self.spectral_evidence_extractor.fit(base_center_spectra, overwrite=overwrite)
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization was not fitted")
+
+#     def set_base_trainability(self) -> None:
+#         self.backbone.set_base_trainability()
+
+#     def set_incremental_trainability(self) -> None:
+#         self.validate_finalized_state()
+#         self.backbone.set_incremental_trainability()
+#         if not tuple(self.backbone.incremental_trainable_parameters()):
+#             raise RuntimeError("incremental representation has no plastic parameters")
+
+#     def extract_features_with_backbone(
+#         self,
+#         backbone: nn.Module,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         output = backbone(patch, center_spectrum=center_spectrum, return_aux=return_aux)
+#         q = output.ordered_features
+#         expected = (patch.size(0), self.spectral_token_count, self.spectral_token_dim)
+#         if q.shape != expected or not bool(torch.isfinite(q).all()):
+#             raise RuntimeError("backbone produced invalid ordered features")
+#         return output
+
+#     def extract_features(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before feature extraction")
+#         return self.extract_features_with_backbone(
+#             self.backbone,
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+
+#     def spectral_evidence(self, center_spectrum: Tensor) -> Tensor:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before spectral evidence")
+#         evidence = self.spectral_evidence_extractor(center_spectrum)
+#         if evidence.device != self.device or evidence.dtype != self.dtype:
+#             evidence = evidence.to(device=self.device, dtype=self.dtype)
+#         if evidence.ndim != 3 or tuple(evidence.shape[1:]) != (self.spectral_bands, 3):
+#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
+#         return evidence
+
+#     def _resolve_cds(
+#         self,
+#         *,
+#         cds: ClassDiscriminativeStructureState | None,
+#         structures: ClassStructureBatch | None,
+#         class_ids: Sequence[int] | Tensor | None,
+#     ) -> ClassDiscriminativeStructureState:
+#         if cds is not None:
+#             if structures is not None or class_ids is not None:
+#                 raise ValueError("cds cannot be combined with structures/class_ids")
+#             return cds
+#         if structures is not None:
+#             if class_ids is not None:
+#                 requested = _class_id_tuple(class_ids)
+#                 actual = tuple(int(v) for v in structures.class_ids.detach().cpu().tolist())
+#                 if requested != actual:
+#                     raise ValueError("class_ids must match supplied structures")
+#             return self.structure_bank.build_cds(structures)
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("classification requires a working CDS")
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def build_class_discriminative_structure(
+#         self,
+#         structures: ClassStructureBatch,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(structures)
+
+#     def classify_features(
+#         self,
+#         ordered_features: Tensor,
+#         *,
+#         center_spectrum: Tensor | None = None,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassifierOutput:
+#         q = torch.as_tensor(ordered_features)
+#         if q.ndim != 3 or tuple(q.shape[1:]) != (self.spectral_token_count, self.spectral_token_dim):
+#             raise ValueError("ordered_features have invalid shape")
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         return self.classifier(q, cds=resolved)
+
+#     @torch.no_grad()
+#     def estimate_physical_class_structure(
+#         self,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#     ) -> PhysicalSpectralStructureBatch:
+#         p = self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_physical(p, labels, class_ids=class_ids)
+
+#     @torch.no_grad()
+#     def estimate_class_structure(
+#         self,
+#         ordered_features: Tensor,
+#         raw_center_spectra: Tensor | None,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#         physical_structure: PhysicalSpectralStructureBatch | None = None,
+#     ) -> ClassStructureBatch:
+#         q = torch.as_tensor(ordered_features)
+#         p = None if physical_structure is not None else self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_classes(
+#             q,
+#             p,
+#             labels,
+#             class_ids=class_ids,
+#             physical_structure=physical_structure,
+#         )
+
+#     @torch.no_grad()
+#     def commit_class_structure(self, estimated: ClassStructureBatch) -> None:
+#         self.structure_bank.append_estimate(estimated)
+
+#     @torch.no_grad()
+#     def replace_class_structure(self, structures: ClassStructureBatch) -> None:
+#         self.structure_bank.replace_all(structures)
+#         self.validate_model_state()
+
+#     def class_discriminative_structure(
+#         self,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def validate_finalized_state(self) -> bool:
+#         self.validate_model_state()
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("finalized phase requires non-empty CDS")
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("finalized phase requires fitted spectral normalization")
+#         return True
+
+#     def forward(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#         return_aux: bool = False,
+#     ) -> NECILOutput:
+#         backbone_output = self.extract_features(
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+#         p = self.spectral_evidence(center_spectrum)
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         classification = self.classifier(backbone_output.ordered_features, cds=resolved)
+#         return NECILOutput(
+#             backbone=backbone_output,
+#             spectral_evidence=p,
+#             classification=classification,
+#         )
+
+
+# __all__ = ["NECILModel", "NECILOutput"]
+
+
+
+# from __future__ import annotations
+
+# """NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
+
+# from __future__ import annotations
+
+# """NECIL-HSI model: one learned Q, one full-band physical P, one CDS bank.
+
+# Q[K,D] is the only learned discriminative sample representation. P[B,3] is a
+# deterministic phase-stable physical spectral structure built from the complete
+# pre-PCA centre spectrum; B is dataset-derived and independent of K.
+
+# Persistent class state is exactly
+#     {I_Q[K,D], V_Q[K,K,D], I_P[B,3], V_P[B,B,3], N}.
+# A single bias-free normalized cosine classifier with one positive shared scale
+# learned from HSI data supplies the all-seen decision rule. Historical classifier rows remain the tested previous-phase parameters,
+# while current real samples compete against all seen classes. The *whole* HSI CDS
+# constrains incremental learning: I_Q supplies ordered identity, V_Q supplies
+# complete intra-class region structure, all seen I_Q,V_Q derive inter-class
+# overlap, and I_P,V_P derive full-band physical spectral confusability. These
+# relations act on the plastic representation and on every classifier boundary
+# involving a current class. No pseudo-feature or second classifier is used.
+# """
+
+# from dataclasses import dataclass
+# from numbers import Integral
+# from typing import Any, Sequence
+
+# import torch
+# import torch.nn as nn
+
+# from models.backbone import BackboneOutput, HSIMambaFeatureExtractor
+# from models.classifier import ClassifierOutput, SpectralCDSClassifier
+# from models.cds_decision_region import HSICDSDecisionRegionRegulator
+# from models.geometry_bank import (
+#     ClassDiscriminativeStructureState,
+#     PhysicalSpectralStructureBatch,
+#     ClassStructureBatch,
+#     HSIClassDiscriminativeStructureBank,
+# )
+# from models.spectral_evidence import OrderedPhysicalSpectralEvidence
+
+# Tensor = torch.Tensor
+
+
+# def _class_id_tuple(values: Sequence[int] | Tensor) -> tuple[int, ...]:
+#     source = values.detach().cpu().tolist() if torch.is_tensor(values) else list(values)
+#     result: list[int] = []
+#     for value in source:
+#         if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+#             raise ValueError("class_ids must contain non-negative integers")
+#         result.append(int(value))
+#     output = tuple(result)
+#     if not output or len(output) != len(set(output)):
+#         raise ValueError("class_ids must be non-empty and unique")
+#     return output
+
+
+# def _physical_band_positions(backbone: HSIMambaFeatureExtractor) -> Tensor | None:
+#     positions = backbone.spectral_encoder.band_positions.detach().cpu()
+#     return positions if positions.numel() == int(backbone.spectral_bands) else None
+
+
+# @dataclass(frozen=True)
+# class NECILOutput:
+#     backbone: BackboneOutput
+#     spectral_evidence: Tensor
+#     classification: ClassifierOutput
+
+
+# class NECILModel(nn.Module):
+#     """One plastic HSI representation, one physical spectral reference, one CDS."""
+
+#     def __init__(self, args: Any) -> None:
+#         super().__init__()
+#         self.backbone = HSIMambaFeatureExtractor(args)
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone must contain parameters")
+#         if reference.dtype not in (torch.float32, torch.float64):
+#             raise TypeError("backbone parameters must use float32 or float64")
+
+#         band_positions = _physical_band_positions(self.backbone)
+#         self.spectral_evidence_extractor = OrderedPhysicalSpectralEvidence(
+#             band_count=int(self.backbone.spectral_bands),
+#             band_positions=band_positions,
+#         )
+#         self.structure_bank = HSIClassDiscriminativeStructureBank(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             spectral_bands=int(self.backbone.spectral_bands),
+#             spectral_band_positions=band_positions,
+#             device=reference.device,
+#             dtype=reference.dtype,
+#         )
+#         total_class_count = int(getattr(args, "class_count", 0))
+#         if total_class_count < 2:
+#             raise ValueError("args.class_count must be set before NECILModel construction")
+#         self.classifier = SpectralCDSClassifier(
+#             spectral_token_count=int(self.backbone.spectral_token_count),
+#             spectral_token_dim=int(self.backbone.spectral_token_dim),
+#             total_class_count=total_class_count,
+#         )
+#         # Parameter-free continual-learning module. It owns no class memory and is
+#         # inactive at inference; it only regulates newly introduced classifier rows
+#         # against the retained HSI-CDS during incremental optimization.
+#         self.decision_region_regulator = HSICDSDecisionRegionRegulator()
+#         self.validate_model_state()
+
+#     def _reference_parameter(self) -> Tensor:
+#         reference = next(self.backbone.parameters(), None)
+#         if reference is None:
+#             raise RuntimeError("backbone has no parameters")
+#         return reference
+
+#     @property
+#     def device(self) -> torch.device:
+#         return self._reference_parameter().device
+
+#     @property
+#     def dtype(self) -> torch.dtype:
+#         return self._reference_parameter().dtype
+
+#     @property
+#     def spectral_token_count(self) -> int:
+#         return int(self.backbone.spectral_token_count)
+
+#     @property
+#     def spectral_token_dim(self) -> int:
+#         return int(self.backbone.spectral_token_dim)
+
+#     @property
+#     def spectral_bands(self) -> int:
+#         return int(self.backbone.spectral_bands)
+
+#     @property
+#     def committed_class_ids(self) -> tuple[int, ...]:
+#         return self.structure_bank.seen_class_ids
+
+#     @property
+#     def spectral_normalization_fitted(self) -> bool:
+#         return bool(self.backbone.spectral_normalization_fitted) and bool(
+#             self.spectral_evidence_extractor.fitted.item()
+#         )
+
+#     def validate_model_state(self) -> bool:
+#         if not isinstance(self.classifier, SpectralCDSClassifier):
+#             raise RuntimeError("classifier must be SpectralCDSClassifier")
+#         if self.classifier.parameter_count <= 0:
+#             raise RuntimeError("cosine classifier must contain trainable class rows")
+#         scale = self.classifier.logit_scale_value
+#         if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+#             raise RuntimeError("shared cosine classifier scale is invalid")
+#         if not isinstance(self.decision_region_regulator, HSICDSDecisionRegionRegulator):
+#             raise RuntimeError("decision_region_regulator must be HSICDSDecisionRegionRegulator")
+#         if self.decision_region_regulator.parameter_count != 0:
+#             raise RuntimeError("decision-region regulator must remain parameter-free")
+#         if not isinstance(self.structure_bank, HSIClassDiscriminativeStructureBank):
+#             raise RuntimeError("structure_bank must be HSIClassDiscriminativeStructureBank")
+#         self.structure_bank.validate_state()
+#         if self.structure_bank.device != self.device or self.structure_bank.dtype != self.dtype:
+#             raise RuntimeError("backbone and structure bank use different device/dtype")
+#         if self.structure_bank.spectral_token_count != self.spectral_token_count:
+#             raise RuntimeError("backbone and bank disagree on K")
+#         if self.structure_bank.spectral_token_dim != self.spectral_token_dim:
+#             raise RuntimeError("backbone and bank disagree on D")
+#         if self.structure_bank.spectral_bands != self.spectral_bands:
+#             raise RuntimeError("backbone and bank disagree on native band count B")
+#         if len(self.structure_bank) and not self.spectral_normalization_fitted:
+#             raise RuntimeError("stored CDS requires fitted Phase-0 spectral normalization")
+#         return True
+
+#     @torch.no_grad()
+#     def fit_spectral_normalization(self, base_center_spectra: Tensor, *, overwrite: bool = False) -> None:
+#         if len(self.structure_bank):
+#             raise RuntimeError("spectral normalization cannot change after Phase 0")
+#         self.backbone.fit_spectral_normalization(base_center_spectra, overwrite=overwrite)
+#         self.spectral_evidence_extractor.fit(base_center_spectra, overwrite=overwrite)
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization was not fitted")
+
+#     def set_base_trainability(self) -> None:
+#         self.backbone.set_base_trainability()
+
+#     def set_incremental_trainability(self) -> None:
+#         self.validate_finalized_state()
+#         self.backbone.set_incremental_trainability()
+#         if not tuple(self.backbone.incremental_trainable_parameters()):
+#             raise RuntimeError("incremental representation has no plastic parameters")
+
+#     def extract_features_with_backbone(
+#         self,
+#         backbone: nn.Module,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         output = backbone(patch, center_spectrum=center_spectrum, return_aux=return_aux)
+#         q = output.ordered_features
+#         expected = (patch.size(0), self.spectral_token_count, self.spectral_token_dim)
+#         if q.shape != expected or not bool(torch.isfinite(q).all()):
+#             raise RuntimeError("backbone produced invalid ordered features")
+#         return output
+
+#     def extract_features(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         return_aux: bool = False,
+#     ) -> BackboneOutput:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before feature extraction")
+#         return self.extract_features_with_backbone(
+#             self.backbone,
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+
+#     def spectral_evidence(self, center_spectrum: Tensor) -> Tensor:
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("spectral normalization must be fitted before spectral evidence")
+#         evidence = self.spectral_evidence_extractor(center_spectrum)
+#         if evidence.device != self.device or evidence.dtype != self.dtype:
+#             evidence = evidence.to(device=self.device, dtype=self.dtype)
+#         if evidence.ndim != 3 or tuple(evidence.shape[1:]) != (self.spectral_bands, 3):
+#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
+#         return evidence
+
+#     def _resolve_cds(
+#         self,
+#         *,
+#         cds: ClassDiscriminativeStructureState | None,
+#         structures: ClassStructureBatch | None,
+#         class_ids: Sequence[int] | Tensor | None,
+#     ) -> ClassDiscriminativeStructureState:
+#         if cds is not None:
+#             if structures is not None or class_ids is not None:
+#                 raise ValueError("cds cannot be combined with structures/class_ids")
+#             return cds
+#         if structures is not None:
+#             if class_ids is not None:
+#                 requested = _class_id_tuple(class_ids)
+#                 actual = tuple(int(v) for v in structures.class_ids.detach().cpu().tolist())
+#                 if requested != actual:
+#                     raise ValueError("class_ids must match supplied structures")
+#             return self.structure_bank.build_cds(structures)
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("classification requires a working CDS")
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def build_class_discriminative_structure(
+#         self,
+#         structures: ClassStructureBatch,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(structures)
+
+#     def classify_features(
+#         self,
+#         ordered_features: Tensor,
+#         *,
+#         center_spectrum: Tensor | None = None,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassifierOutput:
+#         q = torch.as_tensor(ordered_features)
+#         if q.ndim != 3 or tuple(q.shape[1:]) != (self.spectral_token_count, self.spectral_token_dim):
+#             raise ValueError("ordered_features have invalid shape")
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         return self.classifier(q, cds=resolved)
+
+#     @torch.no_grad()
+#     def estimate_physical_class_structure(
+#         self,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#     ) -> PhysicalSpectralStructureBatch:
+#         p = self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_physical(p, labels, class_ids=class_ids)
+
+#     @torch.no_grad()
+#     def estimate_class_structure(
+#         self,
+#         ordered_features: Tensor,
+#         raw_center_spectra: Tensor | None,
+#         labels: Tensor,
+#         *,
+#         class_ids: Sequence[int] | Tensor,
+#         physical_structure: PhysicalSpectralStructureBatch | None = None,
+#     ) -> ClassStructureBatch:
+#         q = torch.as_tensor(ordered_features)
+#         p = None if physical_structure is not None else self.spectral_evidence(raw_center_spectra)
+#         return self.structure_bank.estimate_classes(
+#             q,
+#             p,
+#             labels,
+#             class_ids=class_ids,
+#             physical_structure=physical_structure,
+#         )
+
+#     @torch.no_grad()
+#     def commit_class_structure(self, estimated: ClassStructureBatch) -> None:
+#         self.structure_bank.append_estimate(estimated)
+
+#     @torch.no_grad()
+#     def replace_class_structure(self, structures: ClassStructureBatch) -> None:
+#         self.structure_bank.replace_all(structures)
+#         self.validate_model_state()
+
+#     def class_discriminative_structure(
+#         self,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#     ) -> ClassDiscriminativeStructureState:
+#         return self.structure_bank.build_cds(self.structure_bank.class_structures(class_ids))
+
+#     def validate_finalized_state(self) -> bool:
+#         self.validate_model_state()
+#         if len(self.structure_bank) == 0:
+#             raise RuntimeError("finalized phase requires non-empty CDS")
+#         if not self.spectral_normalization_fitted:
+#             raise RuntimeError("finalized phase requires fitted spectral normalization")
+#         return True
+
+#     def forward(
+#         self,
+#         patch: Tensor,
+#         *,
+#         center_spectrum: Tensor,
+#         cds: ClassDiscriminativeStructureState | None = None,
+#         structures: ClassStructureBatch | None = None,
+#         class_ids: Sequence[int] | Tensor | None = None,
+#         return_aux: bool = False,
+#     ) -> NECILOutput:
+#         backbone_output = self.extract_features(
+#             patch,
+#             center_spectrum=center_spectrum,
+#             return_aux=return_aux,
+#         )
+#         p = self.spectral_evidence(center_spectrum)
+#         resolved = self._resolve_cds(cds=cds, structures=structures, class_ids=class_ids)
+#         classification = self.classifier(backbone_output.ordered_features, cds=resolved)
+#         return NECILOutput(
+#             backbone=backbone_output,
+#             spectral_evidence=p,
+#             classification=classification,
+#         )
+
+
+# __all__ = ["NECILModel", "NECILOutput"]
+
 

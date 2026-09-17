@@ -9,7 +9,8 @@ Protocol contract
 * Cumulative validation/test over all seen classes is evaluation-only and is
   available only after the phase is finalized.
 * The spatial branch receives the processed/PCA patch.
-* The spectral branch receives the raw ordered full-band centre spectrum.
+* The spectral branch receives the pre-PCA ordered centre spectrum from the
+  dataset cube; corrected datasets may already exclude sensor bands.
 * Those two inputs are fused by the backbone; the dataset does not create a
   second learned representation.
 * No optimization/model-selection API returns historical training samples after its phase.
@@ -126,6 +127,56 @@ def _normalize_split_name(split: str) -> str:
         "validation": "val",
         "testing": "test",
     }.get(token, token)
+
+
+_SPECTRAL_AXIS_ALIASES = {
+    "wavelength": "wavelength_nm",
+    "wavelengths": "wavelength_nm",
+    "wavelength_nm": "wavelength_nm",
+    "wavelengths_nm": "wavelength_nm",
+    "nm": "wavelength_nm",
+    "band": "ordered_band",
+    "bands": "ordered_band",
+    "band_index": "ordered_band",
+    "ordered_band": "ordered_band",
+}
+
+
+def _validated_spectral_axis(
+    spectral_axis: Optional[Sequence[float]],
+    *,
+    raw_bands: int,
+    spectral_axis_type: str,
+) -> Tuple[np.ndarray, str]:
+    """Validate the one spectral coordinate shared by the model and CDS."""
+    bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+    token = _SPECTRAL_AXIS_ALIASES.get(
+        str(spectral_axis_type).strip().lower()
+    )
+    if token is None:
+        raise ValueError(
+            "spectral_axis_type must be 'wavelength_nm' or 'ordered_band'"
+        )
+    if spectral_axis is None:
+        if token != "ordered_band":
+            raise ValueError(
+                "physical wavelength coordinates must be supplied explicitly; "
+                "they are never synthesized from band indices"
+            )
+        axis = np.arange(bands, dtype=np.float32)
+    else:
+        axis = np.asarray(spectral_axis, dtype=np.float64).reshape(-1)
+    if axis.shape != (bands,):
+        raise ValueError(
+            "spectral_axis must contain one coordinate per ordered raw band"
+        )
+    if not np.isfinite(axis).all():
+        raise ValueError("spectral_axis contains NaN/Inf")
+    if bands > 1 and not np.all(np.diff(axis) > 0.0):
+        raise ValueError("spectral_axis must be strictly increasing")
+    if token == "wavelength_nm" and np.any(axis <= 0.0):
+        raise ValueError("physical wavelengths in nanometres must be positive")
+    return axis.astype(np.float32), token
 
 
 def _seed_worker(_: int) -> None:
@@ -778,6 +829,8 @@ class IncrementalHSIDatasetManager:
         gt_shape: Sequence[int],
         patch_size: int,
         ordered_spectral_cube: Optional[np.ndarray] = None,
+        spectral_axis: Optional[Sequence[float]] = None,
+        spectral_axis_type: str = "ordered_band",
         num_workers: int = 0,
         device: str = "cpu",
         seed: Optional[int] = None,
@@ -867,6 +920,14 @@ class IncrementalHSIDatasetManager:
         ):
             raise ValueError("ordered_spectral_cube is invalid")
         self.ordered_spectral_cube = np.ascontiguousarray(ordered)
+        self.spectral_axis, self.spectral_axis_type = _validated_spectral_axis(
+            spectral_axis,
+            raw_bands=int(self.ordered_spectral_cube.shape[-1]),
+            spectral_axis_type=spectral_axis_type,
+        )
+        self.spectral_axis_is_physical = (
+            self.spectral_axis_type == "wavelength_nm"
+        )
 
         self.patch_size = _exact_integer(
             patch_size, name="patch_size", minimum=1
@@ -1097,16 +1158,21 @@ class IncrementalHSIDatasetManager:
                 "only context_policy='full_scene_reflect' is implemented"
             )
 
-        protocol_seed = _exact_integer(
-            protocol["seed"], name="protocol seed", minimum=0
+        # Protocol randomness and optimization/DataLoader randomness are
+        # intentionally separate. ``protocol_seed`` fixes class order and
+        # train/val/test membership; ``self.seed`` controls only DataLoader
+        # shuffling/worker randomness for this optimization run.  Multi-seed
+        # robustness therefore supports, for example, protocol_seed=42 with
+        # optimization seeds 42/123/70 without changing the benchmark split.
+        self.protocol_seed = _seed32(
+            protocol["seed"],
+            name="protocol seed",
         )
         self.seed = (
-            protocol_seed
+            self.protocol_seed
             if seed is None
-            else _exact_integer(seed, name="dataset-manager seed", minimum=0)
+            else _seed32(seed, name="dataset-manager optimization seed")
         )
-        if self.seed != protocol_seed:
-            raise ValueError("dataset-manager seed disagrees with protocol seed")
 
         self.num_workers = _exact_integer(
             num_workers, name="num_workers", minimum=0
@@ -1409,6 +1475,26 @@ class IncrementalHSIDatasetManager:
             split=token,
         )
 
+    def get_phase_structure_dataloader(
+        self,
+        phase: int,
+        *,
+        batch_size: int = 256,
+    ) -> DataLoader:
+        """Deterministic full current-TRAIN loader for structure estimation.
+
+        This deliberately reuses the active phase TRAIN membership, exposes no
+        historical rows, disables shuffling, and therefore provides the single
+        legal source for epoch refresh/final commit of current-class
+        I/V/Mspec/Vspec.
+        """
+        return self.get_phase_dataloader(
+            phase,
+            split="train",
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
     def get_cumulative_dataloader(
         self,
         phase: int,
@@ -1526,6 +1612,8 @@ class IncrementalHSIDatasetManager:
     def protocol_report(self) -> Dict[str, Any]:
         return {
             "training_mode": "non_exemplar_class_incremental",
+            "protocol_seed": int(self.protocol_seed),
+            "optimization_dataloader_seed": int(self.seed),
             "tasks": self.nb_tasks,
             "phase_to_classes": {
                 phase: list(classes)
@@ -1545,6 +1633,9 @@ class IncrementalHSIDatasetManager:
             "preprocessing_fit_phase": 0,
             "base_train_sample_count": int(self.base_train_indices.size),
             "preprocessing_frozen_across_phases": True,
+            "spectral_axis_type": self.spectral_axis_type,
+            "spectral_axis_is_physical": bool(self.spectral_axis_is_physical),
+            "spectral_axis_length": int(self.spectral_axis.size),
             "spatial_leakage": self.spatial_leakage_report(),
         }
 
@@ -1574,6 +1665,11 @@ class IncrementalHSIDatasetManager:
             raise RuntimeError(
                 "strict phase-context isolation contract is violated"
             )
+        _validated_spectral_axis(
+            self.spectral_axis,
+            raw_bands=int(self.ordered_spectral_cube.shape[-1]),
+            spectral_axis_type=self.spectral_axis_type,
+        )
         return True
 
 
@@ -1582,8 +1678,6 @@ __all__ = [
     "IncrementalHSIPatchDataset",
     "IncrementalHSIDatasetManager",
 ]
-
-
 
 
 
@@ -1603,7 +1697,10 @@ __all__ = [
 # * Cumulative validation/test over all seen classes is evaluation-only and is
 #   available only after the phase is finalized.
 # * The spatial branch receives the processed/PCA patch.
-# * The spectral branch receives the raw ordered full-band centre spectrum.
+# * The spectral branch receives the pre-PCA ordered centre spectrum from the
+#   dataset cube; corrected datasets may already exclude sensor bands.
+# * Those two inputs are fused by the backbone; the dataset does not create a
+#   second learned representation.
 # * No optimization/model-selection API returns historical training samples after its phase.
 # * A finalized-phase map loader may read all labelled seen-class pixels strictly for
 #   post-training qualitative reporting; those rows are never an optimization source.
@@ -1718,6 +1815,56 @@ __all__ = [
 #         "validation": "val",
 #         "testing": "test",
 #     }.get(token, token)
+
+
+# _SPECTRAL_AXIS_ALIASES = {
+#     "wavelength": "wavelength_nm",
+#     "wavelengths": "wavelength_nm",
+#     "wavelength_nm": "wavelength_nm",
+#     "wavelengths_nm": "wavelength_nm",
+#     "nm": "wavelength_nm",
+#     "band": "ordered_band",
+#     "bands": "ordered_band",
+#     "band_index": "ordered_band",
+#     "ordered_band": "ordered_band",
+# }
+
+
+# def _validated_spectral_axis(
+#     spectral_axis: Optional[Sequence[float]],
+#     *,
+#     raw_bands: int,
+#     spectral_axis_type: str,
+# ) -> Tuple[np.ndarray, str]:
+#     """Validate the one spectral coordinate shared by the model and CDS."""
+#     bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+#     token = _SPECTRAL_AXIS_ALIASES.get(
+#         str(spectral_axis_type).strip().lower()
+#     )
+#     if token is None:
+#         raise ValueError(
+#             "spectral_axis_type must be 'wavelength_nm' or 'ordered_band'"
+#         )
+#     if spectral_axis is None:
+#         if token != "ordered_band":
+#             raise ValueError(
+#                 "physical wavelength coordinates must be supplied explicitly; "
+#                 "they are never synthesized from band indices"
+#             )
+#         axis = np.arange(bands, dtype=np.float32)
+#     else:
+#         axis = np.asarray(spectral_axis, dtype=np.float64).reshape(-1)
+#     if axis.shape != (bands,):
+#         raise ValueError(
+#             "spectral_axis must contain one coordinate per ordered raw band"
+#         )
+#     if not np.isfinite(axis).all():
+#         raise ValueError("spectral_axis contains NaN/Inf")
+#     if bands > 1 and not np.all(np.diff(axis) > 0.0):
+#         raise ValueError("spectral_axis must be strictly increasing")
+#     if token == "wavelength_nm" and np.any(axis <= 0.0):
+#         raise ValueError("physical wavelengths in nanometres must be positive")
+#     return axis.astype(np.float32), token
 
 
 # def _seed_worker(_: int) -> None:
@@ -2370,6 +2517,8 @@ __all__ = [
 #         gt_shape: Sequence[int],
 #         patch_size: int,
 #         ordered_spectral_cube: Optional[np.ndarray] = None,
+#         spectral_axis: Optional[Sequence[float]] = None,
+#         spectral_axis_type: str = "ordered_band",
 #         num_workers: int = 0,
 #         device: str = "cpu",
 #         seed: Optional[int] = None,
@@ -2459,6 +2608,14 @@ __all__ = [
 #         ):
 #             raise ValueError("ordered_spectral_cube is invalid")
 #         self.ordered_spectral_cube = np.ascontiguousarray(ordered)
+#         self.spectral_axis, self.spectral_axis_type = _validated_spectral_axis(
+#             spectral_axis,
+#             raw_bands=int(self.ordered_spectral_cube.shape[-1]),
+#             spectral_axis_type=spectral_axis_type,
+#         )
+#         self.spectral_axis_is_physical = (
+#             self.spectral_axis_type == "wavelength_nm"
+#         )
 
 #         self.patch_size = _exact_integer(
 #             patch_size, name="patch_size", minimum=1
@@ -2689,16 +2846,21 @@ __all__ = [
 #                 "only context_policy='full_scene_reflect' is implemented"
 #             )
 
-#         protocol_seed = _exact_integer(
-#             protocol["seed"], name="protocol seed", minimum=0
+#         # Protocol randomness and optimization/DataLoader randomness are
+#         # intentionally separate. ``protocol_seed`` fixes class order and
+#         # train/val/test membership; ``self.seed`` controls only DataLoader
+#         # shuffling/worker randomness for this optimization run.  Multi-seed
+#         # robustness therefore supports, for example, protocol_seed=42 with
+#         # optimization seeds 42/123/70 without changing the benchmark split.
+#         self.protocol_seed = _seed32(
+#             protocol["seed"],
+#             name="protocol seed",
 #         )
 #         self.seed = (
-#             protocol_seed
+#             self.protocol_seed
 #             if seed is None
-#             else _exact_integer(seed, name="dataset-manager seed", minimum=0)
+#             else _seed32(seed, name="dataset-manager optimization seed")
 #         )
-#         if self.seed != protocol_seed:
-#             raise ValueError("dataset-manager seed disagrees with protocol seed")
 
 #         self.num_workers = _exact_integer(
 #             num_workers, name="num_workers", minimum=0
@@ -2964,7 +3126,7 @@ __all__ = [
 #         return DataLoader(
 #             dataset,
 #             batch_size=size,
-#             shuffle=bool(shuffle),
+#             shuffle=_exact_bool(shuffle, name="shuffle"),
 #             num_workers=self.num_workers,
 #             pin_memory=self.pin_memory,
 #             drop_last=False,
@@ -2999,6 +3161,26 @@ __all__ = [
 #             shuffle=shuffle if token == "train" else False,
 #             phase=phase_id,
 #             split=token,
+#         )
+
+#     def get_phase_structure_dataloader(
+#         self,
+#         phase: int,
+#         *,
+#         batch_size: int = 256,
+#     ) -> DataLoader:
+#         """Deterministic full current-TRAIN loader for structure estimation.
+
+#         This deliberately reuses the active phase TRAIN membership, exposes no
+#         historical rows, disables shuffling, and therefore provides the single
+#         legal source for epoch refresh/final commit of current-class
+#         I/V/Mspec/Vspec.
+#         """
+#         return self.get_phase_dataloader(
+#             phase,
+#             split="train",
+#             batch_size=batch_size,
+#             shuffle=False,
 #         )
 
 #     def get_cumulative_dataloader(
@@ -3049,7 +3231,7 @@ __all__ = [
 #         *,
 #         batch_size: int = 256,
 #     ) -> DataLoader:
-#         """All labelled seen-class pixels for qualitative maps only."""
+#         """All labeled seen-class pixels for qualitative maps only; never metrics/training."""
 #         phase_id = self._validate_phase(phase)
 #         if phase_id not in self.finalized_phases:
 #             raise RuntimeError("map generation requires a finalized phase")
@@ -3064,9 +3246,62 @@ __all__ = [
 #             split="all",
 #         )
 
+#     def base_phase_contract_report(self) -> Dict[str, Any]:
+#         """Return read-only checks for the finalized phase-0 data contract."""
+#         base_ids = self.get_new_classes(0)
+#         train_indices = _collect_indices(
+#             self._split_by_class,
+#             base_ids,
+#             "train",
+#         )
+#         val_indices = _collect_indices(
+#             self._split_by_class,
+#             base_ids,
+#             "val",
+#         )
+#         test_indices = _collect_indices(
+#             self._split_by_class,
+#             base_ids,
+#             "test",
+#         )
+#         if not np.array_equal(
+#             np.sort(train_indices),
+#             np.sort(self.base_train_indices),
+#         ):
+#             raise RuntimeError(
+#                 "base TRAIN membership disagrees with preprocessing membership"
+#             )
+#         if (
+#             np.intersect1d(train_indices, val_indices).size
+#             or np.intersect1d(train_indices, test_indices).size
+#             or np.intersect1d(val_indices, test_indices).size
+#         ):
+#             raise RuntimeError("base train/val/test centre indices overlap")
+#         observed = sorted(
+#             int(v)
+#             for v in np.unique(self.labels[train_indices])
+#         )
+#         if observed != sorted(base_ids):
+#             raise RuntimeError(
+#                 "base TRAIN split does not contain exactly the base classes"
+#             )
+#         return {
+#             "base_class_ids": list(base_ids),
+#             "train_count": int(train_indices.size),
+#             "validation_count": int(val_indices.size),
+#             "test_count": int(test_indices.size),
+#             "preprocess_fit_count": int(self.base_train_indices.size),
+#             "train_equals_preprocess_fit": True,
+#             "center_splits_disjoint": True,
+#             "validation_enabled": bool(self.validation_enabled),
+#             "spatial_leakage": self.spatial_leakage_report(),
+#         }
+
 #     def protocol_report(self) -> Dict[str, Any]:
 #         return {
 #             "training_mode": "non_exemplar_class_incremental",
+#             "protocol_seed": int(self.protocol_seed),
+#             "optimization_dataloader_seed": int(self.seed),
 #             "tasks": self.nb_tasks,
 #             "phase_to_classes": {
 #                 phase: list(classes)
@@ -3086,6 +3321,9 @@ __all__ = [
 #             "preprocessing_fit_phase": 0,
 #             "base_train_sample_count": int(self.base_train_indices.size),
 #             "preprocessing_frozen_across_phases": True,
+#             "spectral_axis_type": self.spectral_axis_type,
+#             "spectral_axis_is_physical": bool(self.spectral_axis_is_physical),
+#             "spectral_axis_length": int(self.spectral_axis.size),
 #             "spatial_leakage": self.spatial_leakage_report(),
 #         }
 
@@ -3115,6 +3353,11 @@ __all__ = [
 #             raise RuntimeError(
 #                 "strict phase-context isolation contract is violated"
 #             )
+#         _validated_spectral_axis(
+#             self.spectral_axis,
+#             raw_bands=int(self.ordered_spectral_cube.shape[-1]),
+#             spectral_axis_type=self.spectral_axis_type,
+#         )
 #         return True
 
 

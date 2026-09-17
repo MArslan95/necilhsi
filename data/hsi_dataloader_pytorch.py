@@ -7,8 +7,9 @@ phase-0 TRAIN centres only.
 
 Input roles are explicit:
 * ``processed_cube`` is the standardized/PCA cube used to extract the spatial patch;
-* ``ordered_spectral_cube`` is the original ordered full-band HSI used only for
-  the center-spectrum spectral path.
+* ``ordered_spectral_cube`` is the pre-PCA ordered band cube loaded from the
+  dataset file and used for the center-spectrum spectral path. It is not claimed
+  to contain every sensor band if the published dataset is already corrected.
 
 These are two input views of the same pixel, not two learned representations.
 They are fused by the backbone into the single canonical Q used downstream.
@@ -204,6 +205,110 @@ def _load_mat_key(path: str, key: str) -> np.ndarray:
     return payload[key]
 
 
+_SPECTRAL_AXIS_ALIASES = {
+    "wavelength": "wavelength_nm",
+    "wavelengths": "wavelength_nm",
+    "wavelength_nm": "wavelength_nm",
+    "wavelengths_nm": "wavelength_nm",
+    "nm": "wavelength_nm",
+    "band": "ordered_band",
+    "bands": "ordered_band",
+    "band_index": "ordered_band",
+    "ordered_band": "ordered_band",
+}
+
+
+def ValidateSpectralAxis(
+    spectral_axis: Sequence[float],
+    *,
+    raw_bands: int,
+    spectral_axis_type: str,
+) -> Tuple[np.ndarray, str]:
+    """Validate the ordered spectral coordinate shared by all HSI paths.
+
+    ``wavelength_nm`` means the coordinates are physical wavelengths in
+    nanometres. ``ordered_band`` means only band order is known; derivatives
+    computed on that axis must not be described as physical wavelength
+    derivatives.
+    """
+    bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+    token = _SPECTRAL_AXIS_ALIASES.get(
+        str(spectral_axis_type).strip().lower()
+    )
+    if token is None:
+        raise ValueError(
+            "spectral_axis_type must be 'wavelength_nm' or 'ordered_band'"
+        )
+
+    axis = np.asarray(spectral_axis, dtype=np.float64).reshape(-1)
+    if axis.shape != (bands,):
+        raise ValueError(
+            "spectral_axis must contain exactly one coordinate per raw band; "
+            f"expected {bands}, got {axis.size}"
+        )
+    if not np.isfinite(axis).all():
+        raise ValueError("spectral_axis contains NaN/Inf")
+    if bands > 1 and not np.all(np.diff(axis) > 0.0):
+        raise ValueError("spectral_axis must be strictly increasing")
+    if token == "wavelength_nm" and np.any(axis <= 0.0):
+        raise ValueError("physical wavelengths in nanometres must be positive")
+
+    return axis.astype(np.float32), token
+
+
+def ResolveSpectralAxis(
+    method: str,
+    raw_bands: int,
+    *,
+    spectral_axis: Optional[Sequence[float]] = None,
+    spectral_axis_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve spectral coordinates without inventing wavelength metadata.
+
+    Exact dataset wavelengths may be supplied explicitly or stored as
+    ``wavelengths_nm`` in ``DATASET_INFO``. If they are unavailable, the
+    function deliberately falls back to monotonically ordered band indices and
+    marks the axis as ``ordered_band``.
+    """
+    if method not in DATASET_INFO:
+        raise ValueError(
+            f"unknown dataset {method!r}; available={sorted(DATASET_INFO)}"
+        )
+    bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+
+    if spectral_axis is not None:
+        axis_type = (
+            "ordered_band"
+            if spectral_axis_type is None
+            else str(spectral_axis_type)
+        )
+        axis, resolved_type = ValidateSpectralAxis(
+            spectral_axis,
+            raw_bands=bands,
+            spectral_axis_type=axis_type,
+        )
+    elif "wavelengths_nm" in DATASET_INFO[method]:
+        axis, resolved_type = ValidateSpectralAxis(
+            DATASET_INFO[method]["wavelengths_nm"],
+            raw_bands=bands,
+            spectral_axis_type="wavelength_nm",
+        )
+    else:
+        # No physical wavelengths are invented. This is an ordered coordinate
+        # only, so downstream code must report ordered-band slope/curvature.
+        axis, resolved_type = ValidateSpectralAxis(
+            np.arange(bands, dtype=np.float32),
+            raw_bands=bands,
+            spectral_axis_type="ordered_band",
+        )
+
+    return {
+        "values": axis,
+        "type": resolved_type,
+        "is_physical_wavelength": resolved_type == "wavelength_nm",
+    }
+
+
 def resolve_label_policy(method: str, gt: np.ndarray) -> Dict[str, Any]:
     if method not in DATASET_INFO:
         raise ValueError(f"unknown dataset {method!r}; available={sorted(DATASET_INFO)}")
@@ -302,6 +407,8 @@ def _fit_preprocessor(
     *,
     n_components: Optional[int],
     whiten: bool,
+    spectral_axis: Optional[Sequence[float]] = None,
+    spectral_axis_type: str = "ordered_band",
 ) -> Dict[str, Any]:
     raw = np.asarray(cube, dtype=np.float32)
     mask = np.asarray(fit_mask, dtype=bool)
@@ -331,6 +438,16 @@ def _fit_preprocessor(
         name="whiten",
     )
 
+    if spectral_axis is None:
+        resolved_axis = np.arange(raw.shape[-1], dtype=np.float32)
+        resolved_axis_type = "ordered_band"
+    else:
+        resolved_axis, resolved_axis_type = ValidateSpectralAxis(
+            spectral_axis,
+            raw_bands=int(raw.shape[-1]),
+            spectral_axis_type=spectral_axis_type,
+        )
+
     state: Dict[str, Any] = {
         "raw_bands": int(raw.shape[-1]),
         "normalization_mean": mean,
@@ -344,6 +461,8 @@ def _fit_preprocessor(
         "pca_variance": np.empty(0, dtype=np.float32),
         "whiten": whiten_value,
         "fit_scope": "provided_mask",
+        "spectral_axis": resolved_axis,
+        "spectral_axis_type": resolved_axis_type,
     }
 
     if n_components is not None:
@@ -374,10 +493,13 @@ def _fit_preprocessor(
             pixels - mean
         ) / std
 
+        # Full SVD is deterministic and independent of the optimization RNG.
+        # This keeps preprocessing fixed when protocol_seed is held constant
+        # across multi-seed optimization runs.
         pca = PCA(
             n_components=component_count,
             whiten=False,
-            svd_solver="auto",
+            svd_solver="full",
         ).fit(normalized_pixels)
 
         state["pca_components"] = (
@@ -408,6 +530,8 @@ def ValidateHSIPreprocessorState(
         "pca_variance",
         "whiten",
         "fit_scope",
+        "spectral_axis",
+        "spectral_axis_type",
     }
     missing = required - set(state)
     if missing:
@@ -476,6 +600,12 @@ def ValidateHSIPreprocessorState(
         raise ValueError(
             "persistent HSI preprocessing must be fitted on base_train only"
         )
+
+    ValidateSpectralAxis(
+        state["spectral_axis"],
+        raw_bands=bands,
+        spectral_axis_type=str(state["spectral_axis_type"]),
+    )
 
     if (
         components.ndim != 2
@@ -568,7 +698,8 @@ def ApplyHSIPreprocessor(
         raise RuntimeError("preprocessing produced NaN/Inf")
 
     # The second cube intentionally remains the original ordered full-band HSI.
-    # The spectral backbone applies the same base-train band statistics itself.
+    # The model's spectral path must normalize it with this same persistent
+    # base-TRAIN state and use the stored spectral_axis consistently.
     return np.ascontiguousarray(processed), np.ascontiguousarray(raw)
 
 
@@ -580,6 +711,8 @@ def FitHSIPreprocessor(
     reduction_method: str = "PCA",
     n_components: int = 30,
     whiten: bool = False,
+    spectral_axis: Optional[Sequence[float]] = None,
+    spectral_axis_type: str = "ordered_band",
     **_: Any,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     use_reduction = _exact_bool(
@@ -620,6 +753,8 @@ def FitHSIPreprocessor(
             else None
         ),
         whiten=whiten_value,
+        spectral_axis=spectral_axis,
+        spectral_axis_type=spectral_axis_type,
     )
     processed, ordered = ApplyHSIPreprocessor(raw, state)
     return processed, ordered, state
@@ -889,6 +1024,13 @@ def SaveHSIPreprocessor(
                 fit_scope=np.asarray(
                     str(state["fit_scope"])
                 ),
+                spectral_axis=np.asarray(
+                    state["spectral_axis"],
+                    dtype=np.float32,
+                ),
+                spectral_axis_type=np.asarray(
+                    str(state["spectral_axis_type"])
+                ),
             )
             stream.flush()
             os.fsync(stream.fileno())
@@ -917,6 +1059,16 @@ def LoadHSIPreprocessor(path: str) -> Dict[str, Any]:
             "pca_variance": archive["pca_variance"].astype(np.float32),
             "whiten": bool(archive["whiten"].item()),
             "fit_scope": str(archive["fit_scope"].item()),
+            "spectral_axis": (
+                archive["spectral_axis"].astype(np.float32)
+                if "spectral_axis" in archive.files
+                else np.arange(int(archive["raw_bands"].item()), dtype=np.float32)
+            ),
+            "spectral_axis_type": (
+                str(archive["spectral_axis_type"].item())
+                if "spectral_axis_type" in archive.files
+                else "ordered_band"
+            ),
         }
     ValidateHSIPreprocessorState(state, require_base_train=True)
     return state
@@ -1044,6 +1196,8 @@ def create_dataloader(
 __all__ = [
     "DATASET_INFO",
     "LoadRawHSIData",
+    "ResolveSpectralAxis",
+    "ValidateSpectralAxis",
     "resolve_label_policy",
     "ExtractLabeledPixelIndex",
     "BuildPreprocessFitMask",
@@ -1062,16 +1216,30 @@ __all__ = [
 
 
 
+
+
+
+
+
+
+
 # from __future__ import annotations
 
 # """HSI loading and preprocessing for class-incremental experiments.
 
-# The loader maps foreground labels once, keeps the processed spectral-spatial
-# cube consistent across phases, and exposes ordinary PyTorch dataset helpers.
-# The incremental protocol decides which samples and classes are available.
-# Training-only spatial symmetry augmentation is deliberately not performed here;
-# the base trainer applies it after batch loading so preprocessing and all
-# evaluation/reference loaders remain deterministic and unchanged.
+# The loader maps foreground labels once and fits persistent preprocessing from
+# phase-0 TRAIN centres only.
+
+# Input roles are explicit:
+# * ``processed_cube`` is the standardized/PCA cube used to extract the spatial patch;
+# * ``ordered_spectral_cube`` is the pre-PCA ordered band cube loaded from the
+#   dataset file and used for the center-spectrum spectral path. It is not claimed
+#   to contain every sensor band if the published dataset is already corrected.
+
+# These are two input views of the same pixel, not two learned representations.
+# They are fused by the backbone into the single canonical Q used downstream.
+# Training-only spatial augmentation is deliberately outside preprocessing so
+# reference/evaluation loaders remain deterministic.
 # """
 
 # import os
@@ -1262,6 +1430,110 @@ __all__ = [
 #     return payload[key]
 
 
+# _SPECTRAL_AXIS_ALIASES = {
+#     "wavelength": "wavelength_nm",
+#     "wavelengths": "wavelength_nm",
+#     "wavelength_nm": "wavelength_nm",
+#     "wavelengths_nm": "wavelength_nm",
+#     "nm": "wavelength_nm",
+#     "band": "ordered_band",
+#     "bands": "ordered_band",
+#     "band_index": "ordered_band",
+#     "ordered_band": "ordered_band",
+# }
+
+
+# def ValidateSpectralAxis(
+#     spectral_axis: Sequence[float],
+#     *,
+#     raw_bands: int,
+#     spectral_axis_type: str,
+# ) -> Tuple[np.ndarray, str]:
+#     """Validate the ordered spectral coordinate shared by all HSI paths.
+
+#     ``wavelength_nm`` means the coordinates are physical wavelengths in
+#     nanometres. ``ordered_band`` means only band order is known; derivatives
+#     computed on that axis must not be described as physical wavelength
+#     derivatives.
+#     """
+#     bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+#     token = _SPECTRAL_AXIS_ALIASES.get(
+#         str(spectral_axis_type).strip().lower()
+#     )
+#     if token is None:
+#         raise ValueError(
+#             "spectral_axis_type must be 'wavelength_nm' or 'ordered_band'"
+#         )
+
+#     axis = np.asarray(spectral_axis, dtype=np.float64).reshape(-1)
+#     if axis.shape != (bands,):
+#         raise ValueError(
+#             "spectral_axis must contain exactly one coordinate per raw band; "
+#             f"expected {bands}, got {axis.size}"
+#         )
+#     if not np.isfinite(axis).all():
+#         raise ValueError("spectral_axis contains NaN/Inf")
+#     if bands > 1 and not np.all(np.diff(axis) > 0.0):
+#         raise ValueError("spectral_axis must be strictly increasing")
+#     if token == "wavelength_nm" and np.any(axis <= 0.0):
+#         raise ValueError("physical wavelengths in nanometres must be positive")
+
+#     return axis.astype(np.float32), token
+
+
+# def ResolveSpectralAxis(
+#     method: str,
+#     raw_bands: int,
+#     *,
+#     spectral_axis: Optional[Sequence[float]] = None,
+#     spectral_axis_type: Optional[str] = None,
+# ) -> Dict[str, Any]:
+#     """Resolve spectral coordinates without inventing wavelength metadata.
+
+#     Exact dataset wavelengths may be supplied explicitly or stored as
+#     ``wavelengths_nm`` in ``DATASET_INFO``. If they are unavailable, the
+#     function deliberately falls back to monotonically ordered band indices and
+#     marks the axis as ``ordered_band``.
+#     """
+#     if method not in DATASET_INFO:
+#         raise ValueError(
+#             f"unknown dataset {method!r}; available={sorted(DATASET_INFO)}"
+#         )
+#     bands = _exact_integer(raw_bands, name="raw_bands", minimum=1)
+
+#     if spectral_axis is not None:
+#         axis_type = (
+#             "ordered_band"
+#             if spectral_axis_type is None
+#             else str(spectral_axis_type)
+#         )
+#         axis, resolved_type = ValidateSpectralAxis(
+#             spectral_axis,
+#             raw_bands=bands,
+#             spectral_axis_type=axis_type,
+#         )
+#     elif "wavelengths_nm" in DATASET_INFO[method]:
+#         axis, resolved_type = ValidateSpectralAxis(
+#             DATASET_INFO[method]["wavelengths_nm"],
+#             raw_bands=bands,
+#             spectral_axis_type="wavelength_nm",
+#         )
+#     else:
+#         # No physical wavelengths are invented. This is an ordered coordinate
+#         # only, so downstream code must report ordered-band slope/curvature.
+#         axis, resolved_type = ValidateSpectralAxis(
+#             np.arange(bands, dtype=np.float32),
+#             raw_bands=bands,
+#             spectral_axis_type="ordered_band",
+#         )
+
+#     return {
+#         "values": axis,
+#         "type": resolved_type,
+#         "is_physical_wavelength": resolved_type == "wavelength_nm",
+#     }
+
+
 # def resolve_label_policy(method: str, gt: np.ndarray) -> Dict[str, Any]:
 #     if method not in DATASET_INFO:
 #         raise ValueError(f"unknown dataset {method!r}; available={sorted(DATASET_INFO)}")
@@ -1360,6 +1632,8 @@ __all__ = [
 #     *,
 #     n_components: Optional[int],
 #     whiten: bool,
+#     spectral_axis: Optional[Sequence[float]] = None,
+#     spectral_axis_type: str = "ordered_band",
 # ) -> Dict[str, Any]:
 #     raw = np.asarray(cube, dtype=np.float32)
 #     mask = np.asarray(fit_mask, dtype=bool)
@@ -1389,6 +1663,16 @@ __all__ = [
 #         name="whiten",
 #     )
 
+#     if spectral_axis is None:
+#         resolved_axis = np.arange(raw.shape[-1], dtype=np.float32)
+#         resolved_axis_type = "ordered_band"
+#     else:
+#         resolved_axis, resolved_axis_type = ValidateSpectralAxis(
+#             spectral_axis,
+#             raw_bands=int(raw.shape[-1]),
+#             spectral_axis_type=spectral_axis_type,
+#         )
+
 #     state: Dict[str, Any] = {
 #         "raw_bands": int(raw.shape[-1]),
 #         "normalization_mean": mean,
@@ -1402,6 +1686,8 @@ __all__ = [
 #         "pca_variance": np.empty(0, dtype=np.float32),
 #         "whiten": whiten_value,
 #         "fit_scope": "provided_mask",
+#         "spectral_axis": resolved_axis,
+#         "spectral_axis_type": resolved_axis_type,
 #     }
 
 #     if n_components is not None:
@@ -1466,6 +1752,8 @@ __all__ = [
 #         "pca_variance",
 #         "whiten",
 #         "fit_scope",
+#         "spectral_axis",
+#         "spectral_axis_type",
 #     }
 #     missing = required - set(state)
 #     if missing:
@@ -1534,6 +1822,12 @@ __all__ = [
 #         raise ValueError(
 #             "persistent HSI preprocessing must be fitted on base_train only"
 #         )
+
+#     ValidateSpectralAxis(
+#         state["spectral_axis"],
+#         raw_bands=bands,
+#         spectral_axis_type=str(state["spectral_axis_type"]),
+#     )
 
 #     if (
 #         components.ndim != 2
@@ -1626,7 +1920,8 @@ __all__ = [
 #         raise RuntimeError("preprocessing produced NaN/Inf")
 
 #     # The second cube intentionally remains the original ordered full-band HSI.
-#     # The spectral backbone applies the same base-train band statistics itself.
+#     # The model's spectral path must normalize it with this same persistent
+#     # base-TRAIN state and use the stored spectral_axis consistently.
 #     return np.ascontiguousarray(processed), np.ascontiguousarray(raw)
 
 
@@ -1638,6 +1933,8 @@ __all__ = [
 #     reduction_method: str = "PCA",
 #     n_components: int = 30,
 #     whiten: bool = False,
+#     spectral_axis: Optional[Sequence[float]] = None,
+#     spectral_axis_type: str = "ordered_band",
 #     **_: Any,
 # ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
 #     use_reduction = _exact_bool(
@@ -1678,6 +1975,8 @@ __all__ = [
 #             else None
 #         ),
 #         whiten=whiten_value,
+#         spectral_axis=spectral_axis,
+#         spectral_axis_type=spectral_axis_type,
 #     )
 #     processed, ordered = ApplyHSIPreprocessor(raw, state)
 #     return processed, ordered, state
@@ -1702,6 +2001,7 @@ __all__ = [
 #         "phase_train_indices",
 #         "phase_to_classes",
 #         "global_labels",
+#         "split_by_class",
 #     }
 #     missing = required - set(protocol)
 #     if missing:
@@ -1825,6 +2125,43 @@ __all__ = [
 #             f"expected={sorted(base_classes)}"
 #         )
 
+#     split_by_class = protocol["split_by_class"]
+#     if not isinstance(split_by_class, Mapping):
+#         raise ValueError("protocol split_by_class must be a mapping")
+#     expected_base_train_rows: list[np.ndarray] = []
+#     for class_id in base_classes:
+#         if class_id not in split_by_class:
+#             raise ValueError(
+#                 f"protocol split_by_class lacks base class {class_id}"
+#             )
+#         row = split_by_class[class_id]
+#         if not isinstance(row, Mapping) or "train" not in row:
+#             raise ValueError(
+#                 f"protocol split_by_class[{class_id}] lacks train indices"
+#             )
+#         class_train = _integer_array(
+#             row["train"],
+#             name=f"split_by_class[{class_id}]['train']",
+#         ).reshape(-1)
+#         if class_train.size == 0:
+#             raise ValueError(
+#                 f"base class {class_id} has an empty TRAIN split"
+#             )
+#         expected_base_train_rows.append(class_train)
+
+#     expected_base_train = np.concatenate(expected_base_train_rows)
+#     if (
+#         expected_base_train.size != fit_indices.size
+#         or not np.array_equal(
+#             np.sort(expected_base_train),
+#             np.sort(fit_indices),
+#         )
+#     ):
+#         raise ValueError(
+#             "base_train_indices must equal the union of the phase-0 "
+#             "class TRAIN splits in split_by_class"
+#         )
+
 #     fit_mask = BuildPreprocessFitMask(
 #         np.asarray(HSI_raw).shape[:2],
 #         coordinates,
@@ -1909,6 +2246,13 @@ __all__ = [
 #                 fit_scope=np.asarray(
 #                     str(state["fit_scope"])
 #                 ),
+#                 spectral_axis=np.asarray(
+#                     state["spectral_axis"],
+#                     dtype=np.float32,
+#                 ),
+#                 spectral_axis_type=np.asarray(
+#                     str(state["spectral_axis_type"])
+#                 ),
 #             )
 #             stream.flush()
 #             os.fsync(stream.fileno())
@@ -1937,6 +2281,16 @@ __all__ = [
 #             "pca_variance": archive["pca_variance"].astype(np.float32),
 #             "whiten": bool(archive["whiten"].item()),
 #             "fit_scope": str(archive["fit_scope"].item()),
+#             "spectral_axis": (
+#                 archive["spectral_axis"].astype(np.float32)
+#                 if "spectral_axis" in archive.files
+#                 else np.arange(int(archive["raw_bands"].item()), dtype=np.float32)
+#             ),
+#             "spectral_axis_type": (
+#                 str(archive["spectral_axis_type"].item())
+#                 if "spectral_axis_type" in archive.files
+#                 else "ordered_band"
+#             ),
 #         }
 #     ValidateHSIPreprocessorState(state, require_base_train=True)
 #     return state
@@ -2055,15 +2409,17 @@ __all__ = [
 #     return DataLoader(
 #         HSICubeDataset(patches, labels),
 #         batch_size=size,
-#         shuffle=bool(shuffle),
+#         shuffle=_exact_bool(shuffle, name="shuffle"),
 #         num_workers=workers,
-#         pin_memory=bool(pin_memory),
+#         pin_memory=_exact_bool(pin_memory, name="pin_memory"),
 #     )
 
 
 # __all__ = [
 #     "DATASET_INFO",
 #     "LoadRawHSIData",
+#     "ResolveSpectralAxis",
+#     "ValidateSpectralAxis",
 #     "resolve_label_policy",
 #     "ExtractLabeledPixelIndex",
 #     "BuildPreprocessFitMask",
