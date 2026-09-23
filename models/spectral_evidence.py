@@ -1,23 +1,6 @@
 from __future__ import annotations
 
-"""Full-band physical spectral structure for HSI CDS.
-
-For a dataset with B native ordered pre-PCA bands this deterministic path returns
-
-    P(x) in R^{B x 3} = [level, spectral slope, spectral curvature].
-
-The raw spectral shape is preserved: derivatives are computed from the original
-centre spectrum using actual band/wavelength spacing when supplied, otherwise a
-uniform normalized band coordinate.  Only a three-component normalization is
-fitted on Phase-0 TRAIN and then frozen.  Thus B is dataset-derived and entirely
-independent of the learned token count K.
-
-P is a phase-stable physical structure, not a class-score branch.  This module
-owns no class state, replay state, classifier parameter, or trainable parameter.
-"""
-
 from numbers import Integral
-from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -26,315 +9,150 @@ Tensor = torch.Tensor
 
 
 def _positive_int(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(value)
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer")
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive")
+    return result
 
 
-def _band_positions(
-    values: Tensor | Sequence[float] | None,
-    *,
-    count: int,
-) -> Tensor:
-    if values is None:
-        return torch.linspace(-1.0, 1.0, count, dtype=torch.float32)
-    raw = torch.as_tensor(values, dtype=torch.float32).flatten()
-    if raw.shape != (count,):
-        raise ValueError(f"band_positions must contain {count} values")
-    if not bool(torch.isfinite(raw).all()):
-        raise ValueError("band_positions contain NaN or Inf")
-    if count > 1 and bool((raw[1:] <= raw[:-1]).any()):
-        raise ValueError("band_positions must be strictly increasing")
+def _validate_spectra(values: Tensor, *, band_count: int) -> Tensor:
+    spectra = torch.as_tensor(values)
+    if spectra.ndim != 2 or spectra.size(0) == 0 or spectra.size(1) != band_count:
+        raise ValueError(f"spectra must be non-empty [N,{band_count}]")
+    if not torch.is_floating_point(spectra) or spectra.is_complex():
+        raise TypeError("spectra must be real floating point")
+    if not bool(torch.isfinite(spectra).all()):
+        raise ValueError("spectra contain NaN or Inf")
+    return spectra
+
+
+def _linear_quantile(sorted_values: Tensor, quantile: float) -> Tensor:
+    values = torch.as_tensor(sorted_values)
+    if values.ndim != 2 or values.size(0) == 0:
+        raise ValueError("sorted_values must be non-empty [N,B]")
+    if not 0.0 <= float(quantile) <= 1.0:
+        raise ValueError("quantile must lie in [0,1]")
+    count = int(values.size(0))
     if count == 1:
-        return torch.zeros(1, dtype=torch.float32)
-    span = raw[-1] - raw[0]
-    if not bool(span > 0):
-        raise ValueError("band_positions must span a positive interval")
-    return 2.0 * (raw - raw[0]) / span - 1.0
-
-
-def _first_derivative(values: Tensor, positions: Tensor) -> Tensor:
-    if values.ndim != 2 or positions.shape != (values.size(1),):
-        raise ValueError("values/positions must be [N,B] and [B]")
-    b = int(values.size(1))
-    if b < 2:
-        return torch.zeros_like(values)
-    result = torch.empty_like(values)
-    result[:, 0] = (values[:, 1] - values[:, 0]) / (positions[1] - positions[0])
-    result[:, -1] = (values[:, -1] - values[:, -2]) / (positions[-1] - positions[-2])
-    if b > 2:
-        result[:, 1:-1] = (
-            (values[:, 2:] - values[:, :-2])
-            / (positions[2:] - positions[:-2]).unsqueeze(0)
-        )
-    return result
-
-
-def _second_derivative(values: Tensor, positions: Tensor) -> Tensor:
-    if values.ndim != 2 or positions.shape != (values.size(1),):
-        raise ValueError("values/positions must be [N,B] and [B]")
-    b = int(values.size(1))
-    result = torch.zeros_like(values)
-    if b < 3:
-        return result
-    step = positions[1:] - positions[:-1]
-    slope = (values[:, 1:] - values[:, :-1]) / step.unsqueeze(0)
-    interior = (
-        2.0
-        * (slope[:, 1:] - slope[:, :-1])
-        / (positions[2:] - positions[:-2]).unsqueeze(0)
+        return values[0]
+    position = float(quantile) * float(count - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, count - 1)
+    interpolation_weight = position - float(lower_index)
+    if upper_index == lower_index or interpolation_weight == 0.0:
+        return values[lower_index]
+    return (
+        values[lower_index] * (1.0 - interpolation_weight)
+        + values[upper_index] * interpolation_weight
     )
-    result[:, 1:-1] = interior
-    result[:, 0] = interior[:, 0]
-    result[:, -1] = interior[:, -1]
-    return result
 
 
-class OrderedPhysicalSpectralEvidence(nn.Module):
-    """Map the complete pre-PCA spectrum to frozen full-band physical evidence."""
+class PhysicalSpectralEvidence(nn.Module):
+    """Return fixed robust standardized native-band evidence P[N,B,1]."""
 
-    component_names = ("level", "slope", "curvature")
-
-    def __init__(
-        self,
-        *,
-        band_count: int,
-        band_positions: Tensor | Sequence[float] | None = None,
-    ) -> None:
+    def __init__(self, *, band_count: int) -> None:
         super().__init__()
         self.band_count = _positive_int(band_count, "band_count")
-        positions = _band_positions(band_positions, count=self.band_count)
-        self.register_buffer("band_positions", positions, persistent=True)
-        self.register_buffer("descriptor_mean", torch.zeros(3, dtype=torch.float32), persistent=True)
-        self.register_buffer("descriptor_scale", torch.ones(3, dtype=torch.float32), persistent=True)
-        self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool), persistent=True)
-
-    def _validate_spectra(self, physical_spectrum: Tensor) -> Tensor:
-        spectrum = torch.as_tensor(physical_spectrum)
-        if spectrum.ndim != 2 or spectrum.size(0) == 0 or spectrum.size(1) != self.band_count:
-            raise ValueError(f"physical_spectrum must be non-empty [N,{self.band_count}]")
-        if not torch.is_floating_point(spectrum) or spectrum.is_complex():
-            raise TypeError("physical_spectrum must be real floating point")
-        if not bool(torch.isfinite(spectrum).all()):
-            raise ValueError("physical_spectrum contains NaN or Inf")
-        return spectrum
-
-    def raw_descriptors(self, physical_spectrum: Tensor) -> Tensor:
-        spectrum = self._validate_spectra(physical_spectrum)
-        positions = self.band_positions.to(device=spectrum.device, dtype=spectrum.dtype)
-        slope = _first_derivative(spectrum, positions)
-        curvature = _second_derivative(spectrum, positions)
-        result = torch.stack((spectrum, slope, curvature), dim=2)
-        if not bool(torch.isfinite(result).all()):
-            raise RuntimeError("full-band physical spectral descriptors contain NaN or Inf")
-        return result
+        self.register_buffer(
+            "band_center",
+            torch.zeros(self.band_count, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "band_scale",
+            torch.ones(self.band_count, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "fitted",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
 
     @torch.no_grad()
-    def fit(self, physical_spectra: Tensor, *, overwrite: bool = False) -> None:
+    def fit(self, spectra: Tensor, *, overwrite: bool = False) -> None:
         if bool(self.fitted.item()) and not overwrite:
             raise RuntimeError("physical spectral normalization is already fitted")
-        raw = self.raw_descriptors(physical_spectra).to(torch.float32)
-        flat = raw.reshape(-1, 3)
-        mean = flat.mean(dim=0)
-        std = flat.std(dim=0, unbiased=False)
-        scale = torch.where(std > 0, std, torch.ones_like(std))
-        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
+
+        values = _validate_spectra(spectra, band_count=self.band_count)
+        cpu = values.detach().to(device="cpu", dtype=torch.float64)
+        ordered = torch.sort(cpu, dim=0, stable=True).values
+
+        center = _linear_quantile(ordered, 0.50)
+        lower = _linear_quantile(ordered, 0.25)
+        upper = _linear_quantile(ordered, 0.75)
+        interquartile_range = (upper - lower).clamp_min(0.0)
+
+        absolute_deviation = (cpu - center.unsqueeze(0)).abs()
+        ordered_deviation = torch.sort(absolute_deviation, dim=0, stable=True).values
+        median_absolute_deviation = _linear_quantile(ordered_deviation, 0.50)
+
+        eps = torch.finfo(torch.float64).eps
+        # Keep the validated Phase-0 robust normalization contract: IQR first,
+        # then the Gaussian-consistent 1.4826*MAD fallback, then unit scale only
+        # for truly constant bands.
+        scale = torch.where(
+            interquartile_range > eps,
+            interquartile_range,
+            torch.where(
+                median_absolute_deviation > eps,
+                1.4826 * median_absolute_deviation,
+                torch.ones_like(interquartile_range),
+            ),
+        )
+
+        if not bool(torch.isfinite(center).all()) or not bool(torch.isfinite(scale).all()):
             raise RuntimeError("physical spectral normalization produced NaN or Inf")
-        self.descriptor_mean.copy_(mean.to(self.descriptor_mean))
-        self.descriptor_scale.copy_(scale.to(self.descriptor_scale))
+        if bool((scale <= 0).any()):
+            raise RuntimeError("physical spectral normalization produced non-positive scale")
+
+        self.band_center.copy_(center.to(self.band_center))
+        self.band_scale.copy_(scale.to(self.band_scale))
         self.fitted.fill_(True)
 
-    def forward(self, physical_spectrum: Tensor) -> Tensor:
+    def inverse(self, evidence: Tensor) -> Tensor:
+        """Map P[N,B,1] back to the spectral coordinate supplied to forward."""
         if not bool(self.fitted.item()):
             raise RuntimeError("physical spectral normalization must be fitted first")
-        raw = self.raw_descriptors(physical_spectrum)
-        mean = self.descriptor_mean.to(device=raw.device, dtype=raw.dtype)
-        scale = self.descriptor_scale.to(device=raw.device, dtype=raw.dtype)
-        result = (raw - mean.view(1, 1, 3)) / scale.view(1, 1, 3)
-        if result.shape[1:] != (self.band_count, 3):
-            raise RuntimeError("full-band physical spectral evidence has invalid shape")
-        if not bool(torch.isfinite(result).all()):
-            raise RuntimeError("normalized full-band physical spectral evidence contains NaN or Inf")
-        return result
+        value = torch.as_tensor(evidence)
+        if value.ndim == 2:
+            value = value.unsqueeze(-1)
+        if value.ndim != 3 or value.size(1) != self.band_count or value.size(2) != 1:
+            raise ValueError(f"evidence must be [N,{self.band_count},1]")
+        if not torch.is_floating_point(value) or value.is_complex() or not bool(torch.isfinite(value).all()):
+            raise ValueError("evidence must be finite real floating point")
+        center = self.band_center.to(device=value.device, dtype=value.dtype)
+        scale = self.band_scale.to(device=value.device, dtype=value.dtype)
+        spectra = value.squeeze(-1) * scale.unsqueeze(0) + center.unsqueeze(0)
+        if not bool(torch.isfinite(spectra).all()):
+            raise RuntimeError("inverse physical spectral evidence contains NaN or Inf")
+        return spectra
+
+    def forward(self, spectra: Tensor) -> Tensor:
+        if not bool(self.fitted.item()):
+            raise RuntimeError("physical spectral normalization must be fitted first")
+
+        values = _validate_spectra(spectra, band_count=self.band_count)
+        compute_dtype = (
+            torch.float32
+            if values.dtype in (torch.float16, torch.bfloat16)
+            else values.dtype
+        )
+        center = self.band_center.to(device=values.device, dtype=compute_dtype)
+        scale = self.band_scale.to(device=values.device, dtype=compute_dtype)
+        normalized = (values.to(dtype=compute_dtype) - center) / scale
+        normalized = normalized.to(dtype=values.dtype).unsqueeze(-1)
+
+        if normalized.shape[1:] != (self.band_count, 1):
+            raise RuntimeError("physical spectral evidence must have shape [N,B,1]")
+        if not bool(torch.isfinite(normalized).all()):
+            raise RuntimeError("physical spectral evidence contains NaN or Inf")
+        return normalized
 
 
-__all__ = ["OrderedPhysicalSpectralEvidence"]
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# """Full-band physical spectral structure for HSI CDS.
-
-# For a dataset with B native ordered pre-PCA bands this deterministic path returns
-
-#     P(x) in R^{B x 3} = [level, spectral slope, spectral curvature].
-
-# The raw spectral shape is preserved: derivatives are computed from the original
-# centre spectrum using actual band/wavelength spacing when supplied, otherwise a
-# uniform normalized band coordinate.  Only a three-component normalization is
-# fitted on Phase-0 TRAIN and then frozen.  Thus B is dataset-derived and entirely
-# independent of the learned token count K.
-
-# P is a phase-stable physical structure, not a class-score branch.  This module
-# owns no class state, replay state, classifier parameter, or trainable parameter.
-# """
-
-# from numbers import Integral
-# from typing import Sequence
-
-# import torch
-# import torch.nn as nn
-
-# Tensor = torch.Tensor
-
-
-# def _positive_int(value: object, name: str) -> int:
-#     if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-#         raise ValueError(f"{name} must be a positive integer")
-#     return int(value)
-
-
-# def _band_positions(
-#     values: Tensor | Sequence[float] | None,
-#     *,
-#     count: int,
-# ) -> Tensor:
-#     if values is None:
-#         return torch.linspace(-1.0, 1.0, count, dtype=torch.float32)
-#     raw = torch.as_tensor(values, dtype=torch.float32).flatten()
-#     if raw.shape != (count,):
-#         raise ValueError(f"band_positions must contain {count} values")
-#     if not bool(torch.isfinite(raw).all()):
-#         raise ValueError("band_positions contain NaN or Inf")
-#     if count > 1 and bool((raw[1:] <= raw[:-1]).any()):
-#         raise ValueError("band_positions must be strictly increasing")
-#     if count == 1:
-#         return torch.zeros(1, dtype=torch.float32)
-#     span = raw[-1] - raw[0]
-#     if not bool(span > 0):
-#         raise ValueError("band_positions must span a positive interval")
-#     return 2.0 * (raw - raw[0]) / span - 1.0
-
-
-# def _first_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     if b < 2:
-#         return torch.zeros_like(values)
-#     result = torch.empty_like(values)
-#     result[:, 0] = (values[:, 1] - values[:, 0]) / (positions[1] - positions[0])
-#     result[:, -1] = (values[:, -1] - values[:, -2]) / (positions[-1] - positions[-2])
-#     if b > 2:
-#         result[:, 1:-1] = (
-#             (values[:, 2:] - values[:, :-2])
-#             / (positions[2:] - positions[:-2]).unsqueeze(0)
-#         )
-#     return result
-
-
-# def _second_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     result = torch.zeros_like(values)
-#     if b < 3:
-#         return result
-#     step = positions[1:] - positions[:-1]
-#     slope = (values[:, 1:] - values[:, :-1]) / step.unsqueeze(0)
-#     interior = (
-#         2.0
-#         * (slope[:, 1:] - slope[:, :-1])
-#         / (positions[2:] - positions[:-2]).unsqueeze(0)
-#     )
-#     result[:, 1:-1] = interior
-#     result[:, 0] = interior[:, 0]
-#     result[:, -1] = interior[:, -1]
-#     return result
-
-
-# class OrderedPhysicalSpectralEvidence(nn.Module):
-#     """Map the complete pre-PCA spectrum to frozen full-band physical evidence."""
-
-#     component_names = ("level", "slope", "curvature")
-
-#     def __init__(
-#         self,
-#         *,
-#         band_count: int,
-#         band_positions: Tensor | Sequence[float] | None = None,
-#     ) -> None:
-#         super().__init__()
-#         self.band_count = _positive_int(band_count, "band_count")
-#         positions = _band_positions(band_positions, count=self.band_count)
-#         self.register_buffer("band_positions", positions, persistent=True)
-#         self.register_buffer("descriptor_mean", torch.zeros(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("descriptor_scale", torch.ones(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool), persistent=True)
-
-#     def _validate_spectra(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = torch.as_tensor(physical_spectrum)
-#         if spectrum.ndim != 2 or spectrum.size(0) == 0 or spectrum.size(1) != self.band_count:
-#             raise ValueError(f"physical_spectrum must be non-empty [N,{self.band_count}]")
-#         if not torch.is_floating_point(spectrum) or spectrum.is_complex():
-#             raise TypeError("physical_spectrum must be real floating point")
-#         if not bool(torch.isfinite(spectrum).all()):
-#             raise ValueError("physical_spectrum contains NaN or Inf")
-#         return spectrum
-
-#     def raw_descriptors(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = self._validate_spectra(physical_spectrum)
-#         positions = self.band_positions.to(device=spectrum.device, dtype=spectrum.dtype)
-#         slope = _first_derivative(spectrum, positions)
-#         curvature = _second_derivative(spectrum, positions)
-#         result = torch.stack((spectrum, slope, curvature), dim=2)
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("full-band physical spectral descriptors contain NaN or Inf")
-#         return result
-
-#     @torch.no_grad()
-#     def fit(self, physical_spectra: Tensor, *, overwrite: bool = False) -> None:
-#         if bool(self.fitted.item()) and not overwrite:
-#             raise RuntimeError("physical spectral normalization is already fitted")
-#         raw = self.raw_descriptors(physical_spectra).to(torch.float32)
-#         flat = raw.reshape(-1, 3)
-#         mean = flat.mean(dim=0)
-#         std = flat.std(dim=0, unbiased=False)
-#         scale = torch.where(std > 0, std, torch.ones_like(std))
-#         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
-#             raise RuntimeError("physical spectral normalization produced NaN or Inf")
-#         self.descriptor_mean.copy_(mean.to(self.descriptor_mean))
-#         self.descriptor_scale.copy_(scale.to(self.descriptor_scale))
-#         self.fitted.fill_(True)
-
-#     def forward(self, physical_spectrum: Tensor) -> Tensor:
-#         if not bool(self.fitted.item()):
-#             raise RuntimeError("physical spectral normalization must be fitted first")
-#         raw = self.raw_descriptors(physical_spectrum)
-#         mean = self.descriptor_mean.to(device=raw.device, dtype=raw.dtype)
-#         scale = self.descriptor_scale.to(device=raw.device, dtype=raw.dtype)
-#         result = (raw - mean.view(1, 1, 3)) / scale.view(1, 1, 3)
-#         if result.shape[1:] != (self.band_count, 3):
-#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("normalized full-band physical spectral evidence contains NaN or Inf")
-#         return result
-
-
-# __all__ = ["OrderedPhysicalSpectralEvidence"]
-
-
-
+__all__ = ["PhysicalSpectralEvidence"]
 
 
 
@@ -344,24 +162,7 @@ __all__ = ["OrderedPhysicalSpectralEvidence"]
 
 # from __future__ import annotations
 
-# """Full-band physical spectral structure for HSI CDS.
-
-# For a dataset with B native ordered pre-PCA bands this deterministic path returns
-
-#     P(x) in R^{B x 3} = [level, spectral slope, spectral curvature].
-
-# The raw spectral shape is preserved: derivatives are computed from the original
-# centre spectrum using actual band/wavelength spacing when supplied, otherwise a
-# uniform normalized band coordinate.  Only a three-component normalization is
-# fitted on Phase-0 TRAIN and then frozen.  Thus B is dataset-derived and entirely
-# independent of the learned token count K.
-
-# P is a phase-stable physical structure, not a class-score branch.  This module
-# owns no class state, replay state, classifier parameter, or trainable parameter.
-# """
-
 # from numbers import Integral
-# from typing import Sequence
 
 # import torch
 # import torch.nn as nn
@@ -370,307 +171,150 @@ __all__ = ["OrderedPhysicalSpectralEvidence"]
 
 
 # def _positive_int(value: object, name: str) -> int:
-#     if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-#         raise ValueError(f"{name} must be a positive integer")
-#     return int(value)
+#     if isinstance(value, bool) or not isinstance(value, Integral):
+#         raise TypeError(f"{name} must be an integer")
+#     result = int(value)
+#     if result <= 0:
+#         raise ValueError(f"{name} must be positive")
+#     return result
 
 
-# def _band_positions(
-#     values: Tensor | Sequence[float] | None,
-#     *,
-#     count: int,
-# ) -> Tensor:
-#     if values is None:
-#         return torch.linspace(-1.0, 1.0, count, dtype=torch.float32)
-#     raw = torch.as_tensor(values, dtype=torch.float32).flatten()
-#     if raw.shape != (count,):
-#         raise ValueError(f"band_positions must contain {count} values")
-#     if not bool(torch.isfinite(raw).all()):
-#         raise ValueError("band_positions contain NaN or Inf")
-#     if count > 1 and bool((raw[1:] <= raw[:-1]).any()):
-#         raise ValueError("band_positions must be strictly increasing")
+# def _validate_spectra(values: Tensor, *, band_count: int) -> Tensor:
+#     spectra = torch.as_tensor(values)
+#     if spectra.ndim != 2 or spectra.size(0) == 0 or spectra.size(1) != band_count:
+#         raise ValueError(f"spectra must be non-empty [N,{band_count}]")
+#     if not torch.is_floating_point(spectra) or spectra.is_complex():
+#         raise TypeError("spectra must be real floating point")
+#     if not bool(torch.isfinite(spectra).all()):
+#         raise ValueError("spectra contain NaN or Inf")
+#     return spectra
+
+
+# def _linear_quantile(sorted_values: Tensor, quantile: float) -> Tensor:
+#     values = torch.as_tensor(sorted_values)
+#     if values.ndim != 2 or values.size(0) == 0:
+#         raise ValueError("sorted_values must be non-empty [N,B]")
+#     if not 0.0 <= float(quantile) <= 1.0:
+#         raise ValueError("quantile must lie in [0,1]")
+#     count = int(values.size(0))
 #     if count == 1:
-#         return torch.zeros(1, dtype=torch.float32)
-#     span = raw[-1] - raw[0]
-#     if not bool(span > 0):
-#         raise ValueError("band_positions must span a positive interval")
-#     return 2.0 * (raw - raw[0]) / span - 1.0
-
-
-# def _first_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     if b < 2:
-#         return torch.zeros_like(values)
-#     result = torch.empty_like(values)
-#     result[:, 0] = (values[:, 1] - values[:, 0]) / (positions[1] - positions[0])
-#     result[:, -1] = (values[:, -1] - values[:, -2]) / (positions[-1] - positions[-2])
-#     if b > 2:
-#         result[:, 1:-1] = (
-#             (values[:, 2:] - values[:, :-2])
-#             / (positions[2:] - positions[:-2]).unsqueeze(0)
-#         )
-#     return result
-
-
-# def _second_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     result = torch.zeros_like(values)
-#     if b < 3:
-#         return result
-#     step = positions[1:] - positions[:-1]
-#     slope = (values[:, 1:] - values[:, :-1]) / step.unsqueeze(0)
-#     interior = (
-#         2.0
-#         * (slope[:, 1:] - slope[:, :-1])
-#         / (positions[2:] - positions[:-2]).unsqueeze(0)
+#         return values[0]
+#     position = float(quantile) * float(count - 1)
+#     lower_index = int(position)
+#     upper_index = min(lower_index + 1, count - 1)
+#     interpolation_weight = position - float(lower_index)
+#     if upper_index == lower_index or interpolation_weight == 0.0:
+#         return values[lower_index]
+#     return (
+#         values[lower_index] * (1.0 - interpolation_weight)
+#         + values[upper_index] * interpolation_weight
 #     )
-#     result[:, 1:-1] = interior
-#     result[:, 0] = interior[:, 0]
-#     result[:, -1] = interior[:, -1]
-#     return result
 
 
-# class OrderedPhysicalSpectralEvidence(nn.Module):
-#     """Map the complete pre-PCA spectrum to frozen full-band physical evidence."""
+# class PhysicalSpectralEvidence(nn.Module):
+#     """Return fixed robust standardized native-band evidence P[N,B,1]."""
 
-#     component_names = ("level", "slope", "curvature")
-
-#     def __init__(
-#         self,
-#         *,
-#         band_count: int,
-#         band_positions: Tensor | Sequence[float] | None = None,
-#     ) -> None:
+#     def __init__(self, *, band_count: int) -> None:
 #         super().__init__()
 #         self.band_count = _positive_int(band_count, "band_count")
-#         positions = _band_positions(band_positions, count=self.band_count)
-#         self.register_buffer("band_positions", positions, persistent=True)
-#         self.register_buffer("descriptor_mean", torch.zeros(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("descriptor_scale", torch.ones(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool), persistent=True)
-
-#     def _validate_spectra(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = torch.as_tensor(physical_spectrum)
-#         if spectrum.ndim != 2 or spectrum.size(0) == 0 or spectrum.size(1) != self.band_count:
-#             raise ValueError(f"physical_spectrum must be non-empty [N,{self.band_count}]")
-#         if not torch.is_floating_point(spectrum) or spectrum.is_complex():
-#             raise TypeError("physical_spectrum must be real floating point")
-#         if not bool(torch.isfinite(spectrum).all()):
-#             raise ValueError("physical_spectrum contains NaN or Inf")
-#         return spectrum
-
-#     def raw_descriptors(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = self._validate_spectra(physical_spectrum)
-#         positions = self.band_positions.to(device=spectrum.device, dtype=spectrum.dtype)
-#         slope = _first_derivative(spectrum, positions)
-#         curvature = _second_derivative(spectrum, positions)
-#         result = torch.stack((spectrum, slope, curvature), dim=2)
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("full-band physical spectral descriptors contain NaN or Inf")
-#         return result
-
-#     @torch.no_grad()
-#     def fit(self, physical_spectra: Tensor, *, overwrite: bool = False) -> None:
-#         if bool(self.fitted.item()) and not overwrite:
-#             raise RuntimeError("physical spectral normalization is already fitted")
-#         raw = self.raw_descriptors(physical_spectra).to(torch.float32)
-#         flat = raw.reshape(-1, 3)
-#         mean = flat.mean(dim=0)
-#         std = flat.std(dim=0, unbiased=False)
-#         scale = torch.where(std > 0, std, torch.ones_like(std))
-#         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
-#             raise RuntimeError("physical spectral normalization produced NaN or Inf")
-#         self.descriptor_mean.copy_(mean.to(self.descriptor_mean))
-#         self.descriptor_scale.copy_(scale.to(self.descriptor_scale))
-#         self.fitted.fill_(True)
-
-#     def forward(self, physical_spectrum: Tensor) -> Tensor:
-#         if not bool(self.fitted.item()):
-#             raise RuntimeError("physical spectral normalization must be fitted first")
-#         raw = self.raw_descriptors(physical_spectrum)
-#         mean = self.descriptor_mean.to(device=raw.device, dtype=raw.dtype)
-#         scale = self.descriptor_scale.to(device=raw.device, dtype=raw.dtype)
-#         result = (raw - mean.view(1, 1, 3)) / scale.view(1, 1, 3)
-#         if result.shape[1:] != (self.band_count, 3):
-#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("normalized full-band physical spectral evidence contains NaN or Inf")
-#         return result
-
-
-# __all__ = ["OrderedPhysicalSpectralEvidence"]
-
-
-
-
-# from __future__ import annotations
-
-# """Full-band physical spectral structure for HSI CDS.
-
-# For a dataset with B native ordered pre-PCA bands this deterministic path returns
-
-#     P(x) in R^{B x 3} = [level, spectral slope, spectral curvature].
-
-# The raw spectral shape is preserved: derivatives are computed from the original
-# centre spectrum using actual band/wavelength spacing when supplied, otherwise a
-# uniform normalized band coordinate.  Only a three-component normalization is
-# fitted on Phase-0 TRAIN and then frozen.  Thus B is dataset-derived and entirely
-# independent of the learned token count K.
-
-# P is a phase-stable physical structure, not a class-score branch.  This module
-# owns no class state, replay state, classifier parameter, or trainable parameter.
-# """
-
-# from numbers import Integral
-# from typing import Sequence
-
-# import torch
-# import torch.nn as nn
-
-# Tensor = torch.Tensor
-
-
-# def _positive_int(value: object, name: str) -> int:
-#     if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-#         raise ValueError(f"{name} must be a positive integer")
-#     return int(value)
-
-
-# def _band_positions(
-#     values: Tensor | Sequence[float] | None,
-#     *,
-#     count: int,
-# ) -> Tensor:
-#     if values is None:
-#         return torch.linspace(-1.0, 1.0, count, dtype=torch.float32)
-#     raw = torch.as_tensor(values, dtype=torch.float32).flatten()
-#     if raw.shape != (count,):
-#         raise ValueError(f"band_positions must contain {count} values")
-#     if not bool(torch.isfinite(raw).all()):
-#         raise ValueError("band_positions contain NaN or Inf")
-#     if count > 1 and bool((raw[1:] <= raw[:-1]).any()):
-#         raise ValueError("band_positions must be strictly increasing")
-#     if count == 1:
-#         return torch.zeros(1, dtype=torch.float32)
-#     span = raw[-1] - raw[0]
-#     if not bool(span > 0):
-#         raise ValueError("band_positions must span a positive interval")
-#     return 2.0 * (raw - raw[0]) / span - 1.0
-
-
-# def _first_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     if b < 2:
-#         return torch.zeros_like(values)
-#     result = torch.empty_like(values)
-#     result[:, 0] = (values[:, 1] - values[:, 0]) / (positions[1] - positions[0])
-#     result[:, -1] = (values[:, -1] - values[:, -2]) / (positions[-1] - positions[-2])
-#     if b > 2:
-#         result[:, 1:-1] = (
-#             (values[:, 2:] - values[:, :-2])
-#             / (positions[2:] - positions[:-2]).unsqueeze(0)
+#         self.register_buffer(
+#             "band_center",
+#             torch.zeros(self.band_count, dtype=torch.float32),
+#             persistent=True,
 #         )
-#     return result
-
-
-# def _second_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     result = torch.zeros_like(values)
-#     if b < 3:
-#         return result
-#     step = positions[1:] - positions[:-1]
-#     slope = (values[:, 1:] - values[:, :-1]) / step.unsqueeze(0)
-#     interior = (
-#         2.0
-#         * (slope[:, 1:] - slope[:, :-1])
-#         / (positions[2:] - positions[:-2]).unsqueeze(0)
-#     )
-#     result[:, 1:-1] = interior
-#     result[:, 0] = interior[:, 0]
-#     result[:, -1] = interior[:, -1]
-#     return result
-
-
-# class OrderedPhysicalSpectralEvidence(nn.Module):
-#     """Map the complete pre-PCA spectrum to frozen full-band physical evidence."""
-
-#     component_names = ("level", "slope", "curvature")
-
-#     def __init__(
-#         self,
-#         *,
-#         band_count: int,
-#         band_positions: Tensor | Sequence[float] | None = None,
-#     ) -> None:
-#         super().__init__()
-#         self.band_count = _positive_int(band_count, "band_count")
-#         positions = _band_positions(band_positions, count=self.band_count)
-#         self.register_buffer("band_positions", positions, persistent=True)
-#         self.register_buffer("descriptor_mean", torch.zeros(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("descriptor_scale", torch.ones(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool), persistent=True)
-
-#     def _validate_spectra(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = torch.as_tensor(physical_spectrum)
-#         if spectrum.ndim != 2 or spectrum.size(0) == 0 or spectrum.size(1) != self.band_count:
-#             raise ValueError(f"physical_spectrum must be non-empty [N,{self.band_count}]")
-#         if not torch.is_floating_point(spectrum) or spectrum.is_complex():
-#             raise TypeError("physical_spectrum must be real floating point")
-#         if not bool(torch.isfinite(spectrum).all()):
-#             raise ValueError("physical_spectrum contains NaN or Inf")
-#         return spectrum
-
-#     def raw_descriptors(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = self._validate_spectra(physical_spectrum)
-#         positions = self.band_positions.to(device=spectrum.device, dtype=spectrum.dtype)
-#         slope = _first_derivative(spectrum, positions)
-#         curvature = _second_derivative(spectrum, positions)
-#         result = torch.stack((spectrum, slope, curvature), dim=2)
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("full-band physical spectral descriptors contain NaN or Inf")
-#         return result
+#         self.register_buffer(
+#             "band_scale",
+#             torch.ones(self.band_count, dtype=torch.float32),
+#             persistent=True,
+#         )
+#         self.register_buffer(
+#             "fitted",
+#             torch.tensor(False, dtype=torch.bool),
+#             persistent=True,
+#         )
 
 #     @torch.no_grad()
-#     def fit(self, physical_spectra: Tensor, *, overwrite: bool = False) -> None:
+#     def fit(self, spectra: Tensor, *, overwrite: bool = False) -> None:
 #         if bool(self.fitted.item()) and not overwrite:
 #             raise RuntimeError("physical spectral normalization is already fitted")
-#         raw = self.raw_descriptors(physical_spectra).to(torch.float32)
-#         flat = raw.reshape(-1, 3)
-#         mean = flat.mean(dim=0)
-#         std = flat.std(dim=0, unbiased=False)
-#         scale = torch.where(std > 0, std, torch.ones_like(std))
-#         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
+
+#         values = _validate_spectra(spectra, band_count=self.band_count)
+#         cpu = values.detach().to(device="cpu", dtype=torch.float64)
+#         ordered = torch.sort(cpu, dim=0, stable=True).values
+
+#         center = _linear_quantile(ordered, 0.50)
+#         lower = _linear_quantile(ordered, 0.25)
+#         upper = _linear_quantile(ordered, 0.75)
+#         interquartile_range = (upper - lower).clamp_min(0.0)
+
+#         absolute_deviation = (cpu - center.unsqueeze(0)).abs()
+#         ordered_deviation = torch.sort(absolute_deviation, dim=0, stable=True).values
+#         median_absolute_deviation = _linear_quantile(ordered_deviation, 0.50)
+
+#         eps = torch.finfo(torch.float64).eps
+#         # Keep the validated Phase-0 robust normalization contract: IQR first,
+#         # then the Gaussian-consistent 1.4826*MAD fallback, then unit scale only
+#         # for truly constant bands.
+#         scale = torch.where(
+#             interquartile_range > eps,
+#             interquartile_range,
+#             torch.where(
+#                 median_absolute_deviation > eps,
+#                 1.4826 * median_absolute_deviation,
+#                 torch.ones_like(interquartile_range),
+#             ),
+#         )
+
+#         if not bool(torch.isfinite(center).all()) or not bool(torch.isfinite(scale).all()):
 #             raise RuntimeError("physical spectral normalization produced NaN or Inf")
-#         self.descriptor_mean.copy_(mean.to(self.descriptor_mean))
-#         self.descriptor_scale.copy_(scale.to(self.descriptor_scale))
+#         if bool((scale <= 0).any()):
+#             raise RuntimeError("physical spectral normalization produced non-positive scale")
+
+#         self.band_center.copy_(center.to(self.band_center))
+#         self.band_scale.copy_(scale.to(self.band_scale))
 #         self.fitted.fill_(True)
 
-#     def forward(self, physical_spectrum: Tensor) -> Tensor:
+#     def inverse(self, evidence: Tensor) -> Tensor:
+#         """Map P[N,B,1] back to the spectral coordinate supplied to forward."""
 #         if not bool(self.fitted.item()):
 #             raise RuntimeError("physical spectral normalization must be fitted first")
-#         raw = self.raw_descriptors(physical_spectrum)
-#         mean = self.descriptor_mean.to(device=raw.device, dtype=raw.dtype)
-#         scale = self.descriptor_scale.to(device=raw.device, dtype=raw.dtype)
-#         result = (raw - mean.view(1, 1, 3)) / scale.view(1, 1, 3)
-#         if result.shape[1:] != (self.band_count, 3):
-#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("normalized full-band physical spectral evidence contains NaN or Inf")
-#         return result
+#         value = torch.as_tensor(evidence)
+#         if value.ndim == 2:
+#             value = value.unsqueeze(-1)
+#         if value.ndim != 3 or value.size(1) != self.band_count or value.size(2) != 1:
+#             raise ValueError(f"evidence must be [N,{self.band_count},1]")
+#         if not torch.is_floating_point(value) or value.is_complex() or not bool(torch.isfinite(value).all()):
+#             raise ValueError("evidence must be finite real floating point")
+#         center = self.band_center.to(device=value.device, dtype=value.dtype)
+#         scale = self.band_scale.to(device=value.device, dtype=value.dtype)
+#         spectra = value.squeeze(-1) * scale.unsqueeze(0) + center.unsqueeze(0)
+#         if not bool(torch.isfinite(spectra).all()):
+#             raise RuntimeError("inverse physical spectral evidence contains NaN or Inf")
+#         return spectra
+
+#     def forward(self, spectra: Tensor) -> Tensor:
+#         if not bool(self.fitted.item()):
+#             raise RuntimeError("physical spectral normalization must be fitted first")
+
+#         values = _validate_spectra(spectra, band_count=self.band_count)
+#         compute_dtype = (
+#             torch.float32
+#             if values.dtype in (torch.float16, torch.bfloat16)
+#             else values.dtype
+#         )
+#         center = self.band_center.to(device=values.device, dtype=compute_dtype)
+#         scale = self.band_scale.to(device=values.device, dtype=compute_dtype)
+#         normalized = (values.to(dtype=compute_dtype) - center) / scale
+#         normalized = normalized.to(dtype=values.dtype).unsqueeze(-1)
+
+#         if normalized.shape[1:] != (self.band_count, 1):
+#             raise RuntimeError("physical spectral evidence must have shape [N,B,1]")
+#         if not bool(torch.isfinite(normalized).all()):
+#             raise RuntimeError("physical spectral evidence contains NaN or Inf")
+#         return normalized
 
 
-# __all__ = ["OrderedPhysicalSpectralEvidence"]
-
-
-
+# __all__ = ["PhysicalSpectralEvidence"]
 
 
 
@@ -680,24 +324,20 @@ __all__ = ["OrderedPhysicalSpectralEvidence"]
 
 # from __future__ import annotations
 
-# """Full-band physical spectral structure for HSI CDS.
+# """Phase-stable full-band physical spectral evidence for HSI CDS.
 
-# For a dataset with B native ordered pre-PCA bands this deterministic path returns
+# The module maps each complete native pre-PCA centre spectrum to
 
-#     P(x) in R^{B x 3} = [level, spectral slope, spectral curvature].
+#     P(x) in R^{B x 1}.
 
-# The raw spectral shape is preserved: derivatives are computed from the original
-# centre spectrum using actual band/wavelength spacing when supplied, otherwise a
-# uniform normalized band coordinate.  Only a three-component normalization is
-# fitted on Phase-0 TRAIN and then frozen.  Thus B is dataset-derived and entirely
-# independent of the learned token count K.
-
-# P is a phase-stable physical structure, not a class-score branch.  This module
-# owns no class state, replay state, classifier parameter, or trainable parameter.
+# Each native band is robustly standardized from real Phase-0 TRAIN spectra and
+# then frozen for all later phases.  The physical CDS therefore models absolute
+# band evidence and ordered cross-band relations in one fixed standardized
+# spectral coordinate.  No slope/curvature descriptor, trainable projection,
+# second representation, or later-phase refitting is introduced.
 # """
 
 # from numbers import Integral
-# from typing import Sequence
 
 # import torch
 # import torch.nn as nn
@@ -706,138 +346,148 @@ __all__ = ["OrderedPhysicalSpectralEvidence"]
 
 
 # def _positive_int(value: object, name: str) -> int:
-#     if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-#         raise ValueError(f"{name} must be a positive integer")
-#     return int(value)
+#     if isinstance(value, bool) or not isinstance(value, Integral):
+#         raise TypeError(f"{name} must be an integer")
+#     result = int(value)
+#     if result <= 0:
+#         raise ValueError(f"{name} must be positive")
+#     return result
 
 
-# def _band_positions(
-#     values: Tensor | Sequence[float] | None,
-#     *,
-#     count: int,
-# ) -> Tensor:
-#     if values is None:
-#         return torch.linspace(-1.0, 1.0, count, dtype=torch.float32)
-#     raw = torch.as_tensor(values, dtype=torch.float32).flatten()
-#     if raw.shape != (count,):
-#         raise ValueError(f"band_positions must contain {count} values")
-#     if not bool(torch.isfinite(raw).all()):
-#         raise ValueError("band_positions contain NaN or Inf")
-#     if count > 1 and bool((raw[1:] <= raw[:-1]).any()):
-#         raise ValueError("band_positions must be strictly increasing")
+# def _validate_spectra(values: Tensor, *, band_count: int) -> Tensor:
+#     spectra = torch.as_tensor(values)
+#     if spectra.ndim != 2 or spectra.size(0) == 0 or spectra.size(1) != band_count:
+#         raise ValueError(f"spectra must be non-empty [N,{band_count}]")
+#     if not torch.is_floating_point(spectra) or spectra.is_complex():
+#         raise TypeError("spectra must be real floating point")
+#     if not bool(torch.isfinite(spectra).all()):
+#         raise ValueError("spectra contain NaN or Inf")
+#     return spectra
+
+
+# def _linear_quantile(sorted_values: Tensor, quantile: float) -> Tensor:
+#     values = torch.as_tensor(sorted_values)
+#     if values.ndim != 2 or values.size(0) == 0:
+#         raise ValueError("sorted_values must be non-empty [N,B]")
+#     if not 0.0 <= float(quantile) <= 1.0:
+#         raise ValueError("quantile must lie in [0,1]")
+#     count = int(values.size(0))
 #     if count == 1:
-#         return torch.zeros(1, dtype=torch.float32)
-#     span = raw[-1] - raw[0]
-#     if not bool(span > 0):
-#         raise ValueError("band_positions must span a positive interval")
-#     return 2.0 * (raw - raw[0]) / span - 1.0
-
-
-# def _first_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     if b < 2:
-#         return torch.zeros_like(values)
-#     result = torch.empty_like(values)
-#     result[:, 0] = (values[:, 1] - values[:, 0]) / (positions[1] - positions[0])
-#     result[:, -1] = (values[:, -1] - values[:, -2]) / (positions[-1] - positions[-2])
-#     if b > 2:
-#         result[:, 1:-1] = (
-#             (values[:, 2:] - values[:, :-2])
-#             / (positions[2:] - positions[:-2]).unsqueeze(0)
-#         )
-#     return result
-
-
-# def _second_derivative(values: Tensor, positions: Tensor) -> Tensor:
-#     if values.ndim != 2 or positions.shape != (values.size(1),):
-#         raise ValueError("values/positions must be [N,B] and [B]")
-#     b = int(values.size(1))
-#     result = torch.zeros_like(values)
-#     if b < 3:
-#         return result
-#     step = positions[1:] - positions[:-1]
-#     slope = (values[:, 1:] - values[:, :-1]) / step.unsqueeze(0)
-#     interior = (
-#         2.0
-#         * (slope[:, 1:] - slope[:, :-1])
-#         / (positions[2:] - positions[:-2]).unsqueeze(0)
+#         return values[0]
+#     position = float(quantile) * float(count - 1)
+#     lower_index = int(position)
+#     upper_index = min(lower_index + 1, count - 1)
+#     interpolation_weight = position - float(lower_index)
+#     if upper_index == lower_index or interpolation_weight == 0.0:
+#         return values[lower_index]
+#     return (
+#         values[lower_index] * (1.0 - interpolation_weight)
+#         + values[upper_index] * interpolation_weight
 #     )
-#     result[:, 1:-1] = interior
-#     result[:, 0] = interior[:, 0]
-#     result[:, -1] = interior[:, -1]
-#     return result
 
 
-# class OrderedPhysicalSpectralEvidence(nn.Module):
-#     """Map the complete pre-PCA spectrum to frozen full-band physical evidence."""
+# class PhysicalSpectralEvidence(nn.Module):
+#     """Return fixed robust standardized native-band evidence P[N,B,1]."""
 
-#     component_names = ("level", "slope", "curvature")
-
-#     def __init__(
-#         self,
-#         *,
-#         band_count: int,
-#         band_positions: Tensor | Sequence[float] | None = None,
-#     ) -> None:
+#     def __init__(self, *, band_count: int) -> None:
 #         super().__init__()
 #         self.band_count = _positive_int(band_count, "band_count")
-#         positions = _band_positions(band_positions, count=self.band_count)
-#         self.register_buffer("band_positions", positions, persistent=True)
-#         self.register_buffer("descriptor_mean", torch.zeros(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("descriptor_scale", torch.ones(3, dtype=torch.float32), persistent=True)
-#         self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool), persistent=True)
-
-#     def _validate_spectra(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = torch.as_tensor(physical_spectrum)
-#         if spectrum.ndim != 2 or spectrum.size(0) == 0 or spectrum.size(1) != self.band_count:
-#             raise ValueError(f"physical_spectrum must be non-empty [N,{self.band_count}]")
-#         if not torch.is_floating_point(spectrum) or spectrum.is_complex():
-#             raise TypeError("physical_spectrum must be real floating point")
-#         if not bool(torch.isfinite(spectrum).all()):
-#             raise ValueError("physical_spectrum contains NaN or Inf")
-#         return spectrum
-
-#     def raw_descriptors(self, physical_spectrum: Tensor) -> Tensor:
-#         spectrum = self._validate_spectra(physical_spectrum)
-#         positions = self.band_positions.to(device=spectrum.device, dtype=spectrum.dtype)
-#         slope = _first_derivative(spectrum, positions)
-#         curvature = _second_derivative(spectrum, positions)
-#         result = torch.stack((spectrum, slope, curvature), dim=2)
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("full-band physical spectral descriptors contain NaN or Inf")
-#         return result
+#         self.register_buffer(
+#             "band_center",
+#             torch.zeros(self.band_count, dtype=torch.float32),
+#             persistent=True,
+#         )
+#         self.register_buffer(
+#             "band_scale",
+#             torch.ones(self.band_count, dtype=torch.float32),
+#             persistent=True,
+#         )
+#         self.register_buffer(
+#             "fitted",
+#             torch.tensor(False, dtype=torch.bool),
+#             persistent=True,
+#         )
 
 #     @torch.no_grad()
-#     def fit(self, physical_spectra: Tensor, *, overwrite: bool = False) -> None:
+#     def fit(self, spectra: Tensor, *, overwrite: bool = False) -> None:
 #         if bool(self.fitted.item()) and not overwrite:
 #             raise RuntimeError("physical spectral normalization is already fitted")
-#         raw = self.raw_descriptors(physical_spectra).to(torch.float32)
-#         flat = raw.reshape(-1, 3)
-#         mean = flat.mean(dim=0)
-#         std = flat.std(dim=0, unbiased=False)
-#         scale = torch.where(std > 0, std, torch.ones_like(std))
-#         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
+
+#         values = _validate_spectra(spectra, band_count=self.band_count)
+#         cpu = values.detach().to(device="cpu", dtype=torch.float64)
+#         ordered = torch.sort(cpu, dim=0, stable=True).values
+
+#         center = _linear_quantile(ordered, 0.50)
+#         lower = _linear_quantile(ordered, 0.25)
+#         upper = _linear_quantile(ordered, 0.75)
+#         interquartile_range = (upper - lower).clamp_min(0.0)
+
+#         absolute_deviation = (cpu - center.unsqueeze(0)).abs()
+#         ordered_deviation = torch.sort(absolute_deviation, dim=0, stable=True).values
+#         median_absolute_deviation = _linear_quantile(ordered_deviation, 0.50)
+
+#         eps = torch.finfo(torch.float64).eps
+#         # Keep the validated Phase-0 robust normalization contract: IQR first,
+#         # then the Gaussian-consistent 1.4826*MAD fallback, then unit scale only
+#         # for truly constant bands.
+#         scale = torch.where(
+#             interquartile_range > eps,
+#             interquartile_range,
+#             torch.where(
+#                 median_absolute_deviation > eps,
+#                 1.4826 * median_absolute_deviation,
+#                 torch.ones_like(interquartile_range),
+#             ),
+#         )
+
+#         if not bool(torch.isfinite(center).all()) or not bool(torch.isfinite(scale).all()):
 #             raise RuntimeError("physical spectral normalization produced NaN or Inf")
-#         self.descriptor_mean.copy_(mean.to(self.descriptor_mean))
-#         self.descriptor_scale.copy_(scale.to(self.descriptor_scale))
+#         if bool((scale <= 0).any()):
+#             raise RuntimeError("physical spectral normalization produced non-positive scale")
+
+#         self.band_center.copy_(center.to(self.band_center))
+#         self.band_scale.copy_(scale.to(self.band_scale))
 #         self.fitted.fill_(True)
 
-#     def forward(self, physical_spectrum: Tensor) -> Tensor:
+#     def inverse(self, evidence: Tensor) -> Tensor:
+#         """Map P[N,B,1] back to the spectral coordinate supplied to forward."""
 #         if not bool(self.fitted.item()):
 #             raise RuntimeError("physical spectral normalization must be fitted first")
-#         raw = self.raw_descriptors(physical_spectrum)
-#         mean = self.descriptor_mean.to(device=raw.device, dtype=raw.dtype)
-#         scale = self.descriptor_scale.to(device=raw.device, dtype=raw.dtype)
-#         result = (raw - mean.view(1, 1, 3)) / scale.view(1, 1, 3)
-#         if result.shape[1:] != (self.band_count, 3):
-#             raise RuntimeError("full-band physical spectral evidence has invalid shape")
-#         if not bool(torch.isfinite(result).all()):
-#             raise RuntimeError("normalized full-band physical spectral evidence contains NaN or Inf")
-#         return result
+#         value = torch.as_tensor(evidence)
+#         if value.ndim == 2:
+#             value = value.unsqueeze(-1)
+#         if value.ndim != 3 or value.size(1) != self.band_count or value.size(2) != 1:
+#             raise ValueError(f"evidence must be [N,{self.band_count},1]")
+#         if not torch.is_floating_point(value) or value.is_complex() or not bool(torch.isfinite(value).all()):
+#             raise ValueError("evidence must be finite real floating point")
+#         center = self.band_center.to(device=value.device, dtype=value.dtype)
+#         scale = self.band_scale.to(device=value.device, dtype=value.dtype)
+#         spectra = value.squeeze(-1) * scale.unsqueeze(0) + center.unsqueeze(0)
+#         if not bool(torch.isfinite(spectra).all()):
+#             raise RuntimeError("inverse physical spectral evidence contains NaN or Inf")
+#         return spectra
+
+#     def forward(self, spectra: Tensor) -> Tensor:
+#         if not bool(self.fitted.item()):
+#             raise RuntimeError("physical spectral normalization must be fitted first")
+
+#         values = _validate_spectra(spectra, band_count=self.band_count)
+#         compute_dtype = (
+#             torch.float32
+#             if values.dtype in (torch.float16, torch.bfloat16)
+#             else values.dtype
+#         )
+#         center = self.band_center.to(device=values.device, dtype=compute_dtype)
+#         scale = self.band_scale.to(device=values.device, dtype=compute_dtype)
+#         normalized = (values.to(dtype=compute_dtype) - center) / scale
+#         normalized = normalized.to(dtype=values.dtype).unsqueeze(-1)
+
+#         if normalized.shape[1:] != (self.band_count, 1):
+#             raise RuntimeError("physical spectral evidence must have shape [N,B,1]")
+#         if not bool(torch.isfinite(normalized).all()):
+#             raise RuntimeError("physical spectral evidence contains NaN or Inf")
+#         return normalized
 
 
-# __all__ = ["OrderedPhysicalSpectralEvidence"]
-
+# __all__ = ["PhysicalSpectralEvidence"]
 

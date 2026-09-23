@@ -1,60 +1,42 @@
 from __future__ import annotations
 
-"""Incremental training with direct complete-HSI-CDS historical supervision.
+"""One-stage incremental training for the finalized NECIL-HSI architecture.
 
-The architecture remains:
-    real current HSI -> HSIMamba -> Q[K,D]
-    raw centre spectrum -> deterministic P[B,3]
-    persistent memory -> {I_Q,V_Q,I_P,V_P,N}
-    deployed decision -> one bias-free normalized cosine classifier
+Problem-to-mechanism contract
+-----------------------------
+* semantic shift: global Q transport + Whole-CDS-conditioned class residual;
+* feature stability: old-logit KD + historical intra/inter CDS preservation;
+* feature plasticity: real-current all-seen CE + supervised contrastive learning;
+* cross-phase separation: current Q versus migrated historical CDS;
+* decision recovery: class-balanced Whole-CDS reconstruction of one all-seen
+  cosine classifier, with old-old clearance retention.
 
-The fix is intentionally narrow. The failed temporary-support/Stage-B path is
-removed. The same real-sample direct-Q contrastive separation used in Phase 0 is
-retained in every incremental phase. During every incremental update, the
-transported historical CDS itself supervises the same classifier:
-
-    current CE        : real new HSI; only current rows are live;
-    HDC               : preserve phase-start historical decision relations;
-    CDS separation    : real new HSI stays out of risky historical regions;
-    historical CDS CE : aligned old I_Q supplies old positive supervision while
-                        V_Q directly constrains old-vs-seen boundary clearance and
-                        I_P/V_P prioritize spectrally dangerous competition.
-
-There is no pseudo-feature, inversion, Gaussian/covariance model, second head,
-post-hoc calibration stage, L-BFGS solve, or decision-region regulator.
+Persistent method memory is only {I_Q,V_Q,I_P,V_P}.  No old images/features,
+synthetic replay, covariance/Gaussian memory, second representation, or second
+classifier stage is introduced.
 """
-
-from dataclasses import dataclass
 import math
 import sys
 from numbers import Integral, Real
-from typing import Any, Dict, Mapping
+from typing import Any, Dict
 
 import torch
 from tqdm import tqdm
 
 from losses.loss import (
     classification_objective,
+    cross_phase_cds_separation_loss,
+    historical_cds_preservation_loss,
+    logit_distillation_loss,
     supervised_contrastive_q_loss,
-    historical_decision_consistency_loss,
-    hsi_cds_separation_loss,
-    historical_full_cds_supervision_loss,
 )
-from models.classifier import SpectralCDSClassifier
-from models.geometry_bank import (
-    ClassDiscriminativeStructureState,
-    PhysicalSpectralStructureBatch,
-    ClassStructureBatch,
-    merge_class_structure_batches,
+from models.classifier import CosineClassificationHead
+from models.cds_decision_region import (
+    HSICDSDecisionRegionRegulator,
+    reconstruct_incoming_classifier_rows_from_whole_cds,
 )
-from models.phase_coordinate_alignment import (
-    CDSAffinityState,
-    CurrentClassResidual,
-    PhaseAlignmentDiagnostics,
-    PhaseCoordinateTransform,
-    align_historical_structure,
-    derive_cds_affinity,
-)
+from models.geometry_bank import ClassStructureBatch, merge_class_structure_batches
+from models.phase_coordinate_alignment import correct_historical_structure
 from utils.eval import old_new_summary, phase_origin_confusion_diagnostics
 
 Tensor = torch.Tensor
@@ -83,216 +65,173 @@ def _finite_nonnegative(name: str, value: object) -> float:
     return result
 
 
-def _clone_structure(batch: ClassStructureBatch) -> ClassStructureBatch:
-    if not isinstance(batch, ClassStructureBatch) or batch.class_count <= 0:
+def _clone_structure(structure: ClassStructureBatch) -> ClassStructureBatch:
+    if not isinstance(structure, ClassStructureBatch) or structure.class_count <= 0:
         raise ValueError("cannot clone an empty class structure")
     return ClassStructureBatch(
-        class_ids=batch.class_ids.detach().clone(),
-        sample_counts=batch.sample_counts.detach().clone(),
-        identity=batch.identity.detach().clone(),
-        variation=batch.variation.detach().clone(),
-        spectral_identity=batch.spectral_identity.detach().clone(),
-        spectral_variation=batch.spectral_variation.detach().clone(),
+        class_ids=structure.class_ids.detach().clone(),
+        sample_counts=structure.sample_counts.detach().clone(),
+        learned_identity=structure.learned_identity.detach().clone(),
+        learned_variation=structure.learned_variation.detach().clone(),
+        physical_identity=structure.physical_identity.detach().clone(),
+        physical_variation=structure.physical_variation.detach().clone(),
     )
 
 
 def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
-    value = torch.as_tensor(labels)
-    ids = torch.as_tensor(class_ids)
-    if value.ndim != 1 or value.numel() == 0 or value.dtype != torch.long:
-        raise ValueError("labels must be non-empty rank-one torch.long")
-    if ids.ndim != 1 or ids.numel() < 1 or ids.dtype != torch.long:
-        raise ValueError("class_ids must be non-empty rank-one torch.long")
-    if value.device != ids.device:
-        raise ValueError("labels and class_ids must share device")
-    matches = value.unsqueeze(1).eq(ids.unsqueeze(0))
+    matches = labels.unsqueeze(1).eq(class_ids.unsqueeze(0))
     if not bool(matches.sum(dim=1).eq(1).all()):
-        raise ValueError("labels contain a class absent from class_ids")
+        raise ValueError("a current label is absent from current_class_ids")
     return matches.to(torch.long).argmax(dim=1)
-
-
-def _batch_coordinates(batch: Mapping[str, Any], *, expected_rows: int) -> Tensor:
-    if "coord" not in batch:
-        raise RuntimeError("incremental TRAIN batches must expose coord for phase-start reference lookup")
-    coords = torch.as_tensor(batch["coord"])
-    if coords.shape != (expected_rows, 2):
-        raise RuntimeError("coord must be [N,2] and batch-aligned")
-    if coords.dtype == torch.bool or coords.is_complex() or torch.is_floating_point(coords):
-        raise RuntimeError("coord must use an integer dtype")
-    return coords.to(dtype=torch.long, device="cpu")
-
-
-@dataclass(frozen=True)
-class CurrentTrainingState:
-    task_mapped_historical: ClassStructureBatch
-    migrated_historical: ClassStructureBatch
-    current: ClassStructureBatch
-    seen: ClassStructureBatch
-    seen_cds: ClassDiscriminativeStructureState
-    current_rows: Dict[str, Tensor]
-    transform: PhaseCoordinateTransform
-    affinity: CDSAffinityState
-    residual: CurrentClassResidual
-    alignment: PhaseAlignmentDiagnostics
 
 
 class IncrementalPhaseTrainer:
     INCREMENTAL_RESULT_FIELDS = frozenset(
         {
-            "phase", "old_class_ids", "new_class_ids", "seen_class_ids", "history",
-            "final_epoch", "cumulative_test", "old_new", "forgetting", "method_state",
-            "structure_committed", "phase_finalized",
+            "phase",
+            "old_class_ids",
+            "new_class_ids",
+            "seen_class_ids",
+            "history",
+            "final_epoch",
+            "cumulative_test",
+            "old_new",
+            "forgetting",
+            "method_state",
+            "structure_committed",
+            "phase_finalized",
         }
     )
 
-    def _require_classifier(self) -> SpectralCDSClassifier:
+    def _require_classifier(self) -> CosineClassificationHead:
         classifier = getattr(self.model, "classifier", None)
-        if not isinstance(classifier, SpectralCDSClassifier) or classifier.parameter_count <= 0:
-            raise RuntimeError("model.classifier must be the trainable cosine SpectralCDSClassifier")
+        if not isinstance(classifier, CosineClassificationHead):
+            raise RuntimeError("model.classifier must be CosineClassificationHead")
         return classifier
 
-    def _phase_classes(self, phase: int) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        old_ids = tuple(self._validated_class_ids(self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"))
-        new_ids = tuple(self._validated_class_ids(self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"))
-        seen_ids = tuple(self._validated_class_ids(self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"))
-        if not old_ids or not new_ids or set(old_ids).intersection(new_ids):
-            raise RuntimeError("incremental phase has invalid old/new class partition")
-        if seen_ids != old_ids + new_ids:
+    def _phase_classes(
+        self,
+        phase: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        old_class_ids = tuple(
+            self._validated_class_ids(
+                self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"
+            )
+        )
+        new_class_ids = tuple(
+            self._validated_class_ids(
+                self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"
+            )
+        )
+        seen_class_ids = tuple(
+            self._validated_class_ids(
+                self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"
+            )
+        )
+        if not old_class_ids or not new_class_ids:
+            raise RuntimeError("incremental phase requires old and new classes")
+        if set(old_class_ids).intersection(new_class_ids):
+            raise RuntimeError("old and new classes overlap")
+        if seen_class_ids != old_class_ids + new_class_ids:
             raise RuntimeError("seen classes must equal old classes followed by new classes")
-        if tuple(self.model.committed_class_ids) != old_ids:
-            raise RuntimeError("historical CDS does not match the old class set")
-        return old_ids, new_ids, seen_ids
+        if tuple(self.model.committed_class_ids) != old_class_ids:
+            raise RuntimeError("committed historical CDS does not match old classes")
+        return old_class_ids, new_class_ids, seen_class_ids
 
     @staticmethod
     def _assert_frozen_reference(reference_backbone: torch.nn.Module) -> None:
         reference_backbone.eval()
         if any(parameter.requires_grad for parameter in reference_backbone.parameters()):
-            raise RuntimeError("previous backbone reference must remain fully frozen")
+            raise RuntimeError("previous backbone reference must remain frozen")
         if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
             raise RuntimeError("previous backbone reference must not carry gradients")
 
     @staticmethod
+    def _assert_frozen_reference_classifier(
+        reference_classifier: CosineClassificationHead,
+    ) -> None:
+        reference_classifier.eval()
+        if any(parameter.requires_grad for parameter in reference_classifier.parameters()):
+            raise RuntimeError("previous classifier reference must remain frozen")
+        if any(parameter.grad is not None for parameter in reference_classifier.parameters()):
+            raise RuntimeError("previous classifier reference must not carry gradients")
+
+    @staticmethod
     @torch.no_grad()
-    def _assert_reference_matches_phase_start(reference_backbone: torch.nn.Module, current_backbone: torch.nn.Module) -> None:
-        left, right = reference_backbone.state_dict(), current_backbone.state_dict()
-        if tuple(left.keys()) != tuple(right.keys()):
-            raise RuntimeError("previous/current backbone schemas differ at phase start")
-        for name in left:
-            if left[name].shape != right[name].shape or left[name].dtype != right[name].dtype:
-                raise RuntimeError(f"phase-start backbone state differs at {name}")
-            if not torch.equal(left[name].detach().cpu(), right[name].detach().cpu()):
-                raise RuntimeError(f"previous backbone is not the finalized phase-start state ({name})")
+    def _assert_reference_matches_phase_start(
+        reference: torch.nn.Module,
+        current: torch.nn.Module,
+        *,
+        name: str,
+    ) -> None:
+        ref_state = reference.state_dict()
+        cur_state = current.state_dict()
+        if tuple(ref_state.keys()) != tuple(cur_state.keys()):
+            raise RuntimeError(f"previous/current {name} schemas differ at phase start")
+        for key in ref_state:
+            if not torch.equal(ref_state[key].detach().cpu(), cur_state[key].detach().cpu()):
+                raise RuntimeError(
+                    f"previous {name} does not match finalized phase-start state at {key}"
+                )
 
     @torch.no_grad()
-    def _current_class_weights(self, loader: Any, *, new_ids: tuple[int, ...]) -> tuple[Tensor, int]:
-        counts = {class_id: 0 for class_id in new_ids}
+    def _current_class_weights(
+        self,
+        loader: Any,
+        *,
+        new_class_ids: tuple[int, ...],
+    ) -> tuple[Tensor, int]:
+        counts = {class_id: 0 for class_id in new_class_ids}
         total = 0
-        valid = set(new_ids)
+        valid = set(new_class_ids)
         for batch in loader:
             _, _, labels = self.unpack_batch(batch)
-            observed = set(int(v) for v in labels.unique().detach().cpu().tolist())
+            observed = set(int(value) for value in labels.unique().detach().cpu().tolist())
             outside = observed - valid
             if outside:
-                raise RuntimeError(f"incremental TRAIN loader contains non-current classes {sorted(outside)}")
-            for class_id in new_ids:
+                raise RuntimeError(
+                    f"incremental TRAIN loader contains non-current classes {sorted(outside)}"
+                )
+            for class_id in new_class_ids:
                 count = int(labels.eq(class_id).sum().item())
                 counts[class_id] += count
                 total += count
-        if total <= 0 or any(counts[c] <= 0 for c in new_ids):
+        if total <= 0 or any(counts[class_id] <= 0 for class_id in new_class_ids):
             raise RuntimeError("incremental TRAIN split is empty or misses a current class")
-        class_count = len(new_ids)
+        class_count = len(new_class_ids)
         weights = torch.tensor(
-            [total / float(class_count * counts[c]) for c in new_ids],
+            [total / float(class_count * counts[class_id]) for class_id in new_class_ids],
             device=self.device,
             dtype=self.model.dtype,
         )
         return weights, total
 
     @staticmethod
-    def _row_lookup(reference_coords: Tensor) -> dict[tuple[int, int], int]:
-        if reference_coords.ndim != 2 or reference_coords.size(1) != 2:
-            raise ValueError("reference_coords must be [N,2]")
-        lookup: dict[tuple[int, int], int] = {}
-        for row, pair in enumerate(reference_coords.detach().cpu().tolist()):
-            key = (int(pair[0]), int(pair[1]))
-            if key in lookup:
-                raise RuntimeError(f"duplicate current TRAIN coordinate {key}")
-            lookup[key] = row
-        return lookup
+    def _max_parameter_change(before: Tensor, after: Tensor) -> float:
+        if before.shape != after.shape:
+            raise ValueError("parameter snapshots have different shapes")
+        if before.numel() == 0:
+            return 0.0
+        return float((after - before).abs().max().item())
 
     @staticmethod
-    def _cached_rows_for_batch(batch_coords: Tensor, *, lookup: dict[tuple[int, int], int], cached: Tensor) -> Tensor:
-        rows: list[int] = []
-        for pair in batch_coords.tolist():
-            key = (int(pair[0]), int(pair[1]))
-            if key not in lookup:
-                raise RuntimeError(f"current TRAIN batch coordinate {key} is absent from phase-start cache")
-            rows.append(lookup[key])
-        return cached.index_select(0, torch.tensor(rows, device=cached.device, dtype=torch.long))
+    def _assert_future_rows_unchanged(
+        classifier: CosineClassificationHead,
+        future_class_tensor: Tensor,
+        future_weight_before: Tensor | None,
+    ) -> None:
+        if future_weight_before is None or future_class_tensor.numel() == 0:
+            return
+        current = classifier.class_weight(future_class_tensor).detach()
+        if not torch.equal(current, future_weight_before):
+            raise RuntimeError("future classifier rows changed before their phase")
 
     @staticmethod
-    def _mean_sample_rms(features: Tensor) -> Tensor:
-        value = torch.as_tensor(features)
-        if value.ndim != 3 or value.size(0) == 0:
-            raise ValueError("features must be non-empty [N,K,D]")
-        return value.square().mean(dim=(1, 2)).sqrt().mean()
-
-    @torch.no_grad()
-    def _refresh_training_state(
-        self,
-        *,
-        train_eval_loader: Any,
-        phase_start_historical: ClassStructureBatch,
-        current_reference: ClassStructureBatch,
-        phase_affinity: CDSAffinityState,
-        reference_q_full: Tensor,
-        reference_labels: Tensor,
-        reference_spectra: Tensor,
-        reference_coords: Tensor,
-        current_physical: PhysicalSpectralStructureBatch,
-        new_ids: tuple[int, ...],
-        seen_ids: tuple[int, ...],
-    ) -> CurrentTrainingState:
-        current_rows = self.collect_ordered_features(train_eval_loader, require_coordinates=True)
-        if not torch.equal(current_rows["labels"], reference_labels):
-            raise RuntimeError("current TRAIN labels/order changed within phase")
-        if not torch.equal(current_rows["coords"], reference_coords):
-            raise RuntimeError("current TRAIN coordinates/order changed within phase")
-        if not torch.equal(current_rows["raw_center_spectra"], reference_spectra):
-            raise RuntimeError("current TRAIN spectra/order changed within phase")
-
-        current_structure = self.model.estimate_class_structure(
-            current_rows["ordered_features"],
-            None,
-            current_rows["labels"],
-            class_ids=new_ids,
-            physical_structure=current_physical,
-        )
-        task_mapped_old, migrated_old, transform, affinity, residual, alignment = align_historical_structure(
-            historical=phase_start_historical,
-            current_reference=current_reference,
-            current_structure=current_structure,
-            reference_features=reference_q_full,
-            current_features=current_rows["ordered_features"],
-            affinity=phase_affinity,
-        )
-        seen_structure = merge_class_structure_batches((migrated_old, current_structure))
-        actual = tuple(int(v) for v in seen_structure.class_ids.detach().cpu().tolist())
-        if actual != seen_ids:
-            raise RuntimeError("all-seen CDS class order changed")
-        seen_cds = self.model.build_class_discriminative_structure(seen_structure)
-        return CurrentTrainingState(
-            task_mapped_historical=task_mapped_old,
-            migrated_historical=migrated_old,
-            current=current_structure,
-            seen=seen_structure,
-            seen_cds=seen_cds,
-            current_rows=current_rows,
-            transform=transform,
-            affinity=affinity,
-            residual=residual,
-            alignment=alignment,
-        )
+    def _row_grad_max(gradient: Tensor | None, class_ids: Tensor) -> float:
+        if gradient is None or class_ids.numel() == 0:
+            return 0.0
+        rows = gradient.index_select(0, class_ids)
+        return float(rows.abs().max().detach().item()) if rows.numel() else 0.0
 
     def train_incremental_phase(
         self,
@@ -302,520 +241,971 @@ class IncrementalPhaseTrainer:
         batch_size: int,
         lr: float,
         reference_backbone: torch.nn.Module,
+        reference_classifier: CosineClassificationHead,
     ) -> Dict[str, Any]:
         phase_id = _positive_int(phase, name="phase")
         epoch_count = _positive_int(epochs, name="epochs")
         train_batch_size = _positive_int(batch_size, name="batch_size")
-        backbone_learning_rate = _finite_positive("lr_inc", lr)
-        classifier_learning_rate = _finite_positive("lr", self.cfg("lr", backbone_learning_rate))
-        eval_batch_size = _positive_int(self.cfg("eval_batch_size", 256), name="eval_batch_size")
-        gradient_clip = _finite_nonnegative("gradient_clip", self.cfg("gradient_clip", 0.0))
-        weight_decay = _finite_nonnegative("weight_decay", self.cfg("weight_decay", 1e-4))
-
+        learning_rate = _finite_positive("lr_inc", lr)
+        eval_batch_size = _positive_int(
+            self.cfg("eval_batch_size", 256), name="eval_batch_size"
+        )
+        weight_decay = _finite_nonnegative(
+            "weight_decay", self.cfg("weight_decay", 1e-4)
+        )
+        gradient_clip = _finite_nonnegative(
+            "gradient_clip", self.cfg("gradient_clip", 0.0)
+        )
+        contrastive_weight = _finite_nonnegative(
+            "contrastive_weight", self.cfg("contrastive_weight", 1.0)
+        )
+        kd_logit_weight = _finite_nonnegative(
+            "kd_logit_weight", self.cfg("kd_logit_weight", 1.0)
+        )
+        kd_temperature = _finite_positive(
+            "kd_temperature", self.cfg("kd_temperature", 2.0)
+        )
+        cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
+        admission_max_iter = _positive_int(
+            self.cfg("admission_max_iter", 80), name="admission_max_iter"
+        )
+        
         self.model.validate_finalized_state()
         classifier = self._require_classifier()
         self._assert_frozen_reference(reference_backbone)
-        self._assert_reference_matches_phase_start(reference_backbone, self.model.backbone)
+        self._assert_frozen_reference_classifier(reference_classifier)
+        self._assert_reference_matches_phase_start(
+            reference_backbone, self.model.backbone, name="backbone"
+        )
+        self._assert_reference_matches_phase_start(
+            reference_classifier, classifier, name="classifier"
+        )
 
         previous_phase = phase_id - 1
-        previous_seen = tuple(self._validated_class_ids(self.dataset.get_seen_classes(previous_phase), name="previous_seen_classes"))
-        old_reporting_loader = self.dataset.get_reporting_dataloader(previous_phase, batch_size=eval_batch_size)
-        old_before = self.evaluate_loader(old_reporting_loader, class_ids=previous_seen, target_class_ids=previous_seen)
+        previous_seen_class_ids = tuple(
+            self._validated_class_ids(
+                self.dataset.get_seen_classes(previous_phase),
+                name="previous_seen_classes",
+            )
+        )
+        old_reporting_loader = self.dataset.get_reporting_dataloader(
+            previous_phase, batch_size=eval_batch_size
+        )
+        old_before = self.evaluate_loader(
+            old_reporting_loader,
+            class_ids=previous_seen_class_ids,
+            target_class_ids=previous_seen_class_ids,
+        )
 
         self.dataset.start_phase(phase_id)
-        old_ids, new_ids, seen_ids = self._phase_classes(phase_id)
-        old_ids_tensor = torch.tensor(old_ids, device=self.device, dtype=torch.long)
-        new_ids_tensor = torch.tensor(new_ids, device=self.device, dtype=torch.long)
-        seen_ids_tensor = torch.tensor(seen_ids, device=self.device, dtype=torch.long)
-        phase_start_historical = _clone_structure(self.model.structure_bank.class_structures(old_ids))
+        old_class_ids, new_class_ids, seen_class_ids = self._phase_classes(phase_id)
+        old_class_tensor = torch.tensor(old_class_ids, device=self.device, dtype=torch.long)
+        new_class_tensor = torch.tensor(new_class_ids, device=self.device, dtype=torch.long)
+        seen_class_tensor = torch.tensor(seen_class_ids, device=self.device, dtype=torch.long)
+
+        historical_structure = _clone_structure(
+            self.model.structure_bank.class_structures(old_class_ids)
+        )
+        reference_historical_cds = self.model.structure_bank.build_cds(historical_structure)
 
         self.model.set_incremental_trainability()
-        backbone_trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
-        backbone_frozen = [p for p in self.model.backbone.parameters() if not p.requires_grad]
-        if not backbone_trainable:
+        backbone_parameters = [
+            parameter
+            for parameter in self.model.backbone.parameters()
+            if parameter.requires_grad
+        ]
+        if not backbone_parameters:
             raise RuntimeError("incremental backbone has no trainable parameters")
 
         train_eval_loader = self.dataset.get_phase_dataloader(
             phase_id, split="train", batch_size=eval_batch_size, shuffle=False
         )
-        class_weights, expected_samples = self._current_class_weights(train_eval_loader, new_ids=new_ids)
-
-        reference_train = self.collect_ordered_features(
-            train_eval_loader, backbone=reference_backbone, require_coordinates=True
+        current_class_weights, expected_samples = self._current_class_weights(
+            train_eval_loader, new_class_ids=new_class_ids
         )
-        reference_q_full = reference_train["ordered_features"].detach()
+        reference_train = self.collect_ordered_features(
+            train_eval_loader, backbone=reference_backbone
+        )
+        reference_features_full = reference_train["ordered_features"].detach()
         reference_spectra = reference_train["raw_center_spectra"].detach()
         reference_labels = reference_train["labels"].detach()
-        reference_coords = reference_train["coords"]
-        observed = tuple(sorted(int(v) for v in reference_labels.unique().detach().cpu().tolist()))
-        if observed != tuple(sorted(new_ids)):
-            raise RuntimeError("incremental TRAIN rows do not match current phase classes")
-        current_physical = self.model.estimate_physical_class_structure(
-            reference_spectra, reference_labels, class_ids=new_ids
+        observed_new = tuple(
+            sorted(int(value) for value in reference_labels.unique().detach().cpu().tolist())
         )
-        cache_lookup = self._row_lookup(reference_coords)
-        reference_q_rms = self._mean_sample_rms(reference_q_full).detach()
+        if observed_new != tuple(sorted(new_class_ids)):
+            raise RuntimeError("incremental TRAIN rows do not match current phase classes")
 
-        # The previous tested old rows are a frozen reference for HDC only. They
-        # are NOT frozen in the deployed classifier: historical full-CDS
-        # supervision is now the only path allowed to move old rows.
-        historical_classifier_rows = classifier.class_weight(old_ids_tensor).detach().clone()
-
-        phase_start_current = self.model.estimate_class_structure(
-            reference_q_full,
+        current_physical_structure = self.model.estimate_physical_class_structure(
+            reference_spectra, reference_labels, class_ids=new_class_ids
+        )
+        current_reference_structure = self.model.estimate_class_structure(
+            reference_features_full,
             None,
             reference_labels,
-            class_ids=new_ids,
-            physical_structure=current_physical,
+            class_ids=new_class_ids,
+            physical_structure=current_physical_structure,
         )
-        phase_start_seen = merge_class_structure_batches((phase_start_historical, phase_start_current))
-        phase_affinity = derive_cds_affinity(
-            historical=phase_start_historical,
-            current_reference=phase_start_current,
+        phase_start_seen_structure = merge_class_structure_batches(
+            (historical_structure, current_reference_structure)
         )
-
-        # Do NOT imprint new classifier rows from current I_Q.  Future rows were
-        # allocated with the cosine head at model construction and remain untouched
-        # during previous phases (masked gradient + zero classifier weight decay).
-        # Keeping that neutral initialization matches incremental cosine-head
-        # practice: old rows retain their tested state, while new rows acquire
-        # class semantics only through real-current all-seen CE plus CDS protection.
-        # Imprinting from I_Q creates cross-phase decisions before any optimization
-        # and can immediately make new rows win on historical samples.
-        phase_start_new_rows = classifier.class_weight(new_ids_tensor).detach().clone()
-        if not torch.equal(classifier.class_weight(old_ids_tensor), historical_classifier_rows):
-            raise RuntimeError("phase-start setup changed historical classifier rows")
-        if not torch.equal(classifier.class_weight(new_ids_tensor), phase_start_new_rows):
-            raise RuntimeError("phase-start setup changed neutral current classifier rows")
-
-        phase_start_old_all_seen = self.evaluate_loader(
-            old_reporting_loader,
-            class_ids=seen_ids,
-            target_class_ids=old_ids,
-            structures=phase_start_seen,
+        phase_start_seen_cds = self.model.structure_bank.build_cds(
+            phase_start_seen_structure
         )
 
-        print(
-            f"[Phase {phase_id} start] PhaseStartOldBA={100*float(old_before['balanced_accuracy']):.2f}% "
-            f"OldAllSeen={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% | "
-            f"Old={list(old_ids)} New={list(new_ids)} Seen={list(seen_ids)}",
-            file=sys.stdout,
+        # Snapshot ownership before incoming-row admission.
+        old_weight_before = classifier.class_weight(old_class_tensor).detach().clone()
+        new_weight_random_before = classifier.class_weight(new_class_tensor).detach().clone()
+        seen_set = set(seen_class_ids)
+        future_class_ids = tuple(
+            class_id
+            for class_id in range(classifier.total_class_count)
+            if class_id not in seen_set
+        )
+        future_class_tensor = torch.tensor(
+            future_class_ids, device=self.device, dtype=torch.long
+        )
+        future_weight_before = (
+            classifier.class_weight(future_class_tensor).detach().clone()
+            if future_class_ids
+            else None
         )
 
-        backbone_optimizer = torch.optim.AdamW(
-            [{"params": backbone_trainable, "weight_decay": weight_decay}],
-            lr=backbone_learning_rate,
+        # Whole-CDS phase-start reconstruction. I_Q provides only the initial
+        # direction. Before joint SGD, incoming rows are optimized from complete
+        # old+new {I_Q,V_Q,I_P,V_P} together with real current TRAIN Q in the
+        # frozen previous coordinate. Only incoming rows may move; historical and
+        # future classifier rows remain bitwise fixed. Robust clearance is reported
+        # as a diagnostic rather than used as an impossible hard feasibility gate.
+        admission_sample_weights = current_class_weights.index_select(
+            0, _targets_local(reference_labels, new_class_tensor)
         )
-        classifier_optimizer = torch.optim.AdamW(
-            list(classifier.parameters()), lr=classifier_learning_rate, weight_decay=0.0
+        admission = reconstruct_incoming_classifier_rows_from_whole_cds(
+            classifier=classifier,
+            seen_cds=phase_start_seen_cds,
+            historical_class_count=len(old_class_ids),
+            current_features=reference_features_full,
+            current_labels=reference_labels,
+            current_sample_weights=admission_sample_weights,
+            max_iter=admission_max_iter,
         )
-        backbone_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            backbone_optimizer, T_max=epoch_count, eta_min=0.0
+        phase_start_new_weight = classifier.class_weight(new_class_tensor).detach().clone()
+        if not torch.equal(classifier.class_weight(old_class_tensor).detach(), old_weight_before):
+            raise RuntimeError("Whole-CDS admission changed a historical classifier row")
+        self._assert_future_rows_unchanged(
+            classifier, future_class_tensor, future_weight_before
         )
-        classifier_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            classifier_optimizer, T_max=epoch_count, eta_min=0.0
-        )
+
+        scale_requires_grad = bool(classifier.logit_scale_parameter.requires_grad)
+        classifier.logit_scale_parameter.requires_grad_(False)
+        classifier.logit_scale_parameter.grad = None
+        classifier.weight.requires_grad_(True)
+        phase_start_scale = float(classifier.logit_scale.detach().item())
 
         train_loader = self.dataset.get_phase_dataloader(
             phase_id, split="train", batch_size=train_batch_size, shuffle=True
         )
         val_loader = (
-            self.dataset.get_phase_dataloader(phase_id, split="val", batch_size=eval_batch_size, shuffle=False)
-            if self.dataset.validation_enabled else None
+            self.dataset.get_phase_dataloader(
+                phase_id, split="val", batch_size=eval_batch_size, shuffle=False
+            )
+            if self.dataset.validation_enabled
+            else None
+        )
+
+        phase_start_new_only = self.evaluate_loader(
+            train_eval_loader, class_ids=new_class_ids, target_class_ids=new_class_ids
+        )
+        phase_start_new_all_seen = self.evaluate_loader(
+            train_eval_loader, class_ids=seen_class_ids, target_class_ids=new_class_ids
+        )
+        phase_start_old_all_seen = self.evaluate_loader(
+            old_reporting_loader, class_ids=seen_class_ids, target_class_ids=old_class_ids
+        )
+        print(
+            f"[Phase {phase_id} start] "
+            f"OldBA(previous-only)={100*float(old_before['balanced_accuracy']):.2f}% "
+            f"OldBA(all-seen)={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% "
+            f"NewBA(new-only)={100*float(phase_start_new_only['balanced_accuracy']):.2f}% "
+            f"NewBA(all-seen)={100*float(phase_start_new_all_seen['balanced_accuracy']):.2f}% | "
+            f"SeedClear={float(admission.initial_joint_clearance_min.item()):.4f} "
+            f"AdmitClear={float(admission.final_joint_clearance_min.item()):.4f} "
+            f"Unsafe={100*float(admission.unsafe_pair_fraction_before.item()):.1f}%->"
+            f"{100*float(admission.unsafe_pair_fraction_after.item()):.1f}% "
+            f"AdmitCDS={float(admission.initial_reconstruction_loss.item()):.4f}->"
+            f"{float(admission.final_reconstruction_loss.item()):.4f} "
+            f"AdmitCE={float(admission.initial_current_ce_loss.item()):.4f}->"
+            f"{float(admission.final_current_ce_loss.item()):.4f} "
+            f"AdmitIter={int(admission.optimization_iterations)}",
+            file=sys.stdout,
+        )
+
+        @torch.no_grad()
+        def refresh_joint_structure():
+            self.model.eval()
+            rows = self.collect_ordered_features(train_eval_loader)
+            if not torch.equal(rows["labels"], reference_labels):
+                raise RuntimeError("current TRAIN label order changed during CDS refresh")
+            if not torch.equal(rows["raw_center_spectra"], reference_spectra):
+                raise RuntimeError("current TRAIN spectra changed during CDS refresh")
+            current_features_full = rows["ordered_features"].detach()
+            current_structure = self.model.estimate_class_structure(
+                current_features_full,
+                None,
+                reference_labels,
+                class_ids=new_class_ids,
+                physical_structure=current_physical_structure,
+            )
+            corrected_historical, transform, alignment = correct_historical_structure(
+                historical_structure=historical_structure,
+                current_reference_structure=current_reference_structure,
+                current_structure=current_structure,
+                reference_features=reference_features_full,
+                current_features=current_features_full,
+            )
+            if not torch.equal(
+                corrected_historical.physical_identity,
+                historical_structure.physical_identity,
+            ):
+                raise RuntimeError("historical I_P changed during semantic correction")
+            if not torch.equal(
+                corrected_historical.physical_variation,
+                historical_structure.physical_variation,
+            ):
+                raise RuntimeError("historical V_P changed during semantic correction")
+            merged = merge_class_structure_batches(
+                (corrected_historical, current_structure)
+            )
+            merged_ids = tuple(
+                int(value) for value in merged.class_ids.detach().cpu().tolist()
+            )
+            if merged_ids != seen_class_ids:
+                raise RuntimeError("CDS refresh produced incorrect seen-class order")
+            seen_cds = self.model.structure_bank.build_cds(merged)
+            return (
+                current_features_full,
+                corrected_historical,
+                current_structure,
+                merged,
+                seen_cds,
+                transform,
+                alignment,
+            )
+
+        # One optimizer, one scheduler, one phase loop.  Classifier weight decay is
+        # zero so masked old/future rows are not silently changed by AdamW decay.
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": backbone_parameters, "weight_decay": weight_decay},
+                {"params": [classifier.weight], "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epoch_count, eta_min=0.0
+        )
+        regulator = HSICDSDecisionRegionRegulator().to(self.device)
+
+        joint_state = refresh_joint_structure()
+        pre_structural = regulator(
+            classifier=classifier,
+            seen_cds=joint_state[4],
+            historical_class_count=len(old_class_ids),
+            reference_classifier=reference_classifier,
+            reference_historical_cds=reference_historical_cds,
         )
 
         history: list[dict[str, Any]] = []
+        gradient_contract_checked = False
         progress = tqdm(
             range(epoch_count),
-            desc=f"Phase {phase_id} full-CDS historical supervision",
+            desc=f"Phase {phase_id} joint CDS-cosine training",
             unit="epoch",
             dynamic_ncols=True,
             file=sys.stdout,
         )
 
-        final_working: CurrentTrainingState | None = None
         for epoch in progress:
-            self.model.eval()
-            working = self._refresh_training_state(
-                train_eval_loader=train_eval_loader,
-                phase_start_historical=phase_start_historical,
-                current_reference=phase_start_current,
-                phase_affinity=phase_affinity,
-                reference_q_full=reference_q_full,
-                reference_labels=reference_labels,
-                reference_spectra=reference_spectra,
-                reference_coords=reference_coords,
-                current_physical=current_physical,
-                new_ids=new_ids,
-                seen_ids=seen_ids,
-            )
+            (
+                _epoch_features,
+                epoch_historical_structure,
+                _epoch_current_structure,
+                _epoch_merged,
+                epoch_seen_cds,
+                _epoch_transform,
+                _epoch_alignment,
+            ) = joint_state
 
             self.model.train()
-            epoch_lr = float(backbone_optimizer.param_groups[0]["lr"])
-            epoch_head_lr = float(classifier_optimizer.param_groups[0]["lr"])
-            classification_sum = hdc_sum = hdc_rmse_sum = 0.0
-            contrastive_sum = contrastive_gap_sum = contrastive_anchor_fraction_sum = 0.0
-            separation_sum = separation_margin_sum = 0.0
-            historical_sum = historical_ce_sum = historical_anchor_ce_sum = historical_relation_sum = 0.0
-            historical_accuracy_sum = historical_anchor_accuracy_sum = historical_margin_sum = 0.0
-            historical_exposure_sum = historical_clearance_sum = 0.0
-            historical_pair_weight_sum = historical_learned_risk_sum = historical_spectral_risk_sum = 0.0
-            total_sum = 0.0
-            correct = sample_count = 0
-            per_class_correct = {class_id: 0 for class_id in new_ids}
-            per_class_total = {class_id: 0 for class_id in new_ids}
+            sums = {name: 0.0 for name in (
+                "classification", "cds_classifier", "cds_classifier_old",
+                "cds_classifier_new", "contrastive", "kd",
+                "cds", "cds_separation", "intra", "inter", "physical_abs",
+                "physical_rel", "physical_joint", "separation_margin",
+                "separation_violation", "old_old", "structural", "total"
+            )}
+            sample_count = 0
+            correct_all_seen = 0
 
             for batch in train_loader:
                 patch, spectrum, labels = self.unpack_batch(batch)
-                batch_coords = _batch_coordinates(batch, expected_rows=int(labels.numel()))
-                backbone_optimizer.zero_grad(set_to_none=True)
-                classifier_optimizer.zero_grad(set_to_none=True)
+                if not bool(torch.isin(labels, new_class_tensor).all()):
+                    raise RuntimeError("incremental TRAIN batch contains an old or future class")
 
-                q = self.model.extract_features(patch, center_spectrum=spectrum, return_aux=False).ordered_features
-                reference_q = self._cached_rows_for_batch(batch_coords, lookup=cache_lookup, cached=reference_q_full)
+                optimizer.zero_grad(set_to_none=True)
+                classifier.logit_scale_parameter.grad = None
 
-                # Real current labels are allowed to move only current classifier
-                # rows. Historical rows remain active rivals but are detached here.
+                with torch.no_grad():
+                    reference_features = self.model.extract_features_with_backbone(
+                        reference_backbone,
+                        patch,
+                        center_spectrum=spectrum,
+                        return_aux=False,
+                    ).ordered_features.detach()
+                    physical_evidence = self.model.physical_spectral_evidence(spectrum).detach()
+                    teacher_old_logits = reference_classifier(
+                        reference_features,
+                        class_ids=old_class_tensor,
+                        trainable_class_ids=(),
+                    ).logits.detach()
+
+                current_features = self.model.extract_features(
+                    patch, center_spectrum=spectrum, return_aux=False
+                ).ordered_features
+                current_local = _targets_local(labels, new_class_tensor)
+                sample_weights = current_class_weights.index_select(0, current_local)
+
+                # CRITICAL ownership rule: all seen classes compete, only incoming
+                # rows receive gradient from labels that contain current classes only.
                 all_seen_output = classifier(
-                    q,
-                    class_ids=seen_ids_tensor,
-                    trainable_class_ids=new_ids_tensor,
+                    current_features,
+                    class_ids=seen_class_tensor,
+                    trainable_class_ids=new_class_tensor,
                 )
-                target_new_local = _targets_local(labels, new_ids_tensor)
-                sample_weights = class_weights.index_select(0, target_new_local)
                 classification = classification_objective(
                     logits=all_seen_output.logits,
                     class_ids=all_seen_output.class_ids,
                     labels_global=labels,
                     sample_weights=sample_weights,
                 )
-
-                hdc = historical_decision_consistency_loss(
-                    reference_features=reference_q,
-                    current_features=q,
-                    historical_classifier_rows=historical_classifier_rows,
-                    labels_global=labels,
-                    seen_cds=working.seen_cds,
-                    historical_class_count=len(old_ids),
-                )
-
-                # Same direct-Q supervised contrast used in Phase 0. Only real
-                # current samples participate. The classifier scale is detached,
-                # so this path changes Q only and introduces no second head/state.
                 contrastive = supervised_contrastive_q_loss(
-                    ordered_features=q,
+                    ordered_features=current_features,
                     labels_global=labels,
-                    logit_scale=classifier.logit_scale_value,
+                    logit_scale=classifier.logit_scale,
                     sample_weights=sample_weights,
                 )
-
-                # Feature-side new->old protection. Classifier rows and scale are
-                # detached here so this objective changes only the representation.
-                separation_cosine = classifier.cosine_similarity(
-                    q,
-                    class_ids=seen_ids_tensor,
+                student_old_logits = classifier(
+                    current_features,
+                    class_ids=old_class_tensor,
                     trainable_class_ids=(),
-                )
-                separation_logits = separation_cosine * classifier.logit_scale_value.detach().to(
-                    device=q.device, dtype=q.dtype
-                )
-                separation = hsi_cds_separation_loss(
-                    logits=separation_logits,
-                    class_ids=seen_ids_tensor,
-                    labels_global=labels,
-                    seen_cds=working.seen_cds,
-                    historical_class_count=len(old_ids),
+                ).logits
+                kd = logit_distillation_loss(
+                    student_old_logits=student_old_logits,
+                    teacher_old_logits=teacher_old_logits,
+                    temperature=kd_temperature,
                     sample_weights=sample_weights,
                 )
-
-                # Old->seen direct classifier supervision. The aligned historical
-                # I_Q provides classifier-shaped anchors, while COMPLETE intra/inter
-                # CDS {I_Q,V_Q,I_P,V_P} derives the pairwise risk that controls old
-                # vs old/new competition. This objective has no backbone path.
-                historical = historical_full_cds_supervision_loss(
-                    classifier=classifier,
-                    seen_cds=working.seen_cds,
-                    historical_class_count=len(old_ids),
-                    historical_classifier_rows=historical_classifier_rows,
+                cds = historical_cds_preservation_loss(
+                    reference_features=reference_features,
+                    current_features=current_features,
+                    physical_spectral_evidence=physical_evidence,
+                    reference_historical_structure=historical_structure,
+                    current_historical_structure=epoch_historical_structure,
                 )
+                separation = cross_phase_cds_separation_loss(
+                    current_features=current_features,
+                    labels_global=labels,
+                    physical_spectral_evidence=physical_evidence,
+                    seen_cds=epoch_seen_cds,
+                    historical_class_count=len(old_class_ids),
+                    logit_scale=classifier.logit_scale,
+                    sample_weights=sample_weights,
+                )
+                structural = regulator(
+                    classifier=classifier,
+                    seen_cds=epoch_seen_cds,
+                    historical_class_count=len(old_class_ids),
+                    reference_classifier=reference_classifier,
+                    reference_historical_cds=reference_historical_cds,
+                )
+
+                # One coherent classifier-reconstruction rule is used for every
+                # incremental phase. Real current labels use the deployed all-seen
+                # cosine head but can update incoming rows only. In parallel, the
+                # whole seen-class CDS reconstructs the same classifier with equal
+                # per-class mass: I_Q/V_Q define directed robust class support and
+                # I_P/V_P define pair relevance. Old-source CDS may update old
+                # positives and seen rivals; new-source CDS keeps old rival rows
+                # detached. No prototype-only anchor or second classifier exists.
+                if not bool(torch.isfinite(structural.loss)):
+                    raise RuntimeError("whole-CDS classifier reconstruction became NaN or Inf")
+
+                if not gradient_contract_checked:
+                    tolerance = 64.0 * torch.finfo(classifier.weight.dtype).eps
+
+                    ce_grad = torch.autograd.grad(
+                        classification.loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    ce_old = self._row_grad_max(ce_grad, old_class_tensor)
+                    ce_new = self._row_grad_max(ce_grad, new_class_tensor)
+                    ce_future = self._row_grad_max(ce_grad, future_class_tensor)
+                    if ce_old > tolerance:
+                        raise RuntimeError("new-only CE leaked gradient into historical rows")
+                    if ce_future > tolerance:
+                        raise RuntimeError("new-only CE leaked gradient into future rows")
+                    if ce_new <= tolerance:
+                        raise RuntimeError("incoming rows received no real-current CE gradient")
+
+                    old_cds_grad = torch.autograd.grad(
+                        structural.old_class_reconstruction_loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    old_cds_old = self._row_grad_max(old_cds_grad, old_class_tensor)
+                    old_cds_new = self._row_grad_max(old_cds_grad, new_class_tensor)
+                    old_cds_future = self._row_grad_max(old_cds_grad, future_class_tensor)
+                    if old_cds_old <= tolerance or old_cds_new <= tolerance:
+                        raise RuntimeError(
+                            "historical whole-CDS reconstruction must update old positives and seen rivals"
+                        )
+                    if old_cds_future > tolerance:
+                        raise RuntimeError("historical whole-CDS reconstruction leaked into future rows")
+
+                    new_cds_grad = torch.autograd.grad(
+                        structural.new_class_reconstruction_loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    new_cds_old = self._row_grad_max(new_cds_grad, old_class_tensor)
+                    new_cds_new = self._row_grad_max(new_cds_grad, new_class_tensor)
+                    new_cds_future = self._row_grad_max(new_cds_grad, future_class_tensor)
+                    if new_cds_old > tolerance:
+                        raise RuntimeError("current-class CDS leaked gradient into historical rows")
+                    if new_cds_new <= tolerance:
+                        raise RuntimeError("current-class CDS produced no incoming-row gradient")
+                    if new_cds_future > tolerance:
+                        raise RuntimeError("current-class CDS leaked into future rows")
+
+                    global_cds_grad = torch.autograd.grad(
+                        structural.global_reconstruction_loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    global_old = self._row_grad_max(global_cds_grad, old_class_tensor)
+                    global_new = self._row_grad_max(global_cds_grad, new_class_tensor)
+                    global_future = self._row_grad_max(global_cds_grad, future_class_tensor)
+                    if global_old <= tolerance or global_new <= tolerance:
+                        raise RuntimeError("global whole-CDS reconstruction must update all seen groups")
+                    if global_future > tolerance:
+                        raise RuntimeError("global whole-CDS reconstruction leaked into future rows")
+
+                    retention_grad = torch.autograd.grad(
+                        structural.old_old_retention_loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    ret_old = self._row_grad_max(retention_grad, old_class_tensor)
+                    ret_new = self._row_grad_max(retention_grad, new_class_tensor)
+                    ret_future = self._row_grad_max(retention_grad, future_class_tensor)
+                    if ret_new > tolerance or ret_future > tolerance:
+                        raise RuntimeError("old-old retention changed a non-historical row")
+
+                    separation_classifier_grad = torch.autograd.grad(
+                        separation.loss,
+                        classifier.weight,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    if separation_classifier_grad is not None and bool(
+                        torch.count_nonzero(separation_classifier_grad)
+                    ):
+                        raise RuntimeError(
+                            "feature-level CDS separation must not update classifier rows"
+                        )
+
+                    print(
+                        "[Gradient ownership] "
+                        f"NewCE old={ce_old:.3e} new={ce_new:.3e} future={ce_future:.3e} | "
+                        f"OldCDS old={old_cds_old:.3e} new={old_cds_new:.3e} | "
+                        f"NewCDS old={new_cds_old:.3e} new={new_cds_new:.3e} | "
+                        f"GlobalCDS old={global_old:.3e} new={global_new:.3e} future={global_future:.3e} | "
+                        f"Retention old={ret_old:.3e} new={ret_new:.3e} future={ret_future:.3e} | "
+                        "CDSSep classifier=0",
+                        file=sys.stdout,
+                    )
+                    gradient_contract_checked = True
 
                 loss = (
                     classification.loss
-                    + contrastive.loss
-                    + hdc.loss
-                    + separation.loss
-                    + historical.loss
+                    + contrastive_weight * contrastive.loss
+                    + kd_logit_weight * kd.loss
+                    + cds_weight * (cds.loss + separation.loss)
+                    + structural.loss
                 )
                 if not bool(torch.isfinite(loss)):
-                    raise RuntimeError(
-                        "incremental CE + direct-Q contrast + HDC + CDS separation + historical full-CDS supervision became NaN or Inf"
-                    )
+                    raise RuntimeError("joint incremental objective became NaN or Inf")
                 loss.backward()
 
-                if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
-                    raise RuntimeError("previous backbone reference accumulated gradients")
-                if any(parameter.grad is not None for parameter in backbone_frozen):
-                    raise RuntimeError("a frozen incremental backbone parameter accumulated gradients")
-                for parameter in backbone_trainable:
-                    if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-                        raise RuntimeError("incremental backbone gradient contains NaN or Inf")
-                for parameter in classifier.parameters():
-                    if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-                        raise RuntimeError("incremental classifier gradient contains NaN or Inf")
-                if gradient_clip > 0.0:
-                    torch.nn.utils.clip_grad_norm_(backbone_trainable, gradient_clip, error_if_nonfinite=True)
+                if classifier.logit_scale_parameter.grad is not None:
+                    raise RuntimeError("incremental training must not update cosine logit scale")
+                if classifier.weight.grad is None or not bool(
+                    torch.isfinite(classifier.weight.grad).all()
+                ):
+                    raise RuntimeError("joint classifier gradient is missing/non-finite")
+                if future_class_tensor.numel() and bool(
+                    torch.count_nonzero(
+                        classifier.weight.grad.index_select(0, future_class_tensor)
+                    )
+                ):
+                    raise RuntimeError("future classifier rows received gradients")
 
-                backbone_optimizer.step()
-                classifier_optimizer.step()
+                backbone_grad_seen = False
+                for parameter in backbone_parameters:
+                    if parameter.grad is None:
+                        continue
+                    if not bool(torch.isfinite(parameter.grad).all()):
+                        raise RuntimeError("incremental backbone gradient contains NaN or Inf")
+                    if bool(torch.count_nonzero(parameter.grad)):
+                        backbone_grad_seen = True
+                if not backbone_grad_seen:
+                    raise RuntimeError("joint objective produced zero backbone gradient")
+
+                if gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        backbone_parameters + [classifier.weight],
+                        gradient_clip,
+                        error_if_nonfinite=True,
+                    )
+                optimizer.step()
+                self._assert_future_rows_unchanged(
+                    classifier, future_class_tensor, future_weight_before
+                )
 
                 n = int(labels.numel())
-                classification_sum += float(classification.loss.detach().item()) * n
-                hdc_sum += float(hdc.loss.detach().item()) * n
-                hdc_rmse_sum += float(hdc.relation_rmse.detach().item()) * n
-                contrastive_sum += float(contrastive.loss.detach().item()) * n
-                contrastive_gap_sum += float(contrastive.similarity_gap.detach().item()) * n
-                contrastive_anchor_fraction_sum += float(contrastive.valid_anchor_fraction.detach().item()) * n
-                separation_sum += float(separation.loss.detach().item()) * n
-                separation_margin_sum += float(separation.margin_mean.detach().item()) * n
-                historical_sum += float(historical.loss.detach().item()) * n
-                historical_ce_sum += float(historical.positive_ce.detach().item()) * n
-                historical_anchor_ce_sum += float(historical.decision_anchor_ce.detach().item()) * n
-                historical_relation_sum += float(historical.relation_loss.detach().item()) * n
-                historical_accuracy_sum += float(historical.identity_accuracy.detach().item()) * n
-                historical_anchor_accuracy_sum += float(historical.decision_anchor_accuracy.detach().item()) * n
-                historical_margin_sum += float(historical.identity_margin_mean.detach().item()) * n
-                historical_exposure_sum += float(historical.deformation_exposure_mean.detach().item()) * n
-                historical_clearance_sum += float(historical.structural_clearance_mean.detach().item()) * n
-                historical_pair_weight_sum += float(historical.pair_weight_mean.detach().item()) * n
-                historical_learned_risk_sum += float(historical.learned_region_risk_mean.detach().item()) * n
-                historical_spectral_risk_sum += float(historical.spectral_region_risk_mean.detach().item()) * n
-                total_sum += float(loss.detach().item()) * n
-
-                prediction = all_seen_output.prediction.detach()
-                correct += int(prediction.eq(labels).sum().item())
+                sums["classification"] += float(classification.loss.detach().item()) * n
+                sums["cds_classifier"] += float(
+                    structural.global_reconstruction_loss.detach().item()
+                ) * n
+                sums["cds_classifier_old"] += float(
+                    structural.old_class_reconstruction_loss.detach().item()
+                ) * n
+                sums["cds_classifier_new"] += float(
+                    structural.new_class_reconstruction_loss.detach().item()
+                ) * n
+                sums["contrastive"] += float(contrastive.loss.detach().item()) * n
+                sums["kd"] += float(kd.loss.detach().item()) * n
+                sums["cds"] += float(cds.loss.detach().item()) * n
+                sums["cds_separation"] += float(separation.loss.detach().item()) * n
+                sums["intra"] += float(cds.intra_loss.detach().item()) * n
+                sums["inter"] += float(cds.inter_loss.detach().item()) * n
+                sums["physical_abs"] += float(
+                    cds.physical_absolute_support_mean.detach().item()
+                ) * n
+                sums["physical_rel"] += float(
+                    cds.physical_relation_support_mean.detach().item()
+                ) * n
+                sums["physical_joint"] += float(
+                    cds.physical_relevance_mean.detach().item()
+                ) * n
+                sums["separation_margin"] += float(
+                    separation.learned_support_margin_mean.detach().item()
+                ) * n
+                sums["separation_violation"] += float(
+                    separation.violation_fraction.detach().item()
+                ) * n
+                sums["structural"] += float(structural.loss.detach().item()) * n
+                sums["old_old"] += float(
+                    structural.old_old_retention_loss.detach().item()
+                ) * n
+                sums["total"] += float(loss.detach().item()) * n
+                correct_all_seen += int(all_seen_output.prediction.detach().eq(labels).sum().item())
                 sample_count += n
-                for class_id in new_ids:
-                    mask = labels.eq(class_id)
-                    count = int(mask.sum().item())
-                    per_class_total[class_id] += count
-                    if count:
-                        per_class_correct[class_id] += int(prediction[mask].eq(labels[mask]).sum().item())
 
             if sample_count != expected_samples:
-                raise RuntimeError("incremental TRAIN loader did not traverse the complete current split")
+                raise RuntimeError("incremental TRAIN loader did not traverse the complete split")
+            scheduler.step()
+            if float(classifier.logit_scale.detach().item()) != phase_start_scale:
+                raise RuntimeError("cosine logit scale changed during incremental training")
+            self._assert_future_rows_unchanged(
+                classifier, future_class_tensor, future_weight_before
+            )
 
-            backbone_scheduler.step()
-            classifier_scheduler.step()
+            # Refresh CDS coordinates for the NEXT epoch.  This performs no
+            # optimizer step and is therefore not a second training stage.
+            joint_state = refresh_joint_structure()
+            epoch_structural = regulator(
+                classifier=classifier,
+                seen_cds=joint_state[4],
+                historical_class_count=len(old_class_ids),
+                reference_classifier=reference_classifier,
+                reference_historical_cds=reference_historical_cds,
+            )
+            alignment = joint_state[6]
 
             self.model.eval()
-            eval_working = self._refresh_training_state(
-                train_eval_loader=train_eval_loader,
-                phase_start_historical=phase_start_historical,
-                current_reference=phase_start_current,
-                phase_affinity=phase_affinity,
-                reference_q_full=reference_q_full,
-                reference_labels=reference_labels,
-                reference_spectra=reference_spectra,
-                reference_coords=reference_coords,
-                current_physical=current_physical,
-                new_ids=new_ids,
-                seen_ids=seen_ids,
+            old_only = self.evaluate_loader(
+                old_reporting_loader,
+                class_ids=old_class_ids,
+                target_class_ids=old_class_ids,
             )
-            final_working = eval_working
+            old_all = self.evaluate_loader(
+                old_reporting_loader,
+                class_ids=seen_class_ids,
+                target_class_ids=old_class_ids,
+            )
+            new_only = self.evaluate_loader(
+                train_eval_loader,
+                class_ids=new_class_ids,
+                target_class_ids=new_class_ids,
+            )
+            new_all = self.evaluate_loader(
+                train_eval_loader,
+                class_ids=seen_class_ids,
+                target_class_ids=new_class_ids,
+            )
+            validation_all = (
+                None
+                if val_loader is None
+                else self.evaluate_loader(
+                    val_loader,
+                    class_ids=seen_class_ids,
+                    target_class_ids=new_class_ids,
+                )
+            )
 
-            new_train_all_seen = self.evaluate_loader(
-                train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-            )
-            new_train_only = self.evaluate_loader(
-                train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-            )
-            validation_all_seen = None if val_loader is None else self.evaluate_loader(
-                val_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-            )
-            validation_new_only = None if val_loader is None else self.evaluate_loader(
-                val_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-            )
-
-            online_per_class = {cid: per_class_correct[cid] / float(per_class_total[cid]) for cid in new_ids}
-            diag = eval_working.alignment
             record = {
+                "stage": "joint",
                 "epoch": epoch + 1,
-                "learning_rate": epoch_lr,
-                "classifier_learning_rate": epoch_head_lr,
-                "classification_loss": classification_sum / sample_count,
-                "historical_decision_consistency_loss": hdc_sum / sample_count,
-                "historical_decision_relation_rmse": hdc_rmse_sum / sample_count,
-                "contrastive_loss": contrastive_sum / sample_count,
-                "contrastive_similarity_gap": contrastive_gap_sum / sample_count,
-                "contrastive_valid_anchor_fraction": contrastive_anchor_fraction_sum / sample_count,
-                "hsi_cds_separation_loss": separation_sum / sample_count,
-                "hsi_cds_separation_margin_mean": separation_margin_sum / sample_count,
-                "historical_full_cds_loss": historical_sum / sample_count,
-                "historical_full_cds_positive_ce": historical_ce_sum / sample_count,
-                "historical_decision_anchor_ce": historical_anchor_ce_sum / sample_count,
-                "historical_full_cds_relation_loss": historical_relation_sum / sample_count,
-                "historical_identity_accuracy": historical_accuracy_sum / sample_count,
-                "historical_decision_anchor_accuracy": historical_anchor_accuracy_sum / sample_count,
-                "historical_identity_margin_mean": historical_margin_sum / sample_count,
-                "historical_deformation_exposure_mean": historical_exposure_sum / sample_count,
-                "historical_structural_clearance_mean": historical_clearance_sum / sample_count,
-                "historical_pair_weight_mean": historical_pair_weight_sum / sample_count,
-                "historical_learned_risk_mean": historical_learned_risk_sum / sample_count,
-                "historical_spectral_risk_mean": historical_spectral_risk_sum / sample_count,
-                "total_loss": total_sum / sample_count,
-                "new_train_oa_online": correct / float(sample_count),
-                "new_train_ba_online": sum(online_per_class.values()) / float(len(online_per_class)),
-                "new_train_min_online": min(online_per_class.values()),
-                "new_train_ba_all_seen": float(new_train_all_seen["balanced_accuracy"]),
-                "new_train_ba_new_only": float(new_train_only["balanced_accuracy"]),
-                "validation_new_ba_all_seen": None if validation_all_seen is None else float(validation_all_seen["balanced_accuracy"]),
-                "validation_new_ba_new_only": None if validation_new_only is None else float(validation_new_only["balanced_accuracy"]),
-                "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-                "feature_drift_rms": float(diag.representation_drift_rms.item()),
-                "reference_q_rms": float(reference_q_rms.item()),
-                "current_q_rms": float(self._mean_sample_rms(eval_working.current_rows["ordered_features"]).item()),
-                "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "classification_loss": sums["classification"] / sample_count,
+                "whole_cds_classifier_loss": sums["cds_classifier"] / sample_count,
+                "old_cds_classifier_loss": sums["cds_classifier_old"] / sample_count,
+                "new_cds_classifier_loss": sums["cds_classifier_new"] / sample_count,
+                "current_all_seen_accuracy": correct_all_seen / float(sample_count),
+                "contrastive_loss": sums["contrastive"] / sample_count,
+                "kd_logit_loss": sums["kd"] / sample_count,
+                "cds_preservation_loss": sums["cds"] / sample_count,
+                "cds_separation_loss": sums["cds_separation"] / sample_count,
+                "cds_separation_margin": sums["separation_margin"] / sample_count,
+                "cds_separation_violation_fraction": sums["separation_violation"] / sample_count,
+                "cds_intra_loss": sums["intra"] / sample_count,
+                "cds_inter_loss": sums["inter"] / sample_count,
+                "physical_absolute_support_mean": sums["physical_abs"] / sample_count,
+                "physical_relation_support_mean": sums["physical_rel"] / sample_count,
+                "physical_relevance_mean": sums["physical_joint"] / sample_count,
+                "structural_loss": sums["structural"] / sample_count,
+                "old_old_retention_loss": sums["old_old"] / sample_count,
+                "total_loss": sums["total"] / sample_count,
+                "old_only_ba": float(old_only["balanced_accuracy"]),
+                "old_all_seen_ba": float(old_all["balanced_accuracy"]),
+                "new_only_ba": float(new_only["balanced_accuracy"]),
+                "new_all_seen_ba": float(new_all["balanced_accuracy"]),
+                "validation_new_all_seen_ba": None
+                if validation_all is None
+                else float(validation_all["balanced_accuracy"]),
+                "old_new_violation_fraction": float(
+                    epoch_structural.old_new_violation_fraction.detach().item()
+                ),
+                "old_old_violation_fraction": float(
+                    epoch_structural.historical_internal_violation_fraction.detach().item()
+                ),
+                "joint_clearance_mean": float(
+                    epoch_structural.joint_structural_clearance_mean.detach().item()
+                ),
+                "joint_clearance_min": float(
+                    epoch_structural.joint_structural_clearance_min.detach().item()
+                ),
+                "epoch_mapping_error": float(alignment.mapping_error.item()),
+                "epoch_representation_drift_rms": float(
+                    alignment.representation_drift_rms.item()
+                ),
             }
             history.append(record)
-
-            message = (
-                f"[Epoch {epoch + 1:03d}/{epoch_count:03d}] "
-                f"CE={record['classification_loss']:.4f} "
-                f"Con={record['contrastive_loss']:.4f} ConGap={record['contrastive_similarity_gap']:.4f} "
-                f"HDC={record['historical_decision_consistency_loss']:.4f} "
-                f"Sep={record['hsi_cds_separation_loss']:.4f} HistCDS={record['historical_full_cds_loss']:.4f} "
-                f"HistAcc={100*record['historical_identity_accuracy']:.2f}% "
-                f"AnchorAcc={100*record['historical_decision_anchor_accuracy']:.2f}% "
-                f"HistClr={record['historical_structural_clearance_mean']:.4f} "
-                f"LR={record['learning_rate']:.2e} HeadLR={record['classifier_learning_rate']:.2e} | "
-                f"NewOnlyBA={100*record['new_train_ba_new_only']:.2f}% "
-                f"AllSeenBA={100*record['new_train_ba_all_seen']:.2f}% "
-                f"MapErr={record['semantic_shift_mapping_error']:.4f}"
+            tqdm.write(
+                f"[Joint {epoch + 1:03d}/{epoch_count:03d}] "
+                f"CEnew-all={record['classification_loss']:.4f} "
+                f"CDSCls={record['whole_cds_classifier_loss']:.4f}"
+                f"[Old={record['old_cds_classifier_loss']:.4f},"
+                f"New={record['new_cds_classifier_loss']:.4f}] "
+                f"Con={record['contrastive_loss']:.4f} "
+                f"KD={record['kd_logit_loss']:.4f} "
+                f"CDS={record['cds_preservation_loss']:.4f} "
+                f"Sep={record['cds_separation_loss']:.4f}"
+                f"[I={record['cds_intra_loss']:.4f},R={record['cds_inter_loss']:.4f}] "
+                f" SepMargin={record['cds_separation_margin']:.4f} "
+                f"SepViol={100*record['cds_separation_violation_fraction']:.1f}% "
+                f"Struct={record['structural_loss']:.4f}"
+                f"[Ret={record['old_old_retention_loss']:.4f}] | "
+                f"OldOnly/All={100*record['old_only_ba']:.2f}%/"
+                f"{100*record['old_all_seen_ba']:.2f}% "
+                f"NewOnly/All={100*record['new_only_ba']:.2f}%/"
+                f"{100*record['new_all_seen_ba']:.2f}% "
+                f"OldNewViol={100*record['old_new_violation_fraction']:.1f}% "
+                f"OldOldViol={100*record['old_old_violation_fraction']:.1f}%",
+                file=sys.stdout,
             )
-            if validation_all_seen is not None:
-                message += (
-                    f" | ValNewOnlyBA={100*record['validation_new_ba_new_only']:.2f}%"
-                    f" ValAllSeenBA={100*record['validation_new_ba_all_seen']:.2f}%"
-                )
-            tqdm.write(message, file=sys.stdout)
 
         progress.close()
-        if final_working is None:
-            raise RuntimeError("incremental phase produced no working CDS")
+        if not history:
+            raise RuntimeError("joint incremental training produced no epochs")
 
         self.model.eval()
-        final_state = self._refresh_training_state(
-            train_eval_loader=train_eval_loader,
-            phase_start_historical=phase_start_historical,
-            current_reference=phase_start_current,
-            phase_affinity=phase_affinity,
-            reference_q_full=reference_q_full,
-            reference_labels=reference_labels,
-            reference_spectra=reference_spectra,
-            reference_coords=reference_coords,
-            current_physical=current_physical,
-            new_ids=new_ids,
-            seen_ids=seen_ids,
+        (
+            _final_features,
+            final_historical_structure,
+            final_current_structure,
+            committed_structure,
+            final_seen_cds,
+            _final_transform,
+            final_alignment,
+        ) = joint_state
+        final_structural = regulator(
+            classifier=classifier,
+            seen_cds=final_seen_cds,
+            historical_class_count=len(old_class_ids),
+            reference_classifier=reference_classifier,
+            reference_historical_cds=reference_historical_cds,
         )
 
-        final_old_only = self.evaluate_loader(
-            old_reporting_loader, class_ids=old_ids, target_class_ids=old_ids, structures=final_state.migrated_historical
-        )
-        final_old_all_seen = self.evaluate_loader(
-            old_reporting_loader, class_ids=seen_ids, target_class_ids=old_ids, structures=final_state.seen
-        )
-        final_new_all_seen = self.evaluate_loader(
-            train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=final_state.seen
-        )
-        final_new_only = self.evaluate_loader(
-            train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=final_state.current
-        )
-
-        with torch.no_grad():
-            final_historical_objective = historical_full_cds_supervision_loss(
-                classifier=classifier,
-                seen_cds=final_state.seen_cds,
-                historical_class_count=len(old_ids),
-                historical_classifier_rows=historical_classifier_rows,
-            )
-
-        self.model.replace_class_structure(final_state.seen)
+        # Commit only corrected/real CDS.  The cosine classifier is already the
+        # same classifier optimized during the one joint stage; no reset follows.
+        self.model.replace_class_structure(committed_structure)
         self.model.validate_finalized_state()
         self.dataset.finalize_phase(phase_id)
+        classifier.logit_scale_parameter.requires_grad_(scale_requires_grad)
+        classifier.logit_scale_parameter.grad = None
 
-        cumulative_loader = self.dataset.get_reporting_dataloader(phase_id, batch_size=eval_batch_size)
-        cumulative = self.evaluate_loader(cumulative_loader, class_ids=seen_ids, target_class_ids=seen_ids)
-        groups = old_new_summary(cumulative, old_class_ids=old_ids, new_class_ids=new_ids)
-        forgetting = float(old_before["balanced_accuracy"]) - float(groups["old"]["balanced_accuracy"])
+        cumulative_loader = self.dataset.get_reporting_dataloader(
+            phase_id, batch_size=eval_batch_size
+        )
+        cumulative = self.evaluate_loader(
+            cumulative_loader,
+            class_ids=seen_class_ids,
+            target_class_ids=seen_class_ids,
+        )
+        groups = old_new_summary(
+            cumulative, old_class_ids=old_class_ids, new_class_ids=new_class_ids
+        )
+        forgetting = float(old_before["balanced_accuracy"]) - float(
+            groups["old"]["balanced_accuracy"]
+        )
         phase_origin = phase_origin_confusion_diagnostics(
             cumulative,
-            phase_to_classes={index: self.dataset.phase_to_classes[index] for index in range(phase_id + 1)},
+            phase_to_classes={
+                index: self.dataset.phase_to_classes[index]
+                for index in range(phase_id + 1)
+            },
         )
 
-        diag = final_state.alignment
+        final_record = history[-1]
+        final_old_weight = classifier.class_weight(old_class_tensor).detach()
+        final_new_weight = classifier.class_weight(new_class_tensor).detach()
         method_state = {
-            "classifier": "single_bias_free_scaled_cosine_head",
-            "new_classifier_row_initialization": "neutral_preallocated_cosine_rows; no_I_Q_imprinting",
-            "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}; all inter-class CDS is derived on demand",
-            "historical_supervision": "aligned_old_I_Q_plus_phase_start_classifier_decision_anchors_plus_V_Q_region_clearance_over_all_seen_boundaries_with_I_P_V_P_risk_priority",
-            "historical_cds_information": "intra={I_Q,V_Q,I_P,V_P}; inter={R_IQ,R_VQ,R_IP,R_VP}; physical_spectral_information_is_active_in_classifier_risk",
-            "representation_objective": "real_current_CE_plus_same_direct_Q_supervised_contrast_as_base_plus_HDC_plus_HSI_CDS_separation",
-            "stores_pseudo_features": False,
-            "reconstructs_historical_features": False,
-            "uses_input_inversion": False,
-            "uses_stage_B": False,
-            "uses_covariance_classifier": False,
-            "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-            "semantic_shift_channel_error_max": float(diag.task_mapping_channel_error_max.item()),
-            "feature_drift_rms": float(diag.representation_drift_rms.item()),
-            "task_translation_rms": float(diag.task_translation_rms.item()),
-            "task_scale_deviation_rms": float(diag.task_scale_deviation_rms.item()),
-            "reference_q_rms": float(reference_q_rms.item()),
-            "current_q_rms": float(self._mean_sample_rms(final_state.current_rows["ordered_features"]).item()),
+            "persistent_cds": "{I_Q,V_Q,I_P,V_P}",
+            "decision_rule": "one shared bias-free all-seen cosine classifier over Q",
+            "physical_evidence": "I_P/V_P is phase-stable spectral evidence for CDS preservation, semantic correction and pair risk; never a second logit head",
+            "training_chain": "one joint incremental optimization loop with the same Whole-CDS classifier objective used in Phase 0; no representation/classifier stage split and no post-hoc row reset",
+            "gradient_ownership": "new-real all-seen CE -> Mamba+new rows only; old-source whole-CDS reconstruction -> old positives + seen rivals; new-source whole-CDS reconstruction -> new rows only with old rivals detached; old-old retention -> old rows; future rows never update",
+            "semantic_drift": "global affine Q transport plus whole-CDS-conditioned class residual correction; I_P/V_P unchanged; multiplicative V_Q correction",
+            "stores_old_images": False,
+            "stores_old_feature_rows": False,
+            "stores_synthetic_support": False,
+            "uses_covariance_or_gaussian_memory": False,
+            "uses_second_classifier": False,
+            "uses_post_training_classifier_stage": False,
+            "joint_epochs": epoch_count,
+            "joint_lr": learning_rate,
+            "phase_start_admission": "Whole-CDS reconstruction of incoming rows before all-seen SGD; only new rows move",
+            "admission_max_iter": admission_max_iter,
+            "admission_iterations": int(admission.optimization_iterations),
+            "admission_converged": bool(admission.converged),
+            "admission_initial_clearance_min": float(admission.initial_joint_clearance_min.item()),
+            "admission_final_clearance_min": float(admission.final_joint_clearance_min.item()),
+            "admission_initial_clearance_mean": float(admission.initial_joint_clearance_mean.item()),
+            "admission_final_clearance_mean": float(admission.final_joint_clearance_mean.item()),
+            "admission_unsafe_pair_fraction_before": float(admission.unsafe_pair_fraction_before.item()),
+            "admission_unsafe_pair_fraction_after": float(admission.unsafe_pair_fraction_after.item()),
+            "admission_initial_reconstruction_loss": float(admission.initial_reconstruction_loss.item()),
+            "admission_final_reconstruction_loss": float(admission.final_reconstruction_loss.item()),
+            "admission_initial_old_source_loss": float(admission.initial_old_source_loss.item()),
+            "admission_final_old_source_loss": float(admission.final_old_source_loss.item()),
+            "admission_initial_new_source_loss": float(admission.initial_new_source_loss.item()),
+            "admission_final_new_source_loss": float(admission.final_new_source_loss.item()),
+            "admission_initial_current_ce_loss": float(admission.initial_current_ce_loss.item()),
+            "admission_final_current_ce_loss": float(admission.final_current_ce_loss.item()),
+            "admission_initial_total_loss": float(admission.initial_admission_loss.item()),
+            "admission_final_total_loss": float(admission.final_admission_loss.item()),
+            "contrastive_weight": contrastive_weight,
+            "kd_logit_weight": kd_logit_weight,
+            "kd_temperature": kd_temperature,
+            "cds_weight": cds_weight,
+            "feature_stability": "old-logit KD + historical intra/inter Whole-CDS preservation; no raw-Q matching",
+            "cross_phase_separation": "real current Q is separated from migrated historical Whole-CDS before classifier-side reconstruction",
+            "phase_mapping_error": float(final_alignment.mapping_error.item()),
+            "representation_drift_rms": float(
+                final_alignment.representation_drift_rms.item()
+            ),
+            "phase_scale_deviation_rms": float(
+                final_alignment.scale_deviation_rms.item()
+            ),
+            "phase_translation_rms": float(final_alignment.translation_rms.item()),
+            "drift_learned_relevance_mean": float(
+                final_alignment.learned_relevance_mean.item()
+            ),
+            "drift_physical_relevance_mean": float(
+                final_alignment.physical_relevance_mean.item()
+            ),
+            "drift_effective_relevance_mean": float(
+                final_alignment.effective_relevance_mean.item()
+            ),
+            "drift_support_mass_mean": float(
+                final_alignment.class_specific_support_mass_mean.item()
+            ),
+            "drift_support_mass_min": float(
+                final_alignment.class_specific_support_mass_min.item()
+            ),
+            "drift_support_mass_max": float(
+                final_alignment.class_specific_support_mass_max.item()
+            ),
+            "drift_identity_correction_relative_mean": float(
+                final_alignment.identity_correction_relative_mean.item()
+            ),
+            "drift_identity_correction_relative_max": float(
+                final_alignment.identity_correction_relative_max.item()
+            ),
+            "drift_variation_correction_relative_mean": float(
+                final_alignment.variation_correction_relative_mean.item()
+            ),
+            "drift_variation_correction_relative_max": float(
+                final_alignment.variation_correction_relative_max.item()
+            ),
+            "drift_variation_negative_fraction_before_sanitize": float(
+                final_alignment.variation_negative_fraction_before_sanitize.item()
+            ),
+            "final_joint_classification_loss": float(final_record["classification_loss"]),
+            "final_whole_cds_classifier_loss": float(final_record["whole_cds_classifier_loss"]),
+            "final_cds_separation_loss": float(final_record["cds_separation_loss"]),
+            "final_cds_separation_margin": float(final_record["cds_separation_margin"]),
+            "final_cds_separation_violation_fraction": float(final_record["cds_separation_violation_fraction"]),
+            "final_old_cds_classifier_loss": float(final_record["old_cds_classifier_loss"]),
+            "final_new_cds_classifier_loss": float(final_record["new_cds_classifier_loss"]),
+            "classifier_balance": "Phase 0 and incremental phases share the same class-balanced Whole-CDS classifier objective; real-current CE uses all-seen logits with new-row gradient ownership",
+            "final_contrastive_loss": float(final_record["contrastive_loss"]),
+            "final_kd_logit_loss": float(final_record["kd_logit_loss"]),
+            "final_cds_preservation_loss": float(final_record["cds_preservation_loss"]),
+            "final_cds_intra_loss": float(final_record["cds_intra_loss"]),
+            "final_cds_inter_loss": float(final_record["cds_inter_loss"]),
+            "final_classifier_structural_loss": float(
+                final_structural.loss.detach().item()
+            ),
+            "final_global_cds_classifier_loss": float(
+                final_structural.global_reconstruction_loss.detach().item()
+            ),
+            "final_old_cds_classifier_component": float(
+                final_structural.old_class_reconstruction_loss.detach().item()
+            ),
+            "final_new_cds_classifier_component": float(
+                final_structural.new_class_reconstruction_loss.detach().item()
+            ),
+            "final_old_old_retention_loss": float(
+                final_structural.old_old_retention_loss.detach().item()
+            ),
+            "initial_old_new_violation_fraction": float(
+                pre_structural.old_new_violation_fraction.detach().item()
+            ),
+            "final_old_new_violation_fraction": float(
+                final_structural.old_new_violation_fraction.detach().item()
+            ),
+            "initial_old_old_violation_fraction": float(
+                pre_structural.historical_internal_violation_fraction.detach().item()
+            ),
+            "final_old_old_violation_fraction": float(
+                final_structural.historical_internal_violation_fraction.detach().item()
+            ),
+            "final_old_old_clearance_mean": float(
+                final_structural.historical_internal_clearance_mean.detach().item()
+            ),
+            "final_old_old_clearance_min": float(
+                final_structural.historical_internal_clearance_min.detach().item()
+            ),
+            "final_old_old_retention_mean": float(
+                final_structural.historical_internal_retention_mean.detach().item()
+            ),
+            "final_old_old_retention_min": float(
+                final_structural.historical_internal_retention_min.detach().item()
+            ),
+            "final_whole_cds_learned_risk_mean": float(
+                final_structural.learned_pair_risk_mean.detach().item()
+            ),
+            "final_whole_cds_physical_risk_mean": float(
+                final_structural.physical_pair_risk_mean.detach().item()
+            ),
+            "final_physical_absolute_support_mean": float(
+                final_record["physical_absolute_support_mean"]
+            ),
+            "final_physical_relation_support_mean": float(
+                final_record["physical_relation_support_mean"]
+            ),
+            "final_physical_relevance_mean": float(
+                final_record["physical_relevance_mean"]
+            ),
+            "historical_classifier_row_max_change": self._max_parameter_change(
+                old_weight_before, final_old_weight
+            ),
+            "incoming_classifier_initialization_max_change": self._max_parameter_change(
+                new_weight_random_before, phase_start_new_weight
+            ),
+            "incoming_classifier_training_max_change": self._max_parameter_change(
+                phase_start_new_weight, final_new_weight
+            ),
+            "incoming_identity_seed_clearance_min": float(
+                admission.initial_joint_clearance_min.item()
+            ),
+            "incoming_identity_seed_clearance_mean": float(
+                admission.initial_joint_clearance_mean.item()
+            ),
+            "incoming_admitted_clearance_min": float(
+                admission.final_joint_clearance_min.item()
+            ),
+            "incoming_admitted_clearance_mean": float(
+                admission.final_joint_clearance_mean.item()
+            ),
             "phase_start_old_ba": float(old_before["balanced_accuracy"]),
-            "phase_start_old_all_seen_ba": float(phase_start_old_all_seen["balanced_accuracy"]),
-            "final_old_only_ba": float(final_old_only["balanced_accuracy"]),
-            "final_old_all_seen_ba": float(final_old_all_seen["balanced_accuracy"]),
-            "representation_forgetting": float(old_before["balanced_accuracy"]) - float(final_old_only["balanced_accuracy"]),
-            "decision_interference_start": float(old_before["balanced_accuracy"]) - float(phase_start_old_all_seen["balanced_accuracy"]),
-            "decision_interference_final": float(final_old_only["balanced_accuracy"]) - float(final_old_all_seen["balanced_accuracy"]),
-            "final_new_train_all_seen_ba": float(final_new_all_seen["balanced_accuracy"]),
-            "final_new_train_only_ba": float(final_new_only["balanced_accuracy"]),
-            "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
-            "final_classification_loss": float(history[-1]["classification_loss"]),
-            "final_historical_decision_consistency_loss": float(history[-1]["historical_decision_consistency_loss"]),
-            "final_contrastive_loss": float(history[-1]["contrastive_loss"]),
-            "final_contrastive_similarity_gap": float(history[-1]["contrastive_similarity_gap"]),
-            "final_contrastive_valid_anchor_fraction": float(history[-1]["contrastive_valid_anchor_fraction"]),
-            "final_hsi_cds_separation_loss": float(history[-1]["hsi_cds_separation_loss"]),
-            "final_historical_full_cds_loss": float(final_historical_objective.loss.item()),
-            "final_historical_full_cds_positive_ce": float(final_historical_objective.positive_ce.item()),
-            "final_historical_decision_anchor_ce": float(final_historical_objective.decision_anchor_ce.item()),
-            "final_historical_full_cds_relation_loss": float(final_historical_objective.relation_loss.item()),
-            "final_historical_identity_accuracy": float(final_historical_objective.identity_accuracy.item()),
-            "final_historical_decision_anchor_accuracy": float(final_historical_objective.decision_anchor_accuracy.item()),
-            "final_historical_identity_margin_mean": float(final_historical_objective.identity_margin_mean.item()),
-            "final_historical_identity_margin_min": float(final_historical_objective.identity_margin_min.item()),
-            "final_historical_deformation_exposure_mean": float(final_historical_objective.deformation_exposure_mean.item()),
-            "final_historical_structural_clearance_mean": float(final_historical_objective.structural_clearance_mean.item()),
-            "final_historical_structural_clearance_min": float(final_historical_objective.structural_clearance_min.item()),
-            "final_historical_pair_weight_mean": float(final_historical_objective.pair_weight_mean.item()),
-            "final_historical_learned_risk_mean": float(final_historical_objective.learned_region_risk_mean.item()),
-            "final_historical_spectral_risk_mean": float(final_historical_objective.spectral_region_risk_mean.item()),
+            "phase_start_old_all_seen_ba": float(
+                phase_start_old_all_seen["balanced_accuracy"]
+            ),
+            "phase_start_new_only_ba": float(
+                phase_start_new_only["balanced_accuracy"]
+            ),
+            "phase_start_new_all_seen_ba": float(
+                phase_start_new_all_seen["balanced_accuracy"]
+            ),
+            "final_old_only_ba": float(final_record["old_only_ba"]),
+            "final_old_all_seen_ba": float(final_record["old_all_seen_ba"]),
+            "final_new_only_ba": float(final_record["new_only_ba"]),
+            "final_new_all_seen_ba": float(final_record["new_all_seen_ba"]),
+            "classifier_logit_scale_frozen_incremental": True,
+            "second_classifier_stage": False,
         }
 
         return {
             "phase": phase_id,
-            "old_class_ids": list(old_ids),
-            "new_class_ids": list(new_ids),
-            "seen_class_ids": list(seen_ids),
+            "old_class_ids": list(old_class_ids),
+            "new_class_ids": list(new_class_ids),
+            "seen_class_ids": list(seen_class_ids),
             "history": history,
             "final_epoch": epoch_count,
             "cumulative_test": cumulative,
             "old_new": groups,
             "forgetting": forgetting,
-            "method_state": method_state,
             "phase_origin_confusion": phase_origin,
+            "method_state": method_state,
             "structure_committed": True,
             "phase_finalized": True,
         }
@@ -832,50 +1222,30 @@ __all__ = ["IncrementalPhaseTrainer"]
 
 
 
+
 # from __future__ import annotations
-
-# """Incremental NECIL-HSI training with one Q, one all-seen CDS and one cosine head.
-
-# Current real HSI supplies CE and direct-Q supervised contrast. HDC stabilizes the
-# representation against the frozen previous backbone/old classifier rows. A
-# feature-only old-rival separation term keeps current Q away from historical
-# decisions. The complete all-seen CDS then protects the SAME classifier: I_Q,V_Q
-# define historical decision regions and I_P,V_P prioritize spectrally confusable
-# historical/seen boundaries. Current CE keeps historical rows detached, while the
-# whole migrated CDS is the only objective allowed to realign historical classifier rows.
-# """
-
-# from dataclasses import dataclass
 # import math
 # import sys
 # from numbers import Integral, Real
-# from typing import Any, Dict, Mapping
+# from typing import Any, Dict
 
 # import torch
 # from tqdm import tqdm
 
 # from losses.loss import (
 #     classification_objective,
+#     historical_cds_preservation_loss,
+#     logit_distillation_loss,
+#     reference_q_consistency_loss,
 #     supervised_contrastive_q_loss,
-#     historical_decision_consistency_loss,
-#     hsi_cds_separation_loss,
 # )
-# from models.cds_decision_region import HSICDSDecisionRegionRegulator
-# from models.classifier import SpectralCDSClassifier
-# from models.geometry_bank import (
-#     ClassDiscriminativeStructureState,
-#     PhysicalSpectralStructureBatch,
-#     ClassStructureBatch,
-#     merge_class_structure_batches,
+# from models.classifier import CosineClassificationHead
+# from models.cds_decision_region import (
+#     HSICDSDecisionRegionRegulator,
+#     initialize_incoming_classifier_rows_from_cds_identity,
 # )
-# from models.phase_coordinate_alignment import (
-#     CDSAffinityState,
-#     CurrentClassResidual,
-#     PhaseAlignmentDiagnostics,
-#     PhaseCoordinateTransform,
-#     align_historical_structure,
-#     derive_cds_affinity,
-# )
+# from models.geometry_bank import ClassStructureBatch, merge_class_structure_batches
+# from models.phase_coordinate_alignment import correct_historical_structure
 # from utils.eval import old_new_summary, phase_origin_confusion_diagnostics
 
 # Tensor = torch.Tensor
@@ -904,216 +1274,173 @@ __all__ = ["IncrementalPhaseTrainer"]
 #     return result
 
 
-# def _clone_structure(batch: ClassStructureBatch) -> ClassStructureBatch:
-#     if not isinstance(batch, ClassStructureBatch) or batch.class_count <= 0:
+# def _clone_structure(structure: ClassStructureBatch) -> ClassStructureBatch:
+#     if not isinstance(structure, ClassStructureBatch) or structure.class_count <= 0:
 #         raise ValueError("cannot clone an empty class structure")
 #     return ClassStructureBatch(
-#         class_ids=batch.class_ids.detach().clone(),
-#         sample_counts=batch.sample_counts.detach().clone(),
-#         identity=batch.identity.detach().clone(),
-#         variation=batch.variation.detach().clone(),
-#         spectral_identity=batch.spectral_identity.detach().clone(),
-#         spectral_variation=batch.spectral_variation.detach().clone(),
+#         class_ids=structure.class_ids.detach().clone(),
+#         sample_counts=structure.sample_counts.detach().clone(),
+#         learned_identity=structure.learned_identity.detach().clone(),
+#         learned_variation=structure.learned_variation.detach().clone(),
+#         physical_identity=structure.physical_identity.detach().clone(),
+#         physical_variation=structure.physical_variation.detach().clone(),
 #     )
 
 
 # def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
-#     value = torch.as_tensor(labels)
-#     ids = torch.as_tensor(class_ids)
-#     if value.ndim != 1 or value.numel() == 0 or value.dtype != torch.long:
-#         raise ValueError("labels must be non-empty rank-one torch.long")
-#     if ids.ndim != 1 or ids.numel() < 1 or ids.dtype != torch.long:
-#         raise ValueError("class_ids must be non-empty rank-one torch.long")
-#     if value.device != ids.device:
-#         raise ValueError("labels and class_ids must share device")
-#     matches = value.unsqueeze(1).eq(ids.unsqueeze(0))
+#     matches = labels.unsqueeze(1).eq(class_ids.unsqueeze(0))
 #     if not bool(matches.sum(dim=1).eq(1).all()):
-#         raise ValueError("labels contain a class absent from class_ids")
+#         raise ValueError("a current label is absent from current_class_ids")
 #     return matches.to(torch.long).argmax(dim=1)
-
-
-# def _batch_coordinates(batch: Mapping[str, Any], *, expected_rows: int) -> Tensor:
-#     if "coord" not in batch:
-#         raise RuntimeError("incremental TRAIN batches must expose coord for phase-start reference lookup")
-#     coords = torch.as_tensor(batch["coord"])
-#     if coords.shape != (expected_rows, 2):
-#         raise RuntimeError("coord must be [N,2] and batch-aligned")
-#     if coords.dtype == torch.bool or coords.is_complex() or torch.is_floating_point(coords):
-#         raise RuntimeError("coord must use an integer dtype")
-#     return coords.to(dtype=torch.long, device="cpu")
-
-
-# @dataclass(frozen=True)
-# class CurrentTrainingState:
-#     task_mapped_historical: ClassStructureBatch
-#     migrated_historical: ClassStructureBatch
-#     current: ClassStructureBatch
-#     seen: ClassStructureBatch
-#     seen_cds: ClassDiscriminativeStructureState
-#     current_rows: Dict[str, Tensor]
-#     transform: PhaseCoordinateTransform
-#     affinity: CDSAffinityState
-#     residual: CurrentClassResidual
-#     alignment: PhaseAlignmentDiagnostics
 
 
 # class IncrementalPhaseTrainer:
 #     INCREMENTAL_RESULT_FIELDS = frozenset(
 #         {
-#             "phase", "old_class_ids", "new_class_ids", "seen_class_ids", "history",
-#             "final_epoch", "cumulative_test", "old_new", "forgetting", "method_state",
-#             "structure_committed", "phase_finalized",
+#             "phase",
+#             "old_class_ids",
+#             "new_class_ids",
+#             "seen_class_ids",
+#             "history",
+#             "final_epoch",
+#             "cumulative_test",
+#             "old_new",
+#             "forgetting",
+#             "method_state",
+#             "structure_committed",
+#             "phase_finalized",
 #         }
 #     )
 
-#     def _require_classifier(self) -> SpectralCDSClassifier:
+#     def _require_classifier(self) -> CosineClassificationHead:
 #         classifier = getattr(self.model, "classifier", None)
-#         if not isinstance(classifier, SpectralCDSClassifier) or classifier.parameter_count <= 0:
-#             raise RuntimeError("model.classifier must be the trainable cosine SpectralCDSClassifier")
+#         if not isinstance(classifier, CosineClassificationHead):
+#             raise RuntimeError("model.classifier must be CosineClassificationHead")
 #         return classifier
 
-#     def _phase_classes(self, phase: int) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-#         old_ids = tuple(self._validated_class_ids(self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"))
-#         new_ids = tuple(self._validated_class_ids(self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"))
-#         seen_ids = tuple(self._validated_class_ids(self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"))
-#         if not old_ids or not new_ids or set(old_ids).intersection(new_ids):
-#             raise RuntimeError("incremental phase has invalid old/new class partition")
-#         if seen_ids != old_ids + new_ids:
+#     def _phase_classes(
+#         self,
+#         phase: int,
+#     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+#         old_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"
+#             )
+#         )
+#         new_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"
+#             )
+#         )
+#         seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"
+#             )
+#         )
+#         if not old_class_ids or not new_class_ids:
+#             raise RuntimeError("incremental phase requires old and new classes")
+#         if set(old_class_ids).intersection(new_class_ids):
+#             raise RuntimeError("old and new classes overlap")
+#         if seen_class_ids != old_class_ids + new_class_ids:
 #             raise RuntimeError("seen classes must equal old classes followed by new classes")
-#         if tuple(self.model.committed_class_ids) != old_ids:
-#             raise RuntimeError("historical CDS does not match the old class set")
-#         return old_ids, new_ids, seen_ids
+#         if tuple(self.model.committed_class_ids) != old_class_ids:
+#             raise RuntimeError("committed historical CDS does not match old classes")
+#         return old_class_ids, new_class_ids, seen_class_ids
 
 #     @staticmethod
 #     def _assert_frozen_reference(reference_backbone: torch.nn.Module) -> None:
 #         reference_backbone.eval()
 #         if any(parameter.requires_grad for parameter in reference_backbone.parameters()):
-#             raise RuntimeError("previous backbone reference must remain fully frozen")
+#             raise RuntimeError("previous backbone reference must remain frozen")
 #         if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
 #             raise RuntimeError("previous backbone reference must not carry gradients")
 
 #     @staticmethod
+#     def _assert_frozen_reference_classifier(
+#         reference_classifier: CosineClassificationHead,
+#     ) -> None:
+#         reference_classifier.eval()
+#         if any(parameter.requires_grad for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must remain frozen")
+#         if any(parameter.grad is not None for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must not carry gradients")
+
+#     @staticmethod
 #     @torch.no_grad()
-#     def _assert_reference_matches_phase_start(reference_backbone: torch.nn.Module, current_backbone: torch.nn.Module) -> None:
-#         left, right = reference_backbone.state_dict(), current_backbone.state_dict()
-#         if tuple(left.keys()) != tuple(right.keys()):
-#             raise RuntimeError("previous/current backbone schemas differ at phase start")
-#         for name in left:
-#             if left[name].shape != right[name].shape or left[name].dtype != right[name].dtype:
-#                 raise RuntimeError(f"phase-start backbone state differs at {name}")
-#             if not torch.equal(left[name].detach().cpu(), right[name].detach().cpu()):
-#                 raise RuntimeError(f"previous backbone is not the finalized phase-start state ({name})")
+#     def _assert_reference_matches_phase_start(
+#         reference: torch.nn.Module,
+#         current: torch.nn.Module,
+#         *,
+#         name: str,
+#     ) -> None:
+#         ref_state = reference.state_dict()
+#         cur_state = current.state_dict()
+#         if tuple(ref_state.keys()) != tuple(cur_state.keys()):
+#             raise RuntimeError(f"previous/current {name} schemas differ at phase start")
+#         for key in ref_state:
+#             if not torch.equal(ref_state[key].detach().cpu(), cur_state[key].detach().cpu()):
+#                 raise RuntimeError(
+#                     f"previous {name} does not match finalized phase-start state at {key}"
+#                 )
 
 #     @torch.no_grad()
-#     def _current_class_weights(self, loader: Any, *, new_ids: tuple[int, ...]) -> tuple[Tensor, int]:
-#         counts = {class_id: 0 for class_id in new_ids}
+#     def _current_class_weights(
+#         self,
+#         loader: Any,
+#         *,
+#         new_class_ids: tuple[int, ...],
+#     ) -> tuple[Tensor, int]:
+#         counts = {class_id: 0 for class_id in new_class_ids}
 #         total = 0
-#         valid = set(new_ids)
+#         valid = set(new_class_ids)
 #         for batch in loader:
 #             _, _, labels = self.unpack_batch(batch)
-#             observed = set(int(v) for v in labels.unique().detach().cpu().tolist())
+#             observed = set(int(value) for value in labels.unique().detach().cpu().tolist())
 #             outside = observed - valid
 #             if outside:
-#                 raise RuntimeError(f"incremental TRAIN loader contains non-current classes {sorted(outside)}")
-#             for class_id in new_ids:
+#                 raise RuntimeError(
+#                     f"incremental TRAIN loader contains non-current classes {sorted(outside)}"
+#                 )
+#             for class_id in new_class_ids:
 #                 count = int(labels.eq(class_id).sum().item())
 #                 counts[class_id] += count
 #                 total += count
-#         if total <= 0 or any(counts[c] <= 0 for c in new_ids):
+#         if total <= 0 or any(counts[class_id] <= 0 for class_id in new_class_ids):
 #             raise RuntimeError("incremental TRAIN split is empty or misses a current class")
-#         class_count = len(new_ids)
+#         class_count = len(new_class_ids)
 #         weights = torch.tensor(
-#             [total / float(class_count * counts[c]) for c in new_ids],
+#             [total / float(class_count * counts[class_id]) for class_id in new_class_ids],
 #             device=self.device,
 #             dtype=self.model.dtype,
 #         )
 #         return weights, total
 
 #     @staticmethod
-#     def _row_lookup(reference_coords: Tensor) -> dict[tuple[int, int], int]:
-#         if reference_coords.ndim != 2 or reference_coords.size(1) != 2:
-#             raise ValueError("reference_coords must be [N,2]")
-#         lookup: dict[tuple[int, int], int] = {}
-#         for row, pair in enumerate(reference_coords.detach().cpu().tolist()):
-#             key = (int(pair[0]), int(pair[1]))
-#             if key in lookup:
-#                 raise RuntimeError(f"duplicate current TRAIN coordinate {key}")
-#             lookup[key] = row
-#         return lookup
+#     def _max_parameter_change(before: Tensor, after: Tensor) -> float:
+#         if before.shape != after.shape:
+#             raise ValueError("parameter snapshots have different shapes")
+#         if before.numel() == 0:
+#             return 0.0
+#         return float((after - before).abs().max().item())
 
 #     @staticmethod
-#     def _cached_rows_for_batch(batch_coords: Tensor, *, lookup: dict[tuple[int, int], int], cached: Tensor) -> Tensor:
-#         rows: list[int] = []
-#         for pair in batch_coords.tolist():
-#             key = (int(pair[0]), int(pair[1]))
-#             if key not in lookup:
-#                 raise RuntimeError(f"current TRAIN batch coordinate {key} is absent from phase-start cache")
-#             rows.append(lookup[key])
-#         return cached.index_select(0, torch.tensor(rows, device=cached.device, dtype=torch.long))
+#     def _assert_future_rows_unchanged(
+#         classifier: CosineClassificationHead,
+#         future_class_tensor: Tensor,
+#         future_weight_before: Tensor | None,
+#     ) -> None:
+#         if future_weight_before is None or future_class_tensor.numel() == 0:
+#             return
+#         current = classifier.class_weight(future_class_tensor).detach()
+#         if not torch.equal(current, future_weight_before):
+#             raise RuntimeError("future classifier rows changed before their phase")
 
 #     @staticmethod
-#     def _mean_sample_rms(features: Tensor) -> Tensor:
-#         value = torch.as_tensor(features)
-#         if value.ndim != 3 or value.size(0) == 0:
-#             raise ValueError("features must be non-empty [N,K,D]")
-#         return value.square().mean(dim=(1, 2)).sqrt().mean()
-
-#     @torch.no_grad()
-#     def _refresh_training_state(
-#         self,
-#         *,
-#         train_eval_loader: Any,
-#         phase_start_historical: ClassStructureBatch,
-#         current_reference: ClassStructureBatch,
-#         phase_affinity: CDSAffinityState,
-#         reference_q_full: Tensor,
-#         reference_labels: Tensor,
-#         reference_spectra: Tensor,
-#         reference_coords: Tensor,
-#         current_physical: PhysicalSpectralStructureBatch,
-#         new_ids: tuple[int, ...],
-#         seen_ids: tuple[int, ...],
-#     ) -> CurrentTrainingState:
-#         current_rows = self.collect_ordered_features(train_eval_loader, require_coordinates=True)
-#         if not torch.equal(current_rows["labels"], reference_labels):
-#             raise RuntimeError("current TRAIN labels/order changed within phase")
-#         if not torch.equal(current_rows["coords"], reference_coords):
-#             raise RuntimeError("current TRAIN coordinates/order changed within phase")
-#         if not torch.equal(current_rows["raw_center_spectra"], reference_spectra):
-#             raise RuntimeError("current TRAIN spectra/order changed within phase")
-
-#         current_structure = self.model.estimate_class_structure(
-#             current_rows["ordered_features"],
-#             None,
-#             current_rows["labels"],
-#             class_ids=new_ids,
-#             physical_structure=current_physical,
-#         )
-#         task_mapped_old, migrated_old, transform, affinity, residual, alignment = align_historical_structure(
-#             historical=phase_start_historical,
-#             current_reference=current_reference,
-#             current_structure=current_structure,
-#             reference_features=reference_q_full,
-#             current_features=current_rows["ordered_features"],
-#             affinity=phase_affinity,
-#         )
-#         seen_structure = merge_class_structure_batches((migrated_old, current_structure))
-#         actual = tuple(int(v) for v in seen_structure.class_ids.detach().cpu().tolist())
-#         if actual != seen_ids:
-#             raise RuntimeError("all-seen CDS class order changed")
-#         seen_cds = self.model.build_class_discriminative_structure(seen_structure)
-#         return CurrentTrainingState(
-#             task_mapped_historical=task_mapped_old,
-#             migrated_historical=migrated_old,
-#             current=current_structure,
-#             seen=seen_structure,
-#             seen_cds=seen_cds,
-#             current_rows=current_rows,
-#             transform=transform,
-#             affinity=affinity,
-#             residual=residual,
-#             alignment=alignment,
-#         )
+#     def _row_grad_max(gradient: Tensor | None, class_ids: Tensor) -> float:
+#         if gradient is None or class_ids.numel() == 0:
+#             return 0.0
+#         rows = gradient.index_select(0, class_ids)
+#         return float(rows.abs().max().detach().item()) if rows.numel() else 0.0
 
 #     def train_incremental_phase(
 #         self,
@@ -1123,1350 +1450,3016 @@ __all__ = ["IncrementalPhaseTrainer"]
 #         batch_size: int,
 #         lr: float,
 #         reference_backbone: torch.nn.Module,
+#         reference_classifier: CosineClassificationHead,
 #     ) -> Dict[str, Any]:
 #         phase_id = _positive_int(phase, name="phase")
 #         epoch_count = _positive_int(epochs, name="epochs")
 #         train_batch_size = _positive_int(batch_size, name="batch_size")
-#         backbone_learning_rate = _finite_positive("lr_inc", lr)
-#         classifier_learning_rate = _finite_positive("lr", self.cfg("lr", backbone_learning_rate))
-#         eval_batch_size = _positive_int(self.cfg("eval_batch_size", 256), name="eval_batch_size")
-#         gradient_clip = _finite_nonnegative("gradient_clip", self.cfg("gradient_clip", 0.0))
-#         weight_decay = _finite_nonnegative("weight_decay", self.cfg("weight_decay", 1e-4))
-
+#         learning_rate = _finite_positive("lr_inc", lr)
+#         eval_batch_size = _positive_int(
+#             self.cfg("eval_batch_size", 256), name="eval_batch_size"
+#         )
+#         weight_decay = _finite_nonnegative(
+#             "weight_decay", self.cfg("weight_decay", 1e-4)
+#         )
+#         gradient_clip = _finite_nonnegative(
+#             "gradient_clip", self.cfg("gradient_clip", 0.0)
+#         )
+#         contrastive_weight = _finite_nonnegative(
+#             "contrastive_weight", self.cfg("contrastive_weight", 1.0)
+#         )
+#         q_consistency_weight = _finite_nonnegative(
+#             "q_consistency_weight", self.cfg("q_consistency_weight", 1.0)
+#         )
+#         kd_logit_weight = _finite_nonnegative(
+#             "kd_logit_weight", self.cfg("kd_logit_weight", 1.0)
+#         )
+#         kd_temperature = _finite_positive(
+#             "kd_temperature", self.cfg("kd_temperature", 2.0)
+#         )
+#         cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
+        
 #         self.model.validate_finalized_state()
 #         classifier = self._require_classifier()
 #         self._assert_frozen_reference(reference_backbone)
-#         self._assert_reference_matches_phase_start(reference_backbone, self.model.backbone)
+#         self._assert_frozen_reference_classifier(reference_classifier)
+#         self._assert_reference_matches_phase_start(
+#             reference_backbone, self.model.backbone, name="backbone"
+#         )
+#         self._assert_reference_matches_phase_start(
+#             reference_classifier, classifier, name="classifier"
+#         )
 
 #         previous_phase = phase_id - 1
-#         previous_seen = tuple(self._validated_class_ids(self.dataset.get_seen_classes(previous_phase), name="previous_seen_classes"))
-#         old_reporting_loader = self.dataset.get_reporting_dataloader(previous_phase, batch_size=eval_batch_size)
-#         old_before = self.evaluate_loader(old_reporting_loader, class_ids=previous_seen, target_class_ids=previous_seen)
-
-#         self.dataset.start_phase(phase_id)
-#         old_ids, new_ids, seen_ids = self._phase_classes(phase_id)
-#         old_ids_tensor = torch.tensor(old_ids, device=self.device, dtype=torch.long)
-#         new_ids_tensor = torch.tensor(new_ids, device=self.device, dtype=torch.long)
-#         seen_ids_tensor = torch.tensor(seen_ids, device=self.device, dtype=torch.long)
-#         phase_start_historical = _clone_structure(self.model.structure_bank.class_structures(old_ids))
-
-#         self.model.set_incremental_trainability()
-#         backbone_trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
-#         backbone_frozen = [p for p in self.model.backbone.parameters() if not p.requires_grad]
-#         if not backbone_trainable:
-#             raise RuntimeError("incremental backbone has no trainable parameters")
-
-#         structure_loader_factory = getattr(self.dataset, "get_phase_structure_dataloader", None)
-#         train_eval_loader = (
-#             structure_loader_factory(phase_id, batch_size=eval_batch_size)
-#             if callable(structure_loader_factory)
-#             else self.dataset.get_phase_dataloader(
-#                 phase_id, split="train", batch_size=eval_batch_size, shuffle=False
+#         previous_seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(previous_phase),
+#                 name="previous_seen_classes",
 #             )
 #         )
-#         class_weights, expected_samples = self._current_class_weights(train_eval_loader, new_ids=new_ids)
-
-#         reference_train = self.collect_ordered_features(
-#             train_eval_loader, backbone=reference_backbone, require_coordinates=True
+#         old_reporting_loader = self.dataset.get_reporting_dataloader(
+#             previous_phase, batch_size=eval_batch_size
 #         )
-#         reference_q_full = reference_train["ordered_features"].detach()
+#         old_before = self.evaluate_loader(
+#             old_reporting_loader,
+#             class_ids=previous_seen_class_ids,
+#             target_class_ids=previous_seen_class_ids,
+#         )
+
+#         self.dataset.start_phase(phase_id)
+#         old_class_ids, new_class_ids, seen_class_ids = self._phase_classes(phase_id)
+#         old_class_tensor = torch.tensor(old_class_ids, device=self.device, dtype=torch.long)
+#         new_class_tensor = torch.tensor(new_class_ids, device=self.device, dtype=torch.long)
+#         seen_class_tensor = torch.tensor(seen_class_ids, device=self.device, dtype=torch.long)
+
+#         historical_structure = _clone_structure(
+#             self.model.structure_bank.class_structures(old_class_ids)
+#         )
+#         reference_historical_cds = self.model.structure_bank.build_cds(historical_structure)
+
+#         self.model.set_incremental_trainability()
+#         backbone_parameters = [
+#             parameter
+#             for parameter in self.model.backbone.parameters()
+#             if parameter.requires_grad
+#         ]
+#         if not backbone_parameters:
+#             raise RuntimeError("incremental backbone has no trainable parameters")
+
+#         train_eval_loader = self.dataset.get_phase_dataloader(
+#             phase_id, split="train", batch_size=eval_batch_size, shuffle=False
+#         )
+#         current_class_weights, expected_samples = self._current_class_weights(
+#             train_eval_loader, new_class_ids=new_class_ids
+#         )
+#         reference_train = self.collect_ordered_features(
+#             train_eval_loader, backbone=reference_backbone
+#         )
+#         reference_features_full = reference_train["ordered_features"].detach()
 #         reference_spectra = reference_train["raw_center_spectra"].detach()
 #         reference_labels = reference_train["labels"].detach()
-#         reference_coords = reference_train["coords"]
-#         observed = tuple(sorted(int(v) for v in reference_labels.unique().detach().cpu().tolist()))
-#         if observed != tuple(sorted(new_ids)):
-#             raise RuntimeError("incremental TRAIN rows do not match current phase classes")
-#         current_physical = self.model.estimate_physical_class_structure(
-#             reference_spectra, reference_labels, class_ids=new_ids
+#         observed_new = tuple(
+#             sorted(int(value) for value in reference_labels.unique().detach().cpu().tolist())
 #         )
-#         cache_lookup = self._row_lookup(reference_coords)
-#         reference_q_rms = self._mean_sample_rms(reference_q_full).detach()
+#         if observed_new != tuple(sorted(new_class_ids)):
+#             raise RuntimeError("incremental TRAIN rows do not match current phase classes")
 
-#         # Snapshot the previous tested historical rows only as the frozen HDC
-#         # teacher. The live historical rows may later realign, but only through
-#         # classifier-side supervision from the migrated historical CDS.
-#         historical_classifier_rows = classifier.class_weight(old_ids_tensor).detach().clone()
-
-#         phase_start_current = self.model.estimate_class_structure(
-#             reference_q_full,
+#         current_physical_structure = self.model.estimate_physical_class_structure(
+#             reference_spectra, reference_labels, class_ids=new_class_ids
+#         )
+#         current_reference_structure = self.model.estimate_class_structure(
+#             reference_features_full,
 #             None,
 #             reference_labels,
-#             class_ids=new_ids,
-#             physical_structure=current_physical,
+#             class_ids=new_class_ids,
+#             physical_structure=current_physical_structure,
 #         )
-#         phase_start_seen = merge_class_structure_batches((phase_start_historical, phase_start_current))
-#         phase_affinity = derive_cds_affinity(
-#             historical=phase_start_historical,
-#             current_reference=phase_start_current,
+#         phase_start_seen_structure = merge_class_structure_batches(
+#             (historical_structure, current_reference_structure)
 #         )
-
-#         # New classifier rows are NOT initialized from I_Q or any CDS center.
-#         # They retain their deterministic model initialization and are learned
-#         # from real current samples. The complete CDS constrains them through
-#         # whole-CDS contrast and boundary clearance; historical rows stay fixed.
-#         if not torch.equal(classifier.class_weight(old_ids_tensor), historical_classifier_rows):
-#             raise RuntimeError("historical classifier rows changed before incremental optimization")
-
-#         phase_start_old_all_seen = self.evaluate_loader(
-#             old_reporting_loader,
-#             class_ids=seen_ids,
-#             target_class_ids=old_ids,
-#             structures=phase_start_seen,
+#         phase_start_seen_cds = self.model.structure_bank.build_cds(
+#             phase_start_seen_structure
 #         )
 
-#         print(
-#             f"[Phase {phase_id} start] PhaseStartOldBA={100*float(old_before['balanced_accuracy']):.2f}% "
-#             f"OldAllSeen={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% | "
-#             f"Old={list(old_ids)} New={list(new_ids)} Seen={list(seen_ids)}",
-#             file=sys.stdout,
+#         # Snapshot ownership before incoming-row admission.
+#         old_weight_before = classifier.class_weight(old_class_tensor).detach().clone()
+#         new_weight_random_before = classifier.class_weight(new_class_tensor).detach().clone()
+#         seen_set = set(seen_class_ids)
+#         future_class_ids = tuple(
+#             class_id
+#             for class_id in range(classifier.total_class_count)
+#             if class_id not in seen_set
+#         )
+#         future_class_tensor = torch.tensor(
+#             future_class_ids, device=self.device, dtype=torch.long
+#         )
+#         future_weight_before = (
+#             classifier.class_weight(future_class_tensor).detach().clone()
+#             if future_class_ids
+#             else None
 #         )
 
-#         backbone_optimizer = torch.optim.AdamW(
-#             [{"params": backbone_trainable, "weight_decay": weight_decay}],
-#             lr=backbone_learning_rate,
+#         # Deterministic, one-time incoming-row admission from the complete CDS.
+#         # Historical rows are never changed by this operation.
+#         initialization = initialize_incoming_classifier_rows_from_cds_identity(
+#             classifier=classifier,
+#             seen_cds=phase_start_seen_cds,
+#             historical_class_count=len(old_class_ids),
 #         )
-#         classifier_optimizer = torch.optim.AdamW(
-#             list(classifier.parameters()), lr=classifier_learning_rate, weight_decay=0.0
+#         phase_start_new_weight = classifier.class_weight(new_class_tensor).detach().clone()
+#         if not torch.equal(classifier.class_weight(old_class_tensor).detach(), old_weight_before):
+#             raise RuntimeError("incoming-row admission changed a historical classifier row")
+#         self._assert_future_rows_unchanged(
+#             classifier, future_class_tensor, future_weight_before
 #         )
-#         backbone_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-#             backbone_optimizer, T_max=epoch_count, eta_min=0.0
-#         )
-#         classifier_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-#             classifier_optimizer, T_max=epoch_count, eta_min=0.0
-#         )
+
+#         scale_requires_grad = bool(classifier.logit_scale_parameter.requires_grad)
+#         classifier.logit_scale_parameter.requires_grad_(False)
+#         classifier.logit_scale_parameter.grad = None
+#         classifier.weight.requires_grad_(True)
+#         phase_start_scale = float(classifier.logit_scale.detach().item())
 
 #         train_loader = self.dataset.get_phase_dataloader(
 #             phase_id, split="train", batch_size=train_batch_size, shuffle=True
 #         )
 #         val_loader = (
-#             self.dataset.get_phase_dataloader(phase_id, split="val", batch_size=eval_batch_size, shuffle=False)
-#             if self.dataset.validation_enabled else None
+#             self.dataset.get_phase_dataloader(
+#                 phase_id, split="val", batch_size=eval_batch_size, shuffle=False
+#             )
+#             if self.dataset.validation_enabled
+#             else None
 #         )
-#         cds_regulator = HSICDSDecisionRegionRegulator().to(self.device)
-#         if cds_regulator.parameter_count != 0:
-#             raise RuntimeError("CDS decision-region regulator must remain parameter-free")
+
+#         phase_start_new_only = self.evaluate_loader(
+#             train_eval_loader, class_ids=new_class_ids, target_class_ids=new_class_ids
+#         )
+#         phase_start_new_all_seen = self.evaluate_loader(
+#             train_eval_loader, class_ids=seen_class_ids, target_class_ids=new_class_ids
+#         )
+#         phase_start_old_all_seen = self.evaluate_loader(
+#             old_reporting_loader, class_ids=seen_class_ids, target_class_ids=old_class_ids
+#         )
+#         print(
+#             f"[Phase {phase_id} start] "
+#             f"OldBA(previous-only)={100*float(old_before['balanced_accuracy']):.2f}% "
+#             f"OldBA(all-seen)={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% "
+#             f"NewBA(new-only)={100*float(phase_start_new_only['balanced_accuracy']):.2f}% "
+#             f"NewBA(all-seen)={100*float(phase_start_new_all_seen['balanced_accuracy']):.2f}% | "
+#             f"InitClear={float(initialization.joint_clearance_min.item()):.4f} "
+#             f"InitClearMean={float(initialization.joint_clearance_mean.item()):.4f}",
+#             file=sys.stdout,
+#         )
+
+#         @torch.no_grad()
+#         def refresh_joint_structure():
+#             self.model.eval()
+#             rows = self.collect_ordered_features(train_eval_loader)
+#             if not torch.equal(rows["labels"], reference_labels):
+#                 raise RuntimeError("current TRAIN label order changed during CDS refresh")
+#             if not torch.equal(rows["raw_center_spectra"], reference_spectra):
+#                 raise RuntimeError("current TRAIN spectra changed during CDS refresh")
+#             current_features_full = rows["ordered_features"].detach()
+#             current_structure = self.model.estimate_class_structure(
+#                 current_features_full,
+#                 None,
+#                 reference_labels,
+#                 class_ids=new_class_ids,
+#                 physical_structure=current_physical_structure,
+#             )
+#             corrected_historical, transform, alignment = correct_historical_structure(
+#                 historical_structure=historical_structure,
+#                 current_reference_structure=current_reference_structure,
+#                 current_structure=current_structure,
+#                 reference_features=reference_features_full,
+#                 current_features=current_features_full,
+#             )
+#             if not torch.equal(
+#                 corrected_historical.physical_identity,
+#                 historical_structure.physical_identity,
+#             ):
+#                 raise RuntimeError("historical I_P changed during semantic correction")
+#             if not torch.equal(
+#                 corrected_historical.physical_variation,
+#                 historical_structure.physical_variation,
+#             ):
+#                 raise RuntimeError("historical V_P changed during semantic correction")
+#             merged = merge_class_structure_batches(
+#                 (corrected_historical, current_structure)
+#             )
+#             merged_ids = tuple(
+#                 int(value) for value in merged.class_ids.detach().cpu().tolist()
+#             )
+#             if merged_ids != seen_class_ids:
+#                 raise RuntimeError("CDS refresh produced incorrect seen-class order")
+#             seen_cds = self.model.structure_bank.build_cds(merged)
+#             return (
+#                 current_features_full,
+#                 corrected_historical,
+#                 current_structure,
+#                 merged,
+#                 seen_cds,
+#                 transform,
+#                 alignment,
+#             )
+
+#         # One optimizer, one scheduler, one phase loop.  Classifier weight decay is
+#         # zero so masked old/future rows are not silently changed by AdamW decay.
+#         optimizer = torch.optim.AdamW(
+#             [
+#                 {"params": backbone_parameters, "weight_decay": weight_decay},
+#                 {"params": [classifier.weight], "weight_decay": 0.0},
+#             ],
+#             lr=learning_rate,
+#         )
+#         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#             optimizer, T_max=epoch_count, eta_min=0.0
+#         )
+#         regulator = HSICDSDecisionRegionRegulator().to(self.device)
+
+#         joint_state = refresh_joint_structure()
+#         pre_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=joint_state[4],
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
+#         )
 
 #         history: list[dict[str, Any]] = []
+#         gradient_contract_checked = False
 #         progress = tqdm(
 #             range(epoch_count),
-#             desc=f"Phase {phase_id} all-seen CDS continual learning",
+#             desc=f"Phase {phase_id} joint CDS-cosine training",
 #             unit="epoch",
 #             dynamic_ncols=True,
 #             file=sys.stdout,
 #         )
 
-#         final_working: CurrentTrainingState | None = None
 #         for epoch in progress:
-#             self.model.eval()
-#             working = self._refresh_training_state(
-#                 train_eval_loader=train_eval_loader,
-#                 phase_start_historical=phase_start_historical,
-#                 current_reference=phase_start_current,
-#                 phase_affinity=phase_affinity,
-#                 reference_q_full=reference_q_full,
-#                 reference_labels=reference_labels,
-#                 reference_spectra=reference_spectra,
-#                 reference_coords=reference_coords,
-#                 current_physical=current_physical,
-#                 new_ids=new_ids,
-#                 seen_ids=seen_ids,
-#             )
+#             (
+#                 _epoch_features,
+#                 epoch_historical_structure,
+#                 _epoch_current_structure,
+#                 _epoch_merged,
+#                 epoch_seen_cds,
+#                 _epoch_transform,
+#                 _epoch_alignment,
+#             ) = joint_state
 
 #             self.model.train()
-#             epoch_lr = float(backbone_optimizer.param_groups[0]["lr"])
-#             epoch_head_lr = float(classifier_optimizer.param_groups[0]["lr"])
-#             classification_sum = hdc_sum = hdc_rmse_sum = 0.0
-#             contrastive_sum = contrastive_gap_sum = contrastive_anchor_fraction_sum = 0.0
-#             separation_sum = separation_margin_sum = 0.0
-#             boundary_sum = boundary_clearance_sum = 0.0
-#             boundary_clearance_min_value = float("inf")
-#             boundary_absolute_clearance_sum = boundary_relational_clearance_sum = 0.0
-#             boundary_unsafe_sum = 0.0
-#             boundary_pair_weight_sum = boundary_learned_risk_sum = boundary_spectral_risk_sum = 0.0
-#             total_sum = 0.0
-#             correct = sample_count = 0
-#             per_class_correct = {class_id: 0 for class_id in new_ids}
-#             per_class_total = {class_id: 0 for class_id in new_ids}
+#             sums = {name: 0.0 for name in (
+#                 "classification", "cds_classifier", "cds_classifier_old",
+#                 "cds_classifier_new", "contrastive", "q_consistency", "kd",
+#                 "cds", "intra", "inter", "physical_abs", "physical_rel",
+#                 "physical_joint", "old_old", "structural", "total"
+#             )}
+#             sample_count = 0
+#             correct_all_seen = 0
 
 #             for batch in train_loader:
 #                 patch, spectrum, labels = self.unpack_batch(batch)
-#                 batch_coords = _batch_coordinates(batch, expected_rows=int(labels.numel()))
-#                 backbone_optimizer.zero_grad(set_to_none=True)
-#                 classifier_optimizer.zero_grad(set_to_none=True)
+#                 if not bool(torch.isin(labels, new_class_tensor).all()):
+#                     raise RuntimeError("incremental TRAIN batch contains an old or future class")
 
-#                 q = self.model.extract_features(patch, center_spectrum=spectrum, return_aux=False).ordered_features
-#                 reference_q = self._cached_rows_for_batch(batch_coords, lookup=cache_lookup, cached=reference_q_full)
+#                 optimizer.zero_grad(set_to_none=True)
+#                 classifier.logit_scale_parameter.grad = None
 
-#                 # Real current labels are allowed to move only current classifier
-#                 # rows. Historical rows remain active rivals but are detached here.
+#                 with torch.no_grad():
+#                     reference_features = self.model.extract_features_with_backbone(
+#                         reference_backbone,
+#                         patch,
+#                         center_spectrum=spectrum,
+#                         return_aux=False,
+#                     ).ordered_features.detach()
+#                     physical_evidence = self.model.physical_spectral_evidence(spectrum).detach()
+#                     teacher_old_logits = reference_classifier(
+#                         reference_features,
+#                         class_ids=old_class_tensor,
+#                         trainable_class_ids=(),
+#                     ).logits.detach()
+
+#                 current_features = self.model.extract_features(
+#                     patch, center_spectrum=spectrum, return_aux=False
+#                 ).ordered_features
+#                 current_local = _targets_local(labels, new_class_tensor)
+#                 sample_weights = current_class_weights.index_select(0, current_local)
+
+#                 # CRITICAL ownership rule: all seen classes compete, only incoming
+#                 # rows receive gradient from labels that contain current classes only.
 #                 all_seen_output = classifier(
-#                     q,
-#                     class_ids=seen_ids_tensor,
-#                     trainable_class_ids=new_ids_tensor,
+#                     current_features,
+#                     class_ids=seen_class_tensor,
+#                     trainable_class_ids=new_class_tensor,
 #                 )
-#                 target_new_local = _targets_local(labels, new_ids_tensor)
-#                 sample_weights = class_weights.index_select(0, target_new_local)
 #                 classification = classification_objective(
 #                     logits=all_seen_output.logits,
 #                     class_ids=all_seen_output.class_ids,
 #                     labels_global=labels,
 #                     sample_weights=sample_weights,
 #                 )
-
-#                 hdc = historical_decision_consistency_loss(
-#                     reference_features=reference_q,
-#                     current_features=q,
-#                     historical_classifier_rows=historical_classifier_rows,
-#                     labels_global=labels,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
-#                 )
-
-#                 # Same direct-Q supervised contrast used in Phase 0. Only real
-#                 # current samples participate; no CDS center, pseudo feature, or
-#                 # second representation is introduced.
 #                 contrastive = supervised_contrastive_q_loss(
-#                     ordered_features=q,
+#                     ordered_features=current_features,
 #                     labels_global=labels,
-#                     logit_scale=classifier.logit_scale_value,
+#                     logit_scale=classifier.logit_scale,
 #                     sample_weights=sample_weights,
 #                 )
-
-#                 # Feature-side new->old separation. Classifier rows and scale are
-#                 # detached, so this objective can move Q but cannot move W. The
-#                 # complete all-seen CDS only prioritizes old/current conflicts.
-#                 separation_cosine = classifier.cosine_similarity(
-#                     q,
-#                     class_ids=seen_ids_tensor,
+#                 q_consistency = reference_q_consistency_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                 )
+#                 student_old_logits = classifier(
+#                     current_features,
+#                     class_ids=old_class_tensor,
 #                     trainable_class_ids=(),
-#                 )
-#                 separation_logits = separation_cosine * classifier.logit_scale_value.detach().to(
-#                     device=q.device, dtype=q.dtype
-#                 )
-#                 separation = hsi_cds_separation_loss(
-#                     logits=separation_logits,
-#                     class_ids=seen_ids_tensor,
-#                     labels_global=labels,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
+#                 ).logits
+#                 kd = logit_distillation_loss(
+#                     student_old_logits=student_old_logits,
+#                     teacher_old_logits=teacher_old_logits,
+#                     temperature=kd_temperature,
 #                     sample_weights=sample_weights,
 #                 )
-
-#                 # Classifier-side historical-region protection. Migrated I_Q locates
-#                 # each historical region, diagonal/off-diagonal V_Q bound its
-#                 # legitimate extent, and I_P/V_P prioritize historical/seen
-#                 # conflicts. This is the only loss allowed to realign old rows.
-#                 boundary = cds_regulator(
-#                     classifier=classifier,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
+#                 cds = historical_cds_preservation_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                     physical_spectral_evidence=physical_evidence,
+#                     reference_historical_structure=historical_structure,
+#                     current_historical_structure=epoch_historical_structure,
 #                 )
+#                 structural = regulator(
+#                     classifier=classifier,
+#                     seen_cds=epoch_seen_cds,
+#                     historical_class_count=len(old_class_ids),
+#                     reference_classifier=reference_classifier,
+#                     reference_historical_cds=reference_historical_cds,
+#                 )
+
+#                 # One coherent classifier-reconstruction rule is used for every
+#                 # incremental phase. Real current labels use the deployed all-seen
+#                 # cosine head but can update incoming rows only. In parallel, the
+#                 # whole seen-class CDS reconstructs the same classifier with equal
+#                 # per-class mass: I_Q/V_Q define directed robust class support and
+#                 # I_P/V_P define pair relevance. Old-source CDS may update old
+#                 # positives and seen rivals; new-source CDS keeps old rival rows
+#                 # detached. No prototype-only anchor or second classifier exists.
+#                 if not bool(torch.isfinite(structural.loss)):
+#                     raise RuntimeError("whole-CDS classifier reconstruction became NaN or Inf")
+
+#                 if not gradient_contract_checked:
+#                     tolerance = 64.0 * torch.finfo(classifier.weight.dtype).eps
+
+#                     ce_grad = torch.autograd.grad(
+#                         classification.loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     ce_old = self._row_grad_max(ce_grad, old_class_tensor)
+#                     ce_new = self._row_grad_max(ce_grad, new_class_tensor)
+#                     ce_future = self._row_grad_max(ce_grad, future_class_tensor)
+#                     if ce_old > tolerance:
+#                         raise RuntimeError("new-only CE leaked gradient into historical rows")
+#                     if ce_future > tolerance:
+#                         raise RuntimeError("new-only CE leaked gradient into future rows")
+#                     if ce_new <= tolerance:
+#                         raise RuntimeError("incoming rows received no real-current CE gradient")
+
+#                     old_cds_grad = torch.autograd.grad(
+#                         structural.old_class_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     old_cds_old = self._row_grad_max(old_cds_grad, old_class_tensor)
+#                     old_cds_new = self._row_grad_max(old_cds_grad, new_class_tensor)
+#                     old_cds_future = self._row_grad_max(old_cds_grad, future_class_tensor)
+#                     if old_cds_old <= tolerance or old_cds_new <= tolerance:
+#                         raise RuntimeError(
+#                             "historical whole-CDS reconstruction must update old positives and seen rivals"
+#                         )
+#                     if old_cds_future > tolerance:
+#                         raise RuntimeError("historical whole-CDS reconstruction leaked into future rows")
+
+#                     new_cds_grad = torch.autograd.grad(
+#                         structural.new_class_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     new_cds_old = self._row_grad_max(new_cds_grad, old_class_tensor)
+#                     new_cds_new = self._row_grad_max(new_cds_grad, new_class_tensor)
+#                     new_cds_future = self._row_grad_max(new_cds_grad, future_class_tensor)
+#                     if new_cds_old > tolerance:
+#                         raise RuntimeError("current-class CDS leaked gradient into historical rows")
+#                     if new_cds_new <= tolerance:
+#                         raise RuntimeError("current-class CDS produced no incoming-row gradient")
+#                     if new_cds_future > tolerance:
+#                         raise RuntimeError("current-class CDS leaked into future rows")
+
+#                     global_cds_grad = torch.autograd.grad(
+#                         structural.global_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     global_old = self._row_grad_max(global_cds_grad, old_class_tensor)
+#                     global_new = self._row_grad_max(global_cds_grad, new_class_tensor)
+#                     global_future = self._row_grad_max(global_cds_grad, future_class_tensor)
+#                     if global_old <= tolerance or global_new <= tolerance:
+#                         raise RuntimeError("global whole-CDS reconstruction must update all seen groups")
+#                     if global_future > tolerance:
+#                         raise RuntimeError("global whole-CDS reconstruction leaked into future rows")
+
+#                     retention_grad = torch.autograd.grad(
+#                         structural.old_old_retention_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     ret_old = self._row_grad_max(retention_grad, old_class_tensor)
+#                     ret_new = self._row_grad_max(retention_grad, new_class_tensor)
+#                     ret_future = self._row_grad_max(retention_grad, future_class_tensor)
+#                     if ret_new > tolerance or ret_future > tolerance:
+#                         raise RuntimeError("old-old retention changed a non-historical row")
+
+#                     print(
+#                         "[Gradient ownership] "
+#                         f"NewCE old={ce_old:.3e} new={ce_new:.3e} future={ce_future:.3e} | "
+#                         f"OldCDS old={old_cds_old:.3e} new={old_cds_new:.3e} | "
+#                         f"NewCDS old={new_cds_old:.3e} new={new_cds_new:.3e} | "
+#                         f"GlobalCDS old={global_old:.3e} new={global_new:.3e} future={global_future:.3e} | "
+#                         f"Retention old={ret_old:.3e} new={ret_new:.3e} future={ret_future:.3e}",
+#                         file=sys.stdout,
+#                     )
+#                     gradient_contract_checked = True
 
 #                 loss = (
 #                     classification.loss
-#                     + contrastive.loss
-#                     + hdc.loss
-#                     + separation.loss
-#                     + boundary.loss
+#                     + contrastive_weight * contrastive.loss
+#                     + q_consistency_weight * q_consistency.loss
+#                     + kd_logit_weight * kd.loss
+#                     + cds_weight * cds.loss
+#                     + structural.loss
 #                 )
 #                 if not bool(torch.isfinite(loss)):
-#                     raise RuntimeError(
-#                         "incremental CE + direct-Q contrast + HDC + CDS separation + classifier protection became NaN or Inf"
-#                     )
+#                     raise RuntimeError("joint incremental objective became NaN or Inf")
 #                 loss.backward()
 
-#                 if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
-#                     raise RuntimeError("previous backbone reference accumulated gradients")
-#                 if any(parameter.grad is not None for parameter in backbone_frozen):
-#                     raise RuntimeError("a frozen incremental backbone parameter accumulated gradients")
-#                 for parameter in backbone_trainable:
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("incremental backbone gradient contains NaN or Inf")
-#                 for parameter in classifier.parameters():
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("incremental classifier gradient contains NaN or Inf")
-#                 if gradient_clip > 0.0:
-#                     torch.nn.utils.clip_grad_norm_(backbone_trainable, gradient_clip, error_if_nonfinite=True)
-
-#                 backbone_optimizer.step()
-#                 classifier_optimizer.step()
-
-#                 n = int(labels.numel())
-#                 classification_sum += float(classification.loss.detach().item()) * n
-#                 hdc_sum += float(hdc.loss.detach().item()) * n
-#                 hdc_rmse_sum += float(hdc.relation_rmse.detach().item()) * n
-#                 contrastive_sum += float(contrastive.loss.detach().item()) * n
-#                 contrastive_gap_sum += float(contrastive.similarity_gap.detach().item()) * n
-#                 contrastive_anchor_fraction_sum += float(contrastive.valid_anchor_fraction.detach().item()) * n
-#                 separation_sum += float(separation.loss.detach().item()) * n
-#                 separation_margin_sum += float(separation.margin_mean.detach().item()) * n
-#                 boundary_sum += float(boundary.loss.detach().item()) * n
-#                 boundary_clearance_sum += float(boundary.structural_clearance_mean.detach().item()) * n
-#                 boundary_clearance_min_value = min(
-#                     boundary_clearance_min_value,
-#                     float(boundary.structural_clearance_min.detach().item()),
-#                 )
-#                 boundary_absolute_clearance_sum += float(boundary.absolute_clearance_mean.detach().item()) * n
-#                 boundary_relational_clearance_sum += float(boundary.relational_clearance_mean.detach().item()) * n
-#                 boundary_unsafe_sum += float(boundary.unsafe_pair_fraction.detach().item()) * n
-#                 boundary_pair_weight_sum += float(boundary.pair_weight_mean.detach().item()) * n
-#                 boundary_learned_risk_sum += float(boundary.learned_region_risk_mean.detach().item()) * n
-#                 boundary_spectral_risk_sum += float(boundary.spectral_region_risk_mean.detach().item()) * n
-#                 total_sum += float(loss.detach().item()) * n
-
-#                 prediction = all_seen_output.prediction.detach()
-#                 correct += int(prediction.eq(labels).sum().item())
-#                 sample_count += n
-#                 for class_id in new_ids:
-#                     mask = labels.eq(class_id)
-#                     count = int(mask.sum().item())
-#                     per_class_total[class_id] += count
-#                     if count:
-#                         per_class_correct[class_id] += int(prediction[mask].eq(labels[mask]).sum().item())
-
-#             if sample_count != expected_samples:
-#                 raise RuntimeError("incremental TRAIN loader did not traverse the complete current split")
-
-#             backbone_scheduler.step()
-#             classifier_scheduler.step()
-
-#             self.model.eval()
-#             eval_working = self._refresh_training_state(
-#                 train_eval_loader=train_eval_loader,
-#                 phase_start_historical=phase_start_historical,
-#                 current_reference=phase_start_current,
-#                 phase_affinity=phase_affinity,
-#                 reference_q_full=reference_q_full,
-#                 reference_labels=reference_labels,
-#                 reference_spectra=reference_spectra,
-#                 reference_coords=reference_coords,
-#                 current_physical=current_physical,
-#                 new_ids=new_ids,
-#                 seen_ids=seen_ids,
-#             )
-#             final_working = eval_working
-
-#             new_train_all_seen = self.evaluate_loader(
-#                 train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-#             )
-#             new_train_only = self.evaluate_loader(
-#                 train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-#             )
-#             validation_all_seen = None if val_loader is None else self.evaluate_loader(
-#                 val_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-#             )
-#             validation_new_only = None if val_loader is None else self.evaluate_loader(
-#                 val_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-#             )
-
-#             online_per_class = {cid: per_class_correct[cid] / float(per_class_total[cid]) for cid in new_ids}
-#             diag = eval_working.alignment
-#             record = {
-#                 "epoch": epoch + 1,
-#                 "learning_rate": epoch_lr,
-#                 "classifier_learning_rate": epoch_head_lr,
-#                 "classification_loss": classification_sum / sample_count,
-#                 "historical_decision_consistency_loss": hdc_sum / sample_count,
-#                 "historical_decision_relation_rmse": hdc_rmse_sum / sample_count,
-#                 "contrastive_loss": contrastive_sum / sample_count,
-#                 "contrastive_similarity_gap": contrastive_gap_sum / sample_count,
-#                 "contrastive_valid_anchor_fraction": contrastive_anchor_fraction_sum / sample_count,
-#                 "hsi_cds_separation_loss": separation_sum / sample_count,
-#                 "hsi_cds_separation_margin_mean": separation_margin_sum / sample_count,
-#                 "cds_boundary_loss": boundary_sum / sample_count,
-#                 "cds_boundary_clearance_mean": boundary_clearance_sum / sample_count,
-#                 "cds_boundary_clearance_min": boundary_clearance_min_value,
-#                 "cds_boundary_absolute_clearance_mean": boundary_absolute_clearance_sum / sample_count,
-#                 "cds_boundary_relational_clearance_mean": boundary_relational_clearance_sum / sample_count,
-#                 "cds_boundary_unsafe_pair_fraction": boundary_unsafe_sum / sample_count,
-#                 "cds_boundary_pair_weight_mean": boundary_pair_weight_sum / sample_count,
-#                 "cds_boundary_learned_risk_mean": boundary_learned_risk_sum / sample_count,
-#                 "cds_boundary_spectral_risk_mean": boundary_spectral_risk_sum / sample_count,
-#                 "total_loss": total_sum / sample_count,
-#                 "new_train_oa_online": correct / float(sample_count),
-#                 "new_train_ba_online": sum(online_per_class.values()) / float(len(online_per_class)),
-#                 "new_train_min_online": min(online_per_class.values()),
-#                 "new_train_ba_all_seen": float(new_train_all_seen["balanced_accuracy"]),
-#                 "new_train_ba_new_only": float(new_train_only["balanced_accuracy"]),
-#                 "validation_new_ba_all_seen": None if validation_all_seen is None else float(validation_all_seen["balanced_accuracy"]),
-#                 "validation_new_ba_new_only": None if validation_new_only is None else float(validation_new_only["balanced_accuracy"]),
-#                 "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-#                 "feature_drift_rms": float(diag.representation_drift_rms.item()),
-#                 "reference_q_rms": float(reference_q_rms.item()),
-#                 "current_q_rms": float(self._mean_sample_rms(eval_working.current_rows["ordered_features"]).item()),
-#                 "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
-#             }
-#             history.append(record)
-
-#             message = (
-#                 f"[Epoch {epoch + 1:03d}/{epoch_count:03d}] "
-#                 f"CE={record['classification_loss']:.4f} Con={record['contrastive_loss']:.4f} "
-#                 f"ConGap={record['contrastive_similarity_gap']:.4f} "
-#                 f"HDC={record['historical_decision_consistency_loss']:.4f} "
-#                 f"Sep={record['hsi_cds_separation_loss']:.4f} "
-#                 f"Boundary={record['cds_boundary_loss']:.4f} "
-#                 f"ClearMin={record['cds_boundary_clearance_min']:.4f} "
-#                 f"LR={record['learning_rate']:.2e} HeadLR={record['classifier_learning_rate']:.2e} | "
-#                 f"NewOnlyBA={100*record['new_train_ba_new_only']:.2f}% "
-#                 f"AllSeenBA={100*record['new_train_ba_all_seen']:.2f}% "
-#                 f"MapErr={record['semantic_shift_mapping_error']:.4f}"
-#             )
-#             if validation_all_seen is not None:
-#                 message += (
-#                     f" | ValNewOnlyBA={100*record['validation_new_ba_new_only']:.2f}%"
-#                     f" ValAllSeenBA={100*record['validation_new_ba_all_seen']:.2f}%"
-#                 )
-#             tqdm.write(message, file=sys.stdout)
-
-#         progress.close()
-#         if final_working is None:
-#             raise RuntimeError("incremental phase produced no working CDS")
-
-#         self.model.eval()
-#         final_state = self._refresh_training_state(
-#             train_eval_loader=train_eval_loader,
-#             phase_start_historical=phase_start_historical,
-#             current_reference=phase_start_current,
-#             phase_affinity=phase_affinity,
-#             reference_q_full=reference_q_full,
-#             reference_labels=reference_labels,
-#             reference_spectra=reference_spectra,
-#             reference_coords=reference_coords,
-#             current_physical=current_physical,
-#             new_ids=new_ids,
-#             seen_ids=seen_ids,
-#         )
-
-#         final_old_only = self.evaluate_loader(
-#             old_reporting_loader, class_ids=old_ids, target_class_ids=old_ids, structures=final_state.migrated_historical
-#         )
-#         final_old_all_seen = self.evaluate_loader(
-#             old_reporting_loader, class_ids=seen_ids, target_class_ids=old_ids, structures=final_state.seen
-#         )
-#         final_new_all_seen = self.evaluate_loader(
-#             train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=final_state.seen
-#         )
-#         final_new_only = self.evaluate_loader(
-#             train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=final_state.current
-#         )
-
-#         with torch.no_grad():
-#             final_boundary_objective = cds_regulator(
-#                 classifier=classifier,
-#                 seen_cds=final_state.seen_cds,
-#                 historical_class_count=len(old_ids),
-#             )
-#         self.model.replace_class_structure(final_state.seen)
-#         self.model.validate_finalized_state()
-#         self.dataset.finalize_phase(phase_id)
-
-#         cumulative_loader = self.dataset.get_reporting_dataloader(phase_id, batch_size=eval_batch_size)
-#         cumulative = self.evaluate_loader(cumulative_loader, class_ids=seen_ids, target_class_ids=seen_ids)
-#         groups = old_new_summary(cumulative, old_class_ids=old_ids, new_class_ids=new_ids)
-#         forgetting = float(old_before["balanced_accuracy"]) - float(groups["old"]["balanced_accuracy"])
-#         phase_origin = phase_origin_confusion_diagnostics(
-#             cumulative,
-#             phase_to_classes={index: self.dataset.phase_to_classes[index] for index in range(phase_id + 1)},
-#         )
-
-#         diag = final_state.alignment
-#         method_state = {
-#             "classifier": "single_bias_free_scaled_cosine_head",
-#             "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}; all inter-class CDS is derived on demand",
-#             "historical_supervision": "HDC_plus_feature_side_old_rival_separation_plus_whole_CDS_classifier_region_protection",
-#             "historical_cds_information": "I_Q locates migrated historical Q regions; V_Q bounds absolute/relational extent; I_P,V_P prioritize historical/seen classifier conflicts through whole-CDS risk",
-#             "representation_objective": "real_current_CE_plus_direct_Q_supervised_contrast_plus_HDC_plus_feature_only_old_rival_separation",
-#             "classifier_objective": "migrated_old_CDS_absolute_and_relational_clearance_against_all_seen_rows; current_CE_detaches_old_rows",
-#             "stores_pseudo_features": False,
-#             "reconstructs_historical_features": False,
-#             "uses_input_inversion": False,
-#             "uses_stage_B": False,
-#             "uses_covariance_classifier": False,
-#             "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-#             "semantic_shift_channel_error_max": float(diag.task_mapping_channel_error_max.item()),
-#             "feature_drift_rms": float(diag.representation_drift_rms.item()),
-#             "task_translation_rms": float(diag.task_translation_rms.item()),
-#             "task_scale_deviation_rms": float(diag.task_scale_deviation_rms.item()),
-#             "reference_q_rms": float(reference_q_rms.item()),
-#             "current_q_rms": float(self._mean_sample_rms(final_state.current_rows["ordered_features"]).item()),
-#             "phase_start_old_ba": float(old_before["balanced_accuracy"]),
-#             "phase_start_old_all_seen_ba": float(phase_start_old_all_seen["balanced_accuracy"]),
-#             "final_old_only_ba": float(final_old_only["balanced_accuracy"]),
-#             "final_old_all_seen_ba": float(final_old_all_seen["balanced_accuracy"]),
-#             "representation_forgetting": float(old_before["balanced_accuracy"]) - float(final_old_only["balanced_accuracy"]),
-#             "decision_interference_start": float(old_before["balanced_accuracy"]) - float(phase_start_old_all_seen["balanced_accuracy"]),
-#             "decision_interference_final": float(final_old_only["balanced_accuracy"]) - float(final_old_all_seen["balanced_accuracy"]),
-#             "final_new_train_all_seen_ba": float(final_new_all_seen["balanced_accuracy"]),
-#             "final_new_train_only_ba": float(final_new_only["balanced_accuracy"]),
-#             "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
-#             "final_classification_loss": float(history[-1]["classification_loss"]),
-#             "final_contrastive_loss": float(history[-1]["contrastive_loss"]),
-#             "final_contrastive_similarity_gap": float(history[-1]["contrastive_similarity_gap"]),
-#             "final_hsi_cds_separation_loss": float(history[-1]["hsi_cds_separation_loss"]),
-#             "final_hsi_cds_separation_margin_mean": float(history[-1]["hsi_cds_separation_margin_mean"]),
-#             "final_historical_decision_consistency_loss": float(history[-1]["historical_decision_consistency_loss"]),
-#             "final_cds_boundary_loss": float(final_boundary_objective.loss.item()),
-#             "final_cds_boundary_clearance_mean": float(final_boundary_objective.structural_clearance_mean.item()),
-#             "final_cds_boundary_clearance_min": float(final_boundary_objective.structural_clearance_min.item()),
-#             "final_cds_boundary_absolute_clearance_mean": float(final_boundary_objective.absolute_clearance_mean.item()),
-#             "final_cds_boundary_relational_clearance_mean": float(final_boundary_objective.relational_clearance_mean.item()),
-#             "final_cds_boundary_unsafe_pair_fraction": float(final_boundary_objective.unsafe_pair_fraction.item()),
-#             "final_cds_boundary_pair_weight_mean": float(final_boundary_objective.pair_weight_mean.item()),
-#             "final_cds_boundary_learned_risk_mean": float(final_boundary_objective.learned_region_risk_mean.item()),
-#             "final_cds_boundary_spectral_risk_mean": float(final_boundary_objective.spectral_region_risk_mean.item()),
-#             "historical_classifier_rows_frozen_for_current_CE": True,
-#             "historical_classifier_rows_realign_via_migrated_CDS": True,
-#         }
-
-#         return {
-#             "phase": phase_id,
-#             "old_class_ids": list(old_ids),
-#             "new_class_ids": list(new_ids),
-#             "seen_class_ids": list(seen_ids),
-#             "history": history,
-#             "final_epoch": epoch_count,
-#             "cumulative_test": cumulative,
-#             "old_new": groups,
-#             "forgetting": forgetting,
-#             "method_state": method_state,
-#             "phase_origin_confusion": phase_origin,
-#             "structure_committed": True,
-#             "phase_finalized": True,
-#         }
-
-
-# __all__ = ["IncrementalPhaseTrainer"]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# """Incremental NECIL-HSI training with one Q, one all-seen CDS and one cosine head.
-
-# Current real HSI supplies CE and direct-Q supervised contrast. HDC stabilizes the
-# representation against the frozen previous backbone/old classifier rows. A
-# feature-only old-rival separation term keeps current Q away from historical
-# decisions. The complete all-seen CDS then protects the SAME classifier: I_Q,V_Q
-# define historical decision regions and I_P,V_P prioritize spectrally confusable
-# old/current boundaries. Historical classifier rows remain bitwise frozen.
-# """
-
-# from dataclasses import dataclass
-# import math
-# import sys
-# from numbers import Integral, Real
-# from typing import Any, Dict, Mapping
-
-# import torch
-# from tqdm import tqdm
-
-# from losses.loss import (
-#     classification_objective,
-#     supervised_contrastive_q_loss,
-#     historical_decision_consistency_loss,
-#     hsi_cds_separation_loss,
-# )
-# from models.cds_decision_region import HSICDSDecisionRegionRegulator
-# from models.classifier import SpectralCDSClassifier
-# from models.geometry_bank import (
-#     ClassDiscriminativeStructureState,
-#     PhysicalSpectralStructureBatch,
-#     ClassStructureBatch,
-#     merge_class_structure_batches,
-# )
-# from models.phase_coordinate_alignment import (
-#     CDSAffinityState,
-#     CurrentClassResidual,
-#     PhaseAlignmentDiagnostics,
-#     PhaseCoordinateTransform,
-#     align_historical_structure,
-#     derive_cds_affinity,
-# )
-# from utils.eval import old_new_summary, phase_origin_confusion_diagnostics
-
-# Tensor = torch.Tensor
-
-
-# def _positive_int(value: object, *, name: str) -> int:
-#     if isinstance(value, bool) or not isinstance(value, (Integral, Real)):
-#         raise ValueError(f"{name} must be a positive integer")
-#     number = float(value)
-#     if not math.isfinite(number) or not number.is_integer() or number <= 0:
-#         raise ValueError(f"{name} must be a positive integer")
-#     return int(number)
-
-
-# def _finite_positive(name: str, value: object) -> float:
-#     result = float(value)
-#     if not math.isfinite(result) or result <= 0.0:
-#         raise ValueError(f"{name} must be finite and positive")
-#     return result
-
-
-# def _finite_nonnegative(name: str, value: object) -> float:
-#     result = float(value)
-#     if not math.isfinite(result) or result < 0.0:
-#         raise ValueError(f"{name} must be finite and non-negative")
-#     return result
-
-
-# def _clone_structure(batch: ClassStructureBatch) -> ClassStructureBatch:
-#     if not isinstance(batch, ClassStructureBatch) or batch.class_count <= 0:
-#         raise ValueError("cannot clone an empty class structure")
-#     return ClassStructureBatch(
-#         class_ids=batch.class_ids.detach().clone(),
-#         sample_counts=batch.sample_counts.detach().clone(),
-#         identity=batch.identity.detach().clone(),
-#         variation=batch.variation.detach().clone(),
-#         spectral_identity=batch.spectral_identity.detach().clone(),
-#         spectral_variation=batch.spectral_variation.detach().clone(),
-#     )
-
-
-# def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
-#     value = torch.as_tensor(labels)
-#     ids = torch.as_tensor(class_ids)
-#     if value.ndim != 1 or value.numel() == 0 or value.dtype != torch.long:
-#         raise ValueError("labels must be non-empty rank-one torch.long")
-#     if ids.ndim != 1 or ids.numel() < 1 or ids.dtype != torch.long:
-#         raise ValueError("class_ids must be non-empty rank-one torch.long")
-#     if value.device != ids.device:
-#         raise ValueError("labels and class_ids must share device")
-#     matches = value.unsqueeze(1).eq(ids.unsqueeze(0))
-#     if not bool(matches.sum(dim=1).eq(1).all()):
-#         raise ValueError("labels contain a class absent from class_ids")
-#     return matches.to(torch.long).argmax(dim=1)
-
-
-# def _batch_coordinates(batch: Mapping[str, Any], *, expected_rows: int) -> Tensor:
-#     if "coord" not in batch:
-#         raise RuntimeError("incremental TRAIN batches must expose coord for phase-start reference lookup")
-#     coords = torch.as_tensor(batch["coord"])
-#     if coords.shape != (expected_rows, 2):
-#         raise RuntimeError("coord must be [N,2] and batch-aligned")
-#     if coords.dtype == torch.bool or coords.is_complex() or torch.is_floating_point(coords):
-#         raise RuntimeError("coord must use an integer dtype")
-#     return coords.to(dtype=torch.long, device="cpu")
-
-
-# @dataclass(frozen=True)
-# class CurrentTrainingState:
-#     task_mapped_historical: ClassStructureBatch
-#     migrated_historical: ClassStructureBatch
-#     current: ClassStructureBatch
-#     seen: ClassStructureBatch
-#     seen_cds: ClassDiscriminativeStructureState
-#     current_rows: Dict[str, Tensor]
-#     transform: PhaseCoordinateTransform
-#     affinity: CDSAffinityState
-#     residual: CurrentClassResidual
-#     alignment: PhaseAlignmentDiagnostics
-
-
-# class IncrementalPhaseTrainer:
-#     INCREMENTAL_RESULT_FIELDS = frozenset(
-#         {
-#             "phase", "old_class_ids", "new_class_ids", "seen_class_ids", "history",
-#             "final_epoch", "cumulative_test", "old_new", "forgetting", "method_state",
-#             "structure_committed", "phase_finalized",
-#         }
-#     )
-
-#     def _require_classifier(self) -> SpectralCDSClassifier:
-#         classifier = getattr(self.model, "classifier", None)
-#         if not isinstance(classifier, SpectralCDSClassifier) or classifier.parameter_count <= 0:
-#             raise RuntimeError("model.classifier must be the trainable cosine SpectralCDSClassifier")
-#         return classifier
-
-#     def _phase_classes(self, phase: int) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-#         old_ids = tuple(self._validated_class_ids(self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"))
-#         new_ids = tuple(self._validated_class_ids(self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"))
-#         seen_ids = tuple(self._validated_class_ids(self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"))
-#         if not old_ids or not new_ids or set(old_ids).intersection(new_ids):
-#             raise RuntimeError("incremental phase has invalid old/new class partition")
-#         if seen_ids != old_ids + new_ids:
-#             raise RuntimeError("seen classes must equal old classes followed by new classes")
-#         if tuple(self.model.committed_class_ids) != old_ids:
-#             raise RuntimeError("historical CDS does not match the old class set")
-#         return old_ids, new_ids, seen_ids
-
-#     @staticmethod
-#     def _assert_frozen_reference(reference_backbone: torch.nn.Module) -> None:
-#         reference_backbone.eval()
-#         if any(parameter.requires_grad for parameter in reference_backbone.parameters()):
-#             raise RuntimeError("previous backbone reference must remain fully frozen")
-#         if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
-#             raise RuntimeError("previous backbone reference must not carry gradients")
-
-#     @staticmethod
-#     @torch.no_grad()
-#     def _assert_reference_matches_phase_start(reference_backbone: torch.nn.Module, current_backbone: torch.nn.Module) -> None:
-#         left, right = reference_backbone.state_dict(), current_backbone.state_dict()
-#         if tuple(left.keys()) != tuple(right.keys()):
-#             raise RuntimeError("previous/current backbone schemas differ at phase start")
-#         for name in left:
-#             if left[name].shape != right[name].shape or left[name].dtype != right[name].dtype:
-#                 raise RuntimeError(f"phase-start backbone state differs at {name}")
-#             if not torch.equal(left[name].detach().cpu(), right[name].detach().cpu()):
-#                 raise RuntimeError(f"previous backbone is not the finalized phase-start state ({name})")
-
-#     @torch.no_grad()
-#     def _current_class_weights(self, loader: Any, *, new_ids: tuple[int, ...]) -> tuple[Tensor, int]:
-#         counts = {class_id: 0 for class_id in new_ids}
-#         total = 0
-#         valid = set(new_ids)
-#         for batch in loader:
-#             _, _, labels = self.unpack_batch(batch)
-#             observed = set(int(v) for v in labels.unique().detach().cpu().tolist())
-#             outside = observed - valid
-#             if outside:
-#                 raise RuntimeError(f"incremental TRAIN loader contains non-current classes {sorted(outside)}")
-#             for class_id in new_ids:
-#                 count = int(labels.eq(class_id).sum().item())
-#                 counts[class_id] += count
-#                 total += count
-#         if total <= 0 or any(counts[c] <= 0 for c in new_ids):
-#             raise RuntimeError("incremental TRAIN split is empty or misses a current class")
-#         class_count = len(new_ids)
-#         weights = torch.tensor(
-#             [total / float(class_count * counts[c]) for c in new_ids],
-#             device=self.device,
-#             dtype=self.model.dtype,
-#         )
-#         return weights, total
-
-#     @staticmethod
-#     def _row_lookup(reference_coords: Tensor) -> dict[tuple[int, int], int]:
-#         if reference_coords.ndim != 2 or reference_coords.size(1) != 2:
-#             raise ValueError("reference_coords must be [N,2]")
-#         lookup: dict[tuple[int, int], int] = {}
-#         for row, pair in enumerate(reference_coords.detach().cpu().tolist()):
-#             key = (int(pair[0]), int(pair[1]))
-#             if key in lookup:
-#                 raise RuntimeError(f"duplicate current TRAIN coordinate {key}")
-#             lookup[key] = row
-#         return lookup
-
-#     @staticmethod
-#     def _cached_rows_for_batch(batch_coords: Tensor, *, lookup: dict[tuple[int, int], int], cached: Tensor) -> Tensor:
-#         rows: list[int] = []
-#         for pair in batch_coords.tolist():
-#             key = (int(pair[0]), int(pair[1]))
-#             if key not in lookup:
-#                 raise RuntimeError(f"current TRAIN batch coordinate {key} is absent from phase-start cache")
-#             rows.append(lookup[key])
-#         return cached.index_select(0, torch.tensor(rows, device=cached.device, dtype=torch.long))
-
-#     @staticmethod
-#     def _mean_sample_rms(features: Tensor) -> Tensor:
-#         value = torch.as_tensor(features)
-#         if value.ndim != 3 or value.size(0) == 0:
-#             raise ValueError("features must be non-empty [N,K,D]")
-#         return value.square().mean(dim=(1, 2)).sqrt().mean()
-
-#     @torch.no_grad()
-#     def _refresh_training_state(
-#         self,
-#         *,
-#         train_eval_loader: Any,
-#         phase_start_historical: ClassStructureBatch,
-#         current_reference: ClassStructureBatch,
-#         phase_affinity: CDSAffinityState,
-#         reference_q_full: Tensor,
-#         reference_labels: Tensor,
-#         reference_spectra: Tensor,
-#         reference_coords: Tensor,
-#         current_physical: PhysicalSpectralStructureBatch,
-#         new_ids: tuple[int, ...],
-#         seen_ids: tuple[int, ...],
-#     ) -> CurrentTrainingState:
-#         current_rows = self.collect_ordered_features(train_eval_loader, require_coordinates=True)
-#         if not torch.equal(current_rows["labels"], reference_labels):
-#             raise RuntimeError("current TRAIN labels/order changed within phase")
-#         if not torch.equal(current_rows["coords"], reference_coords):
-#             raise RuntimeError("current TRAIN coordinates/order changed within phase")
-#         if not torch.equal(current_rows["raw_center_spectra"], reference_spectra):
-#             raise RuntimeError("current TRAIN spectra/order changed within phase")
-
-#         current_structure = self.model.estimate_class_structure(
-#             current_rows["ordered_features"],
-#             None,
-#             current_rows["labels"],
-#             class_ids=new_ids,
-#             physical_structure=current_physical,
-#         )
-#         task_mapped_old, migrated_old, transform, affinity, residual, alignment = align_historical_structure(
-#             historical=phase_start_historical,
-#             current_reference=current_reference,
-#             current_structure=current_structure,
-#             reference_features=reference_q_full,
-#             current_features=current_rows["ordered_features"],
-#             affinity=phase_affinity,
-#         )
-#         seen_structure = merge_class_structure_batches((migrated_old, current_structure))
-#         actual = tuple(int(v) for v in seen_structure.class_ids.detach().cpu().tolist())
-#         if actual != seen_ids:
-#             raise RuntimeError("all-seen CDS class order changed")
-#         seen_cds = self.model.build_class_discriminative_structure(seen_structure)
-#         return CurrentTrainingState(
-#             task_mapped_historical=task_mapped_old,
-#             migrated_historical=migrated_old,
-#             current=current_structure,
-#             seen=seen_structure,
-#             seen_cds=seen_cds,
-#             current_rows=current_rows,
-#             transform=transform,
-#             affinity=affinity,
-#             residual=residual,
-#             alignment=alignment,
-#         )
-
-#     def train_incremental_phase(
-#         self,
-#         *,
-#         phase: int,
-#         epochs: int,
-#         batch_size: int,
-#         lr: float,
-#         reference_backbone: torch.nn.Module,
-#     ) -> Dict[str, Any]:
-#         phase_id = _positive_int(phase, name="phase")
-#         epoch_count = _positive_int(epochs, name="epochs")
-#         train_batch_size = _positive_int(batch_size, name="batch_size")
-#         backbone_learning_rate = _finite_positive("lr_inc", lr)
-#         classifier_learning_rate = _finite_positive("lr", self.cfg("lr", backbone_learning_rate))
-#         eval_batch_size = _positive_int(self.cfg("eval_batch_size", 256), name="eval_batch_size")
-#         gradient_clip = _finite_nonnegative("gradient_clip", self.cfg("gradient_clip", 0.0))
-#         weight_decay = _finite_nonnegative("weight_decay", self.cfg("weight_decay", 1e-4))
-
-#         self.model.validate_finalized_state()
-#         classifier = self._require_classifier()
-#         self._assert_frozen_reference(reference_backbone)
-#         self._assert_reference_matches_phase_start(reference_backbone, self.model.backbone)
-
-#         previous_phase = phase_id - 1
-#         previous_seen = tuple(self._validated_class_ids(self.dataset.get_seen_classes(previous_phase), name="previous_seen_classes"))
-#         old_reporting_loader = self.dataset.get_reporting_dataloader(previous_phase, batch_size=eval_batch_size)
-#         old_before = self.evaluate_loader(old_reporting_loader, class_ids=previous_seen, target_class_ids=previous_seen)
-
-#         self.dataset.start_phase(phase_id)
-#         old_ids, new_ids, seen_ids = self._phase_classes(phase_id)
-#         old_ids_tensor = torch.tensor(old_ids, device=self.device, dtype=torch.long)
-#         new_ids_tensor = torch.tensor(new_ids, device=self.device, dtype=torch.long)
-#         seen_ids_tensor = torch.tensor(seen_ids, device=self.device, dtype=torch.long)
-#         phase_start_historical = _clone_structure(self.model.structure_bank.class_structures(old_ids))
-
-#         self.model.set_incremental_trainability()
-#         backbone_trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
-#         backbone_frozen = [p for p in self.model.backbone.parameters() if not p.requires_grad]
-#         if not backbone_trainable:
-#             raise RuntimeError("incremental backbone has no trainable parameters")
-
-#         structure_loader_factory = getattr(self.dataset, "get_phase_structure_dataloader", None)
-#         train_eval_loader = (
-#             structure_loader_factory(phase_id, batch_size=eval_batch_size)
-#             if callable(structure_loader_factory)
-#             else self.dataset.get_phase_dataloader(
-#                 phase_id, split="train", batch_size=eval_batch_size, shuffle=False
-#             )
-#         )
-#         class_weights, expected_samples = self._current_class_weights(train_eval_loader, new_ids=new_ids)
-
-#         reference_train = self.collect_ordered_features(
-#             train_eval_loader, backbone=reference_backbone, require_coordinates=True
-#         )
-#         reference_q_full = reference_train["ordered_features"].detach()
-#         reference_spectra = reference_train["raw_center_spectra"].detach()
-#         reference_labels = reference_train["labels"].detach()
-#         reference_coords = reference_train["coords"]
-#         observed = tuple(sorted(int(v) for v in reference_labels.unique().detach().cpu().tolist()))
-#         if observed != tuple(sorted(new_ids)):
-#             raise RuntimeError("incremental TRAIN rows do not match current phase classes")
-#         current_physical = self.model.estimate_physical_class_structure(
-#             reference_spectra, reference_labels, class_ids=new_ids
-#         )
-#         cache_lookup = self._row_lookup(reference_coords)
-#         reference_q_rms = self._mean_sample_rms(reference_q_full).detach()
-
-#         # The previous tested old rows are the deployed historical decision rows
-#         # and remain bitwise frozen for the entire phase. They are also the HDC
-#         # reference used on the same legal current TRAIN samples.
-#         historical_classifier_rows = classifier.class_weight(old_ids_tensor).detach().clone()
-
-#         phase_start_current = self.model.estimate_class_structure(
-#             reference_q_full,
-#             None,
-#             reference_labels,
-#             class_ids=new_ids,
-#             physical_structure=current_physical,
-#         )
-#         phase_start_seen = merge_class_structure_batches((phase_start_historical, phase_start_current))
-#         phase_affinity = derive_cds_affinity(
-#             historical=phase_start_historical,
-#             current_reference=phase_start_current,
-#         )
-
-#         # New classifier rows are NOT initialized from I_Q or any CDS center.
-#         # They retain their deterministic model initialization and are learned
-#         # from real current samples. The complete CDS constrains them through
-#         # whole-CDS contrast and boundary clearance; historical rows stay fixed.
-#         if not torch.equal(classifier.class_weight(old_ids_tensor), historical_classifier_rows):
-#             raise RuntimeError("historical classifier rows changed before incremental optimization")
-
-#         phase_start_old_all_seen = self.evaluate_loader(
-#             old_reporting_loader,
-#             class_ids=seen_ids,
-#             target_class_ids=old_ids,
-#             structures=phase_start_seen,
-#         )
-
-#         print(
-#             f"[Phase {phase_id} start] PhaseStartOldBA={100*float(old_before['balanced_accuracy']):.2f}% "
-#             f"OldAllSeen={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% | "
-#             f"Old={list(old_ids)} New={list(new_ids)} Seen={list(seen_ids)}",
-#             file=sys.stdout,
-#         )
-
-#         backbone_optimizer = torch.optim.AdamW(
-#             [{"params": backbone_trainable, "weight_decay": weight_decay}],
-#             lr=backbone_learning_rate,
-#         )
-#         classifier_optimizer = torch.optim.AdamW(
-#             list(classifier.parameters()), lr=classifier_learning_rate, weight_decay=0.0
-#         )
-#         backbone_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-#             backbone_optimizer, T_max=epoch_count, eta_min=0.0
-#         )
-#         classifier_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-#             classifier_optimizer, T_max=epoch_count, eta_min=0.0
-#         )
-
-#         train_loader = self.dataset.get_phase_dataloader(
-#             phase_id, split="train", batch_size=train_batch_size, shuffle=True
-#         )
-#         val_loader = (
-#             self.dataset.get_phase_dataloader(phase_id, split="val", batch_size=eval_batch_size, shuffle=False)
-#             if self.dataset.validation_enabled else None
-#         )
-#         cds_regulator = HSICDSDecisionRegionRegulator().to(self.device)
-#         if cds_regulator.parameter_count != 0:
-#             raise RuntimeError("CDS decision-region regulator must remain parameter-free")
-
-#         history: list[dict[str, Any]] = []
-#         progress = tqdm(
-#             range(epoch_count),
-#             desc=f"Phase {phase_id} all-seen CDS continual learning",
-#             unit="epoch",
-#             dynamic_ncols=True,
-#             file=sys.stdout,
-#         )
-
-#         final_working: CurrentTrainingState | None = None
-#         for epoch in progress:
-#             self.model.eval()
-#             working = self._refresh_training_state(
-#                 train_eval_loader=train_eval_loader,
-#                 phase_start_historical=phase_start_historical,
-#                 current_reference=phase_start_current,
-#                 phase_affinity=phase_affinity,
-#                 reference_q_full=reference_q_full,
-#                 reference_labels=reference_labels,
-#                 reference_spectra=reference_spectra,
-#                 reference_coords=reference_coords,
-#                 current_physical=current_physical,
-#                 new_ids=new_ids,
-#                 seen_ids=seen_ids,
-#             )
-
-#             self.model.train()
-#             epoch_lr = float(backbone_optimizer.param_groups[0]["lr"])
-#             epoch_head_lr = float(classifier_optimizer.param_groups[0]["lr"])
-#             classification_sum = hdc_sum = hdc_rmse_sum = 0.0
-#             contrastive_sum = contrastive_gap_sum = contrastive_anchor_fraction_sum = 0.0
-#             separation_sum = separation_margin_sum = 0.0
-#             boundary_sum = boundary_clearance_sum = 0.0
-#             boundary_clearance_min_value = float("inf")
-#             boundary_absolute_clearance_sum = boundary_relational_clearance_sum = 0.0
-#             boundary_unsafe_sum = 0.0
-#             boundary_pair_weight_sum = boundary_learned_risk_sum = boundary_spectral_risk_sum = 0.0
-#             total_sum = 0.0
-#             correct = sample_count = 0
-#             per_class_correct = {class_id: 0 for class_id in new_ids}
-#             per_class_total = {class_id: 0 for class_id in new_ids}
-
-#             for batch in train_loader:
-#                 patch, spectrum, labels = self.unpack_batch(batch)
-#                 batch_coords = _batch_coordinates(batch, expected_rows=int(labels.numel()))
-#                 backbone_optimizer.zero_grad(set_to_none=True)
-#                 classifier_optimizer.zero_grad(set_to_none=True)
-
-#                 q = self.model.extract_features(patch, center_spectrum=spectrum, return_aux=False).ordered_features
-#                 reference_q = self._cached_rows_for_batch(batch_coords, lookup=cache_lookup, cached=reference_q_full)
-
-#                 # Real current labels are allowed to move only current classifier
-#                 # rows. Historical rows remain active rivals but are detached here.
-#                 all_seen_output = classifier(
-#                     q,
-#                     class_ids=seen_ids_tensor,
-#                     trainable_class_ids=new_ids_tensor,
-#                 )
-#                 target_new_local = _targets_local(labels, new_ids_tensor)
-#                 sample_weights = class_weights.index_select(0, target_new_local)
-#                 classification = classification_objective(
-#                     logits=all_seen_output.logits,
-#                     class_ids=all_seen_output.class_ids,
-#                     labels_global=labels,
-#                     sample_weights=sample_weights,
-#                 )
-
-#                 hdc = historical_decision_consistency_loss(
-#                     reference_features=reference_q,
-#                     current_features=q,
-#                     historical_classifier_rows=historical_classifier_rows,
-#                     labels_global=labels,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
-#                 )
-
-#                 # Same direct-Q supervised contrast used in Phase 0. Only real
-#                 # current samples participate; no CDS center, pseudo feature, or
-#                 # second representation is introduced.
-#                 contrastive = supervised_contrastive_q_loss(
-#                     ordered_features=q,
-#                     labels_global=labels,
-#                     logit_scale=classifier.logit_scale_value,
-#                     sample_weights=sample_weights,
-#                 )
-
-#                 # Feature-side new->old separation. Classifier rows and scale are
-#                 # detached, so this objective can move Q but cannot move W. The
-#                 # complete all-seen CDS only prioritizes old/current conflicts.
-#                 separation_cosine = classifier.cosine_similarity(
-#                     q,
-#                     class_ids=seen_ids_tensor,
-#                     trainable_class_ids=(),
-#                 )
-#                 separation_logits = separation_cosine * classifier.logit_scale_value.detach().to(
-#                     device=q.device, dtype=q.dtype
-#                 )
-#                 separation = hsi_cds_separation_loss(
-#                     logits=separation_logits,
-#                     class_ids=seen_ids_tensor,
-#                     labels_global=labels,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
-#                     sample_weights=sample_weights,
-#                 )
-
-#                 # Classifier-side old->new protection. I_Q locates each historical
-#                 # region, diagonal/off-diagonal V_Q bound its legitimate extent,
-#                 # and I_P/V_P enter whole-CDS old/current risk. Only current rows
-#                 # are live; historical classifier rows are detached and frozen.
-#                 boundary = cds_regulator(
-#                     classifier=classifier,
-#                     seen_cds=working.seen_cds,
-#                     historical_class_count=len(old_ids),
-#                 )
-
-#                 loss = (
-#                     classification.loss
-#                     + contrastive.loss
-#                     + hdc.loss
-#                     + separation.loss
-#                     + boundary.loss
-#                 )
-#                 if not bool(torch.isfinite(loss)):
-#                     raise RuntimeError(
-#                         "incremental CE + direct-Q contrast + HDC + CDS separation + classifier protection became NaN or Inf"
-#                     )
-#                 loss.backward()
-#                 classifier.mask_gradient_to_classes(new_ids_tensor)
-
-#                 if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
-#                     raise RuntimeError("previous backbone reference accumulated gradients")
-#                 if any(parameter.grad is not None for parameter in backbone_frozen):
-#                     raise RuntimeError("a frozen incremental backbone parameter accumulated gradients")
-#                 for parameter in backbone_trainable:
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("incremental backbone gradient contains NaN or Inf")
-#                 for parameter in classifier.parameters():
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("incremental classifier gradient contains NaN or Inf")
-#                 weight_grad = classifier.weight.grad
-#                 if weight_grad is not None and not torch.equal(
-#                     weight_grad.index_select(0, old_ids_tensor),
-#                     torch.zeros_like(weight_grad.index_select(0, old_ids_tensor)),
+#                 if classifier.logit_scale_parameter.grad is not None:
+#                     raise RuntimeError("incremental training must not update cosine logit scale")
+#                 if classifier.weight.grad is None or not bool(
+#                     torch.isfinite(classifier.weight.grad).all()
 #                 ):
-#                     raise RuntimeError("historical classifier rows received incremental gradients")
-#                 if gradient_clip > 0.0:
-#                     torch.nn.utils.clip_grad_norm_(backbone_trainable, gradient_clip, error_if_nonfinite=True)
+#                     raise RuntimeError("joint classifier gradient is missing/non-finite")
+#                 if future_class_tensor.numel() and bool(
+#                     torch.count_nonzero(
+#                         classifier.weight.grad.index_select(0, future_class_tensor)
+#                     )
+#                 ):
+#                     raise RuntimeError("future classifier rows received gradients")
 
-#                 backbone_optimizer.step()
-#                 classifier_optimizer.step()
-#                 if not torch.equal(classifier.class_weight(old_ids_tensor), historical_classifier_rows):
-#                     raise RuntimeError("historical classifier rows changed during incremental optimization")
+#                 backbone_grad_seen = False
+#                 for parameter in backbone_parameters:
+#                     if parameter.grad is None:
+#                         continue
+#                     if not bool(torch.isfinite(parameter.grad).all()):
+#                         raise RuntimeError("incremental backbone gradient contains NaN or Inf")
+#                     if bool(torch.count_nonzero(parameter.grad)):
+#                         backbone_grad_seen = True
+#                 if not backbone_grad_seen:
+#                     raise RuntimeError("joint objective produced zero backbone gradient")
+
+#                 if gradient_clip > 0:
+#                     torch.nn.utils.clip_grad_norm_(
+#                         backbone_parameters + [classifier.weight],
+#                         gradient_clip,
+#                         error_if_nonfinite=True,
+#                     )
+#                 optimizer.step()
+#                 self._assert_future_rows_unchanged(
+#                     classifier, future_class_tensor, future_weight_before
+#                 )
 
 #                 n = int(labels.numel())
-#                 classification_sum += float(classification.loss.detach().item()) * n
-#                 hdc_sum += float(hdc.loss.detach().item()) * n
-#                 hdc_rmse_sum += float(hdc.relation_rmse.detach().item()) * n
-#                 contrastive_sum += float(contrastive.loss.detach().item()) * n
-#                 contrastive_gap_sum += float(contrastive.similarity_gap.detach().item()) * n
-#                 contrastive_anchor_fraction_sum += float(contrastive.valid_anchor_fraction.detach().item()) * n
-#                 separation_sum += float(separation.loss.detach().item()) * n
-#                 separation_margin_sum += float(separation.margin_mean.detach().item()) * n
-#                 boundary_sum += float(boundary.loss.detach().item()) * n
-#                 boundary_clearance_sum += float(boundary.structural_clearance_mean.detach().item()) * n
-#                 boundary_clearance_min_value = min(
-#                     boundary_clearance_min_value,
-#                     float(boundary.structural_clearance_min.detach().item()),
-#                 )
-#                 boundary_absolute_clearance_sum += float(boundary.absolute_clearance_mean.detach().item()) * n
-#                 boundary_relational_clearance_sum += float(boundary.relational_clearance_mean.detach().item()) * n
-#                 boundary_unsafe_sum += float(boundary.unsafe_pair_fraction.detach().item()) * n
-#                 boundary_pair_weight_sum += float(boundary.pair_weight_mean.detach().item()) * n
-#                 boundary_learned_risk_sum += float(boundary.learned_region_risk_mean.detach().item()) * n
-#                 boundary_spectral_risk_sum += float(boundary.spectral_region_risk_mean.detach().item()) * n
-#                 total_sum += float(loss.detach().item()) * n
-
-#                 prediction = all_seen_output.prediction.detach()
-#                 correct += int(prediction.eq(labels).sum().item())
+#                 sums["classification"] += float(classification.loss.detach().item()) * n
+#                 sums["cds_classifier"] += float(
+#                     structural.global_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["cds_classifier_old"] += float(
+#                     structural.old_class_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["cds_classifier_new"] += float(
+#                     structural.new_class_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["contrastive"] += float(contrastive.loss.detach().item()) * n
+#                 sums["q_consistency"] += float(q_consistency.loss.detach().item()) * n
+#                 sums["kd"] += float(kd.loss.detach().item()) * n
+#                 sums["cds"] += float(cds.loss.detach().item()) * n
+#                 sums["intra"] += float(cds.intra_loss.detach().item()) * n
+#                 sums["inter"] += float(cds.inter_loss.detach().item()) * n
+#                 sums["physical_abs"] += float(
+#                     cds.physical_absolute_support_mean.detach().item()
+#                 ) * n
+#                 sums["physical_rel"] += float(
+#                     cds.physical_relation_support_mean.detach().item()
+#                 ) * n
+#                 sums["physical_joint"] += float(
+#                     cds.physical_relevance_mean.detach().item()
+#                 ) * n
+#                 sums["structural"] += float(structural.loss.detach().item()) * n
+#                 sums["old_old"] += float(
+#                     structural.old_old_retention_loss.detach().item()
+#                 ) * n
+#                 sums["total"] += float(loss.detach().item()) * n
+#                 correct_all_seen += int(all_seen_output.prediction.detach().eq(labels).sum().item())
 #                 sample_count += n
-#                 for class_id in new_ids:
-#                     mask = labels.eq(class_id)
-#                     count = int(mask.sum().item())
-#                     per_class_total[class_id] += count
-#                     if count:
-#                         per_class_correct[class_id] += int(prediction[mask].eq(labels[mask]).sum().item())
 
 #             if sample_count != expected_samples:
-#                 raise RuntimeError("incremental TRAIN loader did not traverse the complete current split")
+#                 raise RuntimeError("incremental TRAIN loader did not traverse the complete split")
+#             scheduler.step()
+#             if float(classifier.logit_scale.detach().item()) != phase_start_scale:
+#                 raise RuntimeError("cosine logit scale changed during incremental training")
+#             self._assert_future_rows_unchanged(
+#                 classifier, future_class_tensor, future_weight_before
+#             )
 
-#             backbone_scheduler.step()
-#             classifier_scheduler.step()
+#             # Refresh CDS coordinates for the NEXT epoch.  This performs no
+#             # optimizer step and is therefore not a second training stage.
+#             joint_state = refresh_joint_structure()
+#             epoch_structural = regulator(
+#                 classifier=classifier,
+#                 seen_cds=joint_state[4],
+#                 historical_class_count=len(old_class_ids),
+#                 reference_classifier=reference_classifier,
+#                 reference_historical_cds=reference_historical_cds,
+#             )
+#             alignment = joint_state[6]
 
 #             self.model.eval()
-#             eval_working = self._refresh_training_state(
-#                 train_eval_loader=train_eval_loader,
-#                 phase_start_historical=phase_start_historical,
-#                 current_reference=phase_start_current,
-#                 phase_affinity=phase_affinity,
-#                 reference_q_full=reference_q_full,
-#                 reference_labels=reference_labels,
-#                 reference_spectra=reference_spectra,
-#                 reference_coords=reference_coords,
-#                 current_physical=current_physical,
-#                 new_ids=new_ids,
-#                 seen_ids=seen_ids,
+#             old_only = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=old_class_ids,
+#                 target_class_ids=old_class_ids,
 #             )
-#             final_working = eval_working
+#             old_all = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=old_class_ids,
+#             )
+#             new_only = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=new_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             new_all = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             validation_all = (
+#                 None
+#                 if val_loader is None
+#                 else self.evaluate_loader(
+#                     val_loader,
+#                     class_ids=seen_class_ids,
+#                     target_class_ids=new_class_ids,
+#                 )
+#             )
 
-#             new_train_all_seen = self.evaluate_loader(
-#                 train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-#             )
-#             new_train_only = self.evaluate_loader(
-#                 train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-#             )
-#             validation_all_seen = None if val_loader is None else self.evaluate_loader(
-#                 val_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=eval_working.seen
-#             )
-#             validation_new_only = None if val_loader is None else self.evaluate_loader(
-#                 val_loader, class_ids=new_ids, target_class_ids=new_ids, structures=eval_working.current
-#             )
-
-#             online_per_class = {cid: per_class_correct[cid] / float(per_class_total[cid]) for cid in new_ids}
-#             diag = eval_working.alignment
 #             record = {
+#                 "stage": "joint",
 #                 "epoch": epoch + 1,
-#                 "learning_rate": epoch_lr,
-#                 "classifier_learning_rate": epoch_head_lr,
-#                 "classification_loss": classification_sum / sample_count,
-#                 "historical_decision_consistency_loss": hdc_sum / sample_count,
-#                 "historical_decision_relation_rmse": hdc_rmse_sum / sample_count,
-#                 "contrastive_loss": contrastive_sum / sample_count,
-#                 "contrastive_similarity_gap": contrastive_gap_sum / sample_count,
-#                 "contrastive_valid_anchor_fraction": contrastive_anchor_fraction_sum / sample_count,
-#                 "hsi_cds_separation_loss": separation_sum / sample_count,
-#                 "hsi_cds_separation_margin_mean": separation_margin_sum / sample_count,
-#                 "cds_boundary_loss": boundary_sum / sample_count,
-#                 "cds_boundary_clearance_mean": boundary_clearance_sum / sample_count,
-#                 "cds_boundary_clearance_min": boundary_clearance_min_value,
-#                 "cds_boundary_absolute_clearance_mean": boundary_absolute_clearance_sum / sample_count,
-#                 "cds_boundary_relational_clearance_mean": boundary_relational_clearance_sum / sample_count,
-#                 "cds_boundary_unsafe_pair_fraction": boundary_unsafe_sum / sample_count,
-#                 "cds_boundary_pair_weight_mean": boundary_pair_weight_sum / sample_count,
-#                 "cds_boundary_learned_risk_mean": boundary_learned_risk_sum / sample_count,
-#                 "cds_boundary_spectral_risk_mean": boundary_spectral_risk_sum / sample_count,
-#                 "total_loss": total_sum / sample_count,
-#                 "new_train_oa_online": correct / float(sample_count),
-#                 "new_train_ba_online": sum(online_per_class.values()) / float(len(online_per_class)),
-#                 "new_train_min_online": min(online_per_class.values()),
-#                 "new_train_ba_all_seen": float(new_train_all_seen["balanced_accuracy"]),
-#                 "new_train_ba_new_only": float(new_train_only["balanced_accuracy"]),
-#                 "validation_new_ba_all_seen": None if validation_all_seen is None else float(validation_all_seen["balanced_accuracy"]),
-#                 "validation_new_ba_new_only": None if validation_new_only is None else float(validation_new_only["balanced_accuracy"]),
-#                 "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-#                 "feature_drift_rms": float(diag.representation_drift_rms.item()),
-#                 "reference_q_rms": float(reference_q_rms.item()),
-#                 "current_q_rms": float(self._mean_sample_rms(eval_working.current_rows["ordered_features"]).item()),
-#                 "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
+#                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+#                 "classification_loss": sums["classification"] / sample_count,
+#                 "whole_cds_classifier_loss": sums["cds_classifier"] / sample_count,
+#                 "old_cds_classifier_loss": sums["cds_classifier_old"] / sample_count,
+#                 "new_cds_classifier_loss": sums["cds_classifier_new"] / sample_count,
+#                 "current_all_seen_accuracy": correct_all_seen / float(sample_count),
+#                 "contrastive_loss": sums["contrastive"] / sample_count,
+#                 "q_consistency_loss": sums["q_consistency"] / sample_count,
+#                 "kd_logit_loss": sums["kd"] / sample_count,
+#                 "cds_preservation_loss": sums["cds"] / sample_count,
+#                 "cds_intra_loss": sums["intra"] / sample_count,
+#                 "cds_inter_loss": sums["inter"] / sample_count,
+#                 "physical_absolute_support_mean": sums["physical_abs"] / sample_count,
+#                 "physical_relation_support_mean": sums["physical_rel"] / sample_count,
+#                 "physical_relevance_mean": sums["physical_joint"] / sample_count,
+#                 "structural_loss": sums["structural"] / sample_count,
+#                 "old_old_retention_loss": sums["old_old"] / sample_count,
+#                 "total_loss": sums["total"] / sample_count,
+#                 "old_only_ba": float(old_only["balanced_accuracy"]),
+#                 "old_all_seen_ba": float(old_all["balanced_accuracy"]),
+#                 "new_only_ba": float(new_only["balanced_accuracy"]),
+#                 "new_all_seen_ba": float(new_all["balanced_accuracy"]),
+#                 "validation_new_all_seen_ba": None
+#                 if validation_all is None
+#                 else float(validation_all["balanced_accuracy"]),
+#                 "old_new_violation_fraction": float(
+#                     epoch_structural.old_new_violation_fraction.detach().item()
+#                 ),
+#                 "old_old_violation_fraction": float(
+#                     epoch_structural.historical_internal_violation_fraction.detach().item()
+#                 ),
+#                 "joint_clearance_mean": float(
+#                     epoch_structural.joint_structural_clearance_mean.detach().item()
+#                 ),
+#                 "joint_clearance_min": float(
+#                     epoch_structural.joint_structural_clearance_min.detach().item()
+#                 ),
+#                 "epoch_mapping_error": float(alignment.mapping_error.item()),
+#                 "epoch_representation_drift_rms": float(
+#                     alignment.representation_drift_rms.item()
+#                 ),
 #             }
 #             history.append(record)
-
-#             message = (
-#                 f"[Epoch {epoch + 1:03d}/{epoch_count:03d}] "
-#                 f"CE={record['classification_loss']:.4f} Con={record['contrastive_loss']:.4f} "
-#                 f"ConGap={record['contrastive_similarity_gap']:.4f} "
-#                 f"HDC={record['historical_decision_consistency_loss']:.4f} "
-#                 f"Sep={record['hsi_cds_separation_loss']:.4f} "
-#                 f"Boundary={record['cds_boundary_loss']:.4f} "
-#                 f"ClearMin={record['cds_boundary_clearance_min']:.4f} "
-#                 f"LR={record['learning_rate']:.2e} HeadLR={record['classifier_learning_rate']:.2e} | "
-#                 f"NewOnlyBA={100*record['new_train_ba_new_only']:.2f}% "
-#                 f"AllSeenBA={100*record['new_train_ba_all_seen']:.2f}% "
-#                 f"MapErr={record['semantic_shift_mapping_error']:.4f}"
+#             tqdm.write(
+#                 f"[Joint {epoch + 1:03d}/{epoch_count:03d}] "
+#                 f"CEnew-all={record['classification_loss']:.4f} "
+#                 f"CDSCls={record['whole_cds_classifier_loss']:.4f}"
+#                 f"[Old={record['old_cds_classifier_loss']:.4f},"
+#                 f"New={record['new_cds_classifier_loss']:.4f}] "
+#                 f"Con={record['contrastive_loss']:.4f} "
+#                 f"Q={record['q_consistency_loss']:.4f} "
+#                 f"KD={record['kd_logit_loss']:.4f} "
+#                 f"CDS={record['cds_preservation_loss']:.4f}"
+#                 f"[I={record['cds_intra_loss']:.4f},R={record['cds_inter_loss']:.4f}] "
+#                 f"Struct={record['structural_loss']:.4f}"
+#                 f"[Ret={record['old_old_retention_loss']:.4f}] | "
+#                 f"OldOnly/All={100*record['old_only_ba']:.2f}%/"
+#                 f"{100*record['old_all_seen_ba']:.2f}% "
+#                 f"NewOnly/All={100*record['new_only_ba']:.2f}%/"
+#                 f"{100*record['new_all_seen_ba']:.2f}% "
+#                 f"OldNewViol={100*record['old_new_violation_fraction']:.1f}% "
+#                 f"OldOldViol={100*record['old_old_violation_fraction']:.1f}%",
+#                 file=sys.stdout,
 #             )
-#             if validation_all_seen is not None:
-#                 message += (
-#                     f" | ValNewOnlyBA={100*record['validation_new_ba_new_only']:.2f}%"
-#                     f" ValAllSeenBA={100*record['validation_new_ba_all_seen']:.2f}%"
-#                 )
-#             tqdm.write(message, file=sys.stdout)
 
 #         progress.close()
-#         if final_working is None:
-#             raise RuntimeError("incremental phase produced no working CDS")
+#         if not history:
+#             raise RuntimeError("joint incremental training produced no epochs")
 
 #         self.model.eval()
-#         final_state = self._refresh_training_state(
-#             train_eval_loader=train_eval_loader,
-#             phase_start_historical=phase_start_historical,
-#             current_reference=phase_start_current,
-#             phase_affinity=phase_affinity,
-#             reference_q_full=reference_q_full,
-#             reference_labels=reference_labels,
-#             reference_spectra=reference_spectra,
-#             reference_coords=reference_coords,
-#             current_physical=current_physical,
-#             new_ids=new_ids,
-#             seen_ids=seen_ids,
+#         (
+#             _final_features,
+#             final_historical_structure,
+#             final_current_structure,
+#             committed_structure,
+#             final_seen_cds,
+#             _final_transform,
+#             final_alignment,
+#         ) = joint_state
+#         final_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=final_seen_cds,
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
 #         )
 
-#         final_old_only = self.evaluate_loader(
-#             old_reporting_loader, class_ids=old_ids, target_class_ids=old_ids, structures=final_state.migrated_historical
-#         )
-#         final_old_all_seen = self.evaluate_loader(
-#             old_reporting_loader, class_ids=seen_ids, target_class_ids=old_ids, structures=final_state.seen
-#         )
-#         final_new_all_seen = self.evaluate_loader(
-#             train_eval_loader, class_ids=seen_ids, target_class_ids=new_ids, structures=final_state.seen
-#         )
-#         final_new_only = self.evaluate_loader(
-#             train_eval_loader, class_ids=new_ids, target_class_ids=new_ids, structures=final_state.current
-#         )
-
-#         with torch.no_grad():
-#             final_boundary_objective = cds_regulator(
-#                 classifier=classifier,
-#                 seen_cds=final_state.seen_cds,
-#                 historical_class_count=len(old_ids),
-#             )
-#         if not torch.equal(classifier.class_weight(old_ids_tensor), historical_classifier_rows):
-#             raise RuntimeError("historical classifier rows changed during incremental optimization")
-
-#         self.model.replace_class_structure(final_state.seen)
+#         # Commit only corrected/real CDS.  The cosine classifier is already the
+#         # same classifier optimized during the one joint stage; no reset follows.
+#         self.model.replace_class_structure(committed_structure)
 #         self.model.validate_finalized_state()
 #         self.dataset.finalize_phase(phase_id)
+#         classifier.logit_scale_parameter.requires_grad_(scale_requires_grad)
+#         classifier.logit_scale_parameter.grad = None
 
-#         cumulative_loader = self.dataset.get_reporting_dataloader(phase_id, batch_size=eval_batch_size)
-#         cumulative = self.evaluate_loader(cumulative_loader, class_ids=seen_ids, target_class_ids=seen_ids)
-#         groups = old_new_summary(cumulative, old_class_ids=old_ids, new_class_ids=new_ids)
-#         forgetting = float(old_before["balanced_accuracy"]) - float(groups["old"]["balanced_accuracy"])
+#         cumulative_loader = self.dataset.get_reporting_dataloader(
+#             phase_id, batch_size=eval_batch_size
+#         )
+#         cumulative = self.evaluate_loader(
+#             cumulative_loader,
+#             class_ids=seen_class_ids,
+#             target_class_ids=seen_class_ids,
+#         )
+#         groups = old_new_summary(
+#             cumulative, old_class_ids=old_class_ids, new_class_ids=new_class_ids
+#         )
+#         forgetting = float(old_before["balanced_accuracy"]) - float(
+#             groups["old"]["balanced_accuracy"]
+#         )
 #         phase_origin = phase_origin_confusion_diagnostics(
 #             cumulative,
-#             phase_to_classes={index: self.dataset.phase_to_classes[index] for index in range(phase_id + 1)},
+#             phase_to_classes={
+#                 index: self.dataset.phase_to_classes[index]
+#                 for index in range(phase_id + 1)
+#             },
 #         )
 
-#         diag = final_state.alignment
+#         final_record = history[-1]
+#         final_old_weight = classifier.class_weight(old_class_tensor).detach()
+#         final_new_weight = classifier.class_weight(new_class_tensor).detach()
 #         method_state = {
-#             "classifier": "single_bias_free_scaled_cosine_head",
-#             "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}; all inter-class CDS is derived on demand",
-#             "historical_supervision": "HDC_plus_feature_side_old_rival_separation_plus_whole_CDS_classifier_region_protection",
-#             "historical_cds_information": "I_Q locates historical Q regions; V_Q bounds absolute/relational extent; I_P,V_P prioritize old/current classifier conflicts through whole-CDS risk",
-#             "representation_objective": "real_current_CE_plus_direct_Q_supervised_contrast_plus_HDC_plus_feature_only_old_rival_separation",
-#             "classifier_objective": "old_CDS_to_current_row_absolute_and_relational_clearance_with_old_rows_bitwise_frozen",
-#             "stores_pseudo_features": False,
-#             "reconstructs_historical_features": False,
-#             "uses_input_inversion": False,
-#             "uses_stage_B": False,
-#             "uses_covariance_classifier": False,
-#             "semantic_shift_mapping_error": float(diag.task_mapping_error.item()),
-#             "semantic_shift_channel_error_max": float(diag.task_mapping_channel_error_max.item()),
-#             "feature_drift_rms": float(diag.representation_drift_rms.item()),
-#             "task_translation_rms": float(diag.task_translation_rms.item()),
-#             "task_scale_deviation_rms": float(diag.task_scale_deviation_rms.item()),
-#             "reference_q_rms": float(reference_q_rms.item()),
-#             "current_q_rms": float(self._mean_sample_rms(final_state.current_rows["ordered_features"]).item()),
+#             "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}",
+#             "stores_old_images": False,
+#             "stores_old_feature_rows": False,
+#             "stores_synthetic_support": False,
+#             "uses_covariance_or_gaussian_memory": False,
+#             "uses_second_classifier": False,
+#             "uses_post_training_classifier_stage": False,
+#             "joint_epochs": epoch_count,
+#             "joint_lr": learning_rate,
+#             "contrastive_weight": contrastive_weight,
+#             "q_consistency_weight": q_consistency_weight,
+#             "kd_logit_weight": kd_logit_weight,
+#             "kd_temperature": kd_temperature,
+#             "cds_weight": cds_weight,
+#                         "phase_mapping_error": float(final_alignment.mapping_error.item()),
+#             "representation_drift_rms": float(
+#                 final_alignment.representation_drift_rms.item()
+#             ),
+#             "phase_scale_deviation_rms": float(
+#                 final_alignment.scale_deviation_rms.item()
+#             ),
+#             "phase_translation_rms": float(final_alignment.translation_rms.item()),
+#             "drift_learned_relevance_mean": float(
+#                 final_alignment.learned_relevance_mean.item()
+#             ),
+#             "drift_physical_relevance_mean": float(
+#                 final_alignment.physical_relevance_mean.item()
+#             ),
+#             "drift_effective_relevance_mean": float(
+#                 final_alignment.effective_relevance_mean.item()
+#             ),
+#             "drift_support_mass_mean": float(
+#                 final_alignment.class_specific_support_mass_mean.item()
+#             ),
+#             "drift_support_mass_min": float(
+#                 final_alignment.class_specific_support_mass_min.item()
+#             ),
+#             "drift_support_mass_max": float(
+#                 final_alignment.class_specific_support_mass_max.item()
+#             ),
+#             "drift_identity_correction_relative_mean": float(
+#                 final_alignment.identity_correction_relative_mean.item()
+#             ),
+#             "drift_identity_correction_relative_max": float(
+#                 final_alignment.identity_correction_relative_max.item()
+#             ),
+#             "drift_variation_correction_relative_mean": float(
+#                 final_alignment.variation_correction_relative_mean.item()
+#             ),
+#             "drift_variation_correction_relative_max": float(
+#                 final_alignment.variation_correction_relative_max.item()
+#             ),
+#             "drift_variation_negative_fraction_before_sanitize": float(
+#                 final_alignment.variation_negative_fraction_before_sanitize.item()
+#             ),
+#             "final_joint_classification_loss": float(final_record["classification_loss"]),
+#             "final_whole_cds_classifier_loss": float(final_record["whole_cds_classifier_loss"]),
+#             "final_old_cds_classifier_loss": float(final_record["old_cds_classifier_loss"]),
+#             "final_new_cds_classifier_loss": float(final_record["new_cds_classifier_loss"]),
+#             "final_contrastive_loss": float(final_record["contrastive_loss"]),
+#             "final_q_consistency_loss": float(final_record["q_consistency_loss"]),
+#             "final_kd_logit_loss": float(final_record["kd_logit_loss"]),
+#             "final_cds_preservation_loss": float(final_record["cds_preservation_loss"]),
+#             "final_cds_intra_loss": float(final_record["cds_intra_loss"]),
+#             "final_cds_inter_loss": float(final_record["cds_inter_loss"]),
+#             "final_classifier_structural_loss": float(
+#                 final_structural.loss.detach().item()
+#             ),
+#             "final_global_cds_classifier_loss": float(
+#                 final_structural.global_reconstruction_loss.detach().item()
+#             ),
+#             "final_old_cds_classifier_component": float(
+#                 final_structural.old_class_reconstruction_loss.detach().item()
+#             ),
+#             "final_new_cds_classifier_component": float(
+#                 final_structural.new_class_reconstruction_loss.detach().item()
+#             ),
+#             "final_old_old_retention_loss": float(
+#                 final_structural.old_old_retention_loss.detach().item()
+#             ),
+#             "initial_old_new_violation_fraction": float(
+#                 pre_structural.old_new_violation_fraction.detach().item()
+#             ),
+#             "final_old_new_violation_fraction": float(
+#                 final_structural.old_new_violation_fraction.detach().item()
+#             ),
+#             "initial_old_old_violation_fraction": float(
+#                 pre_structural.historical_internal_violation_fraction.detach().item()
+#             ),
+#             "final_old_old_violation_fraction": float(
+#                 final_structural.historical_internal_violation_fraction.detach().item()
+#             ),
+#             "final_old_old_clearance_mean": float(
+#                 final_structural.historical_internal_clearance_mean.detach().item()
+#             ),
+#             "final_old_old_clearance_min": float(
+#                 final_structural.historical_internal_clearance_min.detach().item()
+#             ),
+#             "final_old_old_retention_mean": float(
+#                 final_structural.historical_internal_retention_mean.detach().item()
+#             ),
+#             "final_old_old_retention_min": float(
+#                 final_structural.historical_internal_retention_min.detach().item()
+#             ),
+#             "final_whole_cds_learned_risk_mean": float(
+#                 final_structural.learned_pair_risk_mean.detach().item()
+#             ),
+#             "final_whole_cds_physical_risk_mean": float(
+#                 final_structural.physical_pair_risk_mean.detach().item()
+#             ),
+#             "final_physical_absolute_support_mean": float(
+#                 final_record["physical_absolute_support_mean"]
+#             ),
+#             "final_physical_relation_support_mean": float(
+#                 final_record["physical_relation_support_mean"]
+#             ),
+#             "final_physical_relevance_mean": float(
+#                 final_record["physical_relevance_mean"]
+#             ),
+#             "historical_classifier_row_max_change": self._max_parameter_change(
+#                 old_weight_before, final_old_weight
+#             ),
+#             "incoming_classifier_initialization_max_change": self._max_parameter_change(
+#                 new_weight_random_before, phase_start_new_weight
+#             ),
+#             "incoming_classifier_training_max_change": self._max_parameter_change(
+#                 phase_start_new_weight, final_new_weight
+#             ),
+#             "incoming_initial_clearance_min": float(
+#                 initialization.joint_clearance_min.item()
+#             ),
+#             "incoming_initial_clearance_mean": float(
+#                 initialization.joint_clearance_mean.item()
+#             ),
 #             "phase_start_old_ba": float(old_before["balanced_accuracy"]),
-#             "phase_start_old_all_seen_ba": float(phase_start_old_all_seen["balanced_accuracy"]),
-#             "final_old_only_ba": float(final_old_only["balanced_accuracy"]),
-#             "final_old_all_seen_ba": float(final_old_all_seen["balanced_accuracy"]),
-#             "representation_forgetting": float(old_before["balanced_accuracy"]) - float(final_old_only["balanced_accuracy"]),
-#             "decision_interference_start": float(old_before["balanced_accuracy"]) - float(phase_start_old_all_seen["balanced_accuracy"]),
-#             "decision_interference_final": float(final_old_only["balanced_accuracy"]) - float(final_old_all_seen["balanced_accuracy"]),
-#             "final_new_train_all_seen_ba": float(final_new_all_seen["balanced_accuracy"]),
-#             "final_new_train_only_ba": float(final_new_only["balanced_accuracy"]),
-#             "classifier_logit_scale": float(classifier.logit_scale_value.detach().item()),
-#             "final_classification_loss": float(history[-1]["classification_loss"]),
-#             "final_contrastive_loss": float(history[-1]["contrastive_loss"]),
-#             "final_contrastive_similarity_gap": float(history[-1]["contrastive_similarity_gap"]),
-#             "final_hsi_cds_separation_loss": float(history[-1]["hsi_cds_separation_loss"]),
-#             "final_hsi_cds_separation_margin_mean": float(history[-1]["hsi_cds_separation_margin_mean"]),
-#             "final_historical_decision_consistency_loss": float(history[-1]["historical_decision_consistency_loss"]),
-#             "final_cds_boundary_loss": float(final_boundary_objective.loss.item()),
-#             "final_cds_boundary_clearance_mean": float(final_boundary_objective.structural_clearance_mean.item()),
-#             "final_cds_boundary_clearance_min": float(final_boundary_objective.structural_clearance_min.item()),
-#             "final_cds_boundary_absolute_clearance_mean": float(final_boundary_objective.absolute_clearance_mean.item()),
-#             "final_cds_boundary_relational_clearance_mean": float(final_boundary_objective.relational_clearance_mean.item()),
-#             "final_cds_boundary_unsafe_pair_fraction": float(final_boundary_objective.unsafe_pair_fraction.item()),
-#             "final_cds_boundary_pair_weight_mean": float(final_boundary_objective.pair_weight_mean.item()),
-#             "final_cds_boundary_learned_risk_mean": float(final_boundary_objective.learned_region_risk_mean.item()),
-#             "final_cds_boundary_spectral_risk_mean": float(final_boundary_objective.spectral_region_risk_mean.item()),
-#             "historical_classifier_rows_frozen": True,
+#             "phase_start_old_all_seen_ba": float(
+#                 phase_start_old_all_seen["balanced_accuracy"]
+#             ),
+#             "phase_start_new_only_ba": float(
+#                 phase_start_new_only["balanced_accuracy"]
+#             ),
+#             "phase_start_new_all_seen_ba": float(
+#                 phase_start_new_all_seen["balanced_accuracy"]
+#             ),
+#             "final_old_only_ba": float(final_record["old_only_ba"]),
+#             "final_old_all_seen_ba": float(final_record["old_all_seen_ba"]),
+#             "final_new_only_ba": float(final_record["new_only_ba"]),
+#             "final_new_all_seen_ba": float(final_record["new_all_seen_ba"]),
+#             "classifier_logit_scale_frozen_incremental": True,
+#             "second_classifier_stage": False,
 #         }
 
 #         return {
 #             "phase": phase_id,
-#             "old_class_ids": list(old_ids),
-#             "new_class_ids": list(new_ids),
-#             "seen_class_ids": list(seen_ids),
+#             "old_class_ids": list(old_class_ids),
+#             "new_class_ids": list(new_class_ids),
+#             "seen_class_ids": list(seen_class_ids),
+#             "history": history,
+#             "final_epoch": epoch_count,
+#             "cumulative_test": cumulative,
+#             "old_new": groups,
+#             "forgetting": forgetting,
+#             "phase_origin_confusion": phase_origin,
+#             "method_state": method_state,
+#             "structure_committed": True,
+#             "phase_finalized": True,
+#         }
+
+
+# __all__ = ["IncrementalPhaseTrainer"]
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# """One-stage NECIL-HSI incremental training with coherent whole-CDS use.
+
+# Locked architecture
+# -------------------
+# * one plastic Mamba/SSM representation Q[K,D];
+# * one shared bias-free cosine classifier for every seen class;
+# * persistent memory exactly {I_Q,V_Q,I_P,V_P,N};
+# * real current HSI only (no stored/replayed old sample);
+# * semantic correction = global Q transport + whole-CDS-conditioned class residual;
+# * physical I_P/V_P stay in the fixed native spectral coordinate;
+# * one joint optimization loop; no classifier-only second stage.
+
+# Gradient ownership
+# ------------------
+# * real-current all-seen CE: Mamba + NEW classifier rows only;
+# * old-logit KD: Mamba only;
+# * historical-source whole-CDS reconstruction: old positive rows + seen rivals;
+# * current-source whole-CDS reconstruction: NEW rows only, old rivals detached;
+# * old-old retention: OLD rows only.
+
+# The classifier-side CDS objective is one class-balanced reconstruction over ALL
+# seen classes. I_Q/V_Q define robust directed cosine support; I_P/V_P define the
+# phase-stable pair relevance used by that same objective.
+# """
+
+# import math
+# import sys
+# from numbers import Integral, Real
+# from typing import Any, Dict
+
+# import torch
+# from tqdm import tqdm
+
+# from losses.loss import (
+#     classification_objective,
+#     historical_cds_preservation_loss,
+#     logit_distillation_loss,
+#     reference_q_consistency_loss,
+#     supervised_contrastive_q_loss,
+# )
+# from models.classifier import CosineClassificationHead
+# from models.cds_decision_region import (
+#     HSICDSDecisionRegionRegulator,
+#     initialize_incoming_classifier_rows_from_whole_cds,
+# )
+# from models.geometry_bank import ClassStructureBatch, merge_class_structure_batches
+# from models.phase_coordinate_alignment import correct_historical_structure
+# from utils.eval import old_new_summary, phase_origin_confusion_diagnostics
+
+# Tensor = torch.Tensor
+
+
+# def _positive_int(value: object, *, name: str) -> int:
+#     if isinstance(value, bool) or not isinstance(value, (Integral, Real)):
+#         raise ValueError(f"{name} must be a positive integer")
+#     number = float(value)
+#     if not math.isfinite(number) or not number.is_integer() or number <= 0:
+#         raise ValueError(f"{name} must be a positive integer")
+#     return int(number)
+
+
+# def _finite_positive(name: str, value: object) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result <= 0.0:
+#         raise ValueError(f"{name} must be finite and positive")
+#     return result
+
+
+# def _finite_nonnegative(name: str, value: object) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result < 0.0:
+#         raise ValueError(f"{name} must be finite and non-negative")
+#     return result
+
+
+# def _clone_structure(structure: ClassStructureBatch) -> ClassStructureBatch:
+#     if not isinstance(structure, ClassStructureBatch) or structure.class_count <= 0:
+#         raise ValueError("cannot clone an empty class structure")
+#     return ClassStructureBatch(
+#         class_ids=structure.class_ids.detach().clone(),
+#         sample_counts=structure.sample_counts.detach().clone(),
+#         learned_identity=structure.learned_identity.detach().clone(),
+#         learned_variation=structure.learned_variation.detach().clone(),
+#         physical_identity=structure.physical_identity.detach().clone(),
+#         physical_variation=structure.physical_variation.detach().clone(),
+#     )
+
+
+# def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
+#     matches = labels.unsqueeze(1).eq(class_ids.unsqueeze(0))
+#     if not bool(matches.sum(dim=1).eq(1).all()):
+#         raise ValueError("a current label is absent from current_class_ids")
+#     return matches.to(torch.long).argmax(dim=1)
+
+
+# class IncrementalPhaseTrainer:
+#     INCREMENTAL_RESULT_FIELDS = frozenset(
+#         {
+#             "phase",
+#             "old_class_ids",
+#             "new_class_ids",
+#             "seen_class_ids",
+#             "history",
+#             "final_epoch",
+#             "cumulative_test",
+#             "old_new",
+#             "forgetting",
+#             "method_state",
+#             "structure_committed",
+#             "phase_finalized",
+#         }
+#     )
+
+#     def _require_classifier(self) -> CosineClassificationHead:
+#         classifier = getattr(self.model, "classifier", None)
+#         if not isinstance(classifier, CosineClassificationHead):
+#             raise RuntimeError("model.classifier must be CosineClassificationHead")
+#         return classifier
+
+#     def _phase_classes(
+#         self,
+#         phase: int,
+#     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+#         old_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_old_classes(phase), name=f"phase_{phase}_old_classes"
+#             )
+#         )
+#         new_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_new_classes(phase), name=f"phase_{phase}_new_classes"
+#             )
+#         )
+#         seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(phase), name=f"phase_{phase}_seen_classes"
+#             )
+#         )
+#         if not old_class_ids or not new_class_ids:
+#             raise RuntimeError("incremental phase requires old and new classes")
+#         if set(old_class_ids).intersection(new_class_ids):
+#             raise RuntimeError("old and new classes overlap")
+#         if seen_class_ids != old_class_ids + new_class_ids:
+#             raise RuntimeError("seen classes must equal old classes followed by new classes")
+#         if tuple(self.model.committed_class_ids) != old_class_ids:
+#             raise RuntimeError("committed historical CDS does not match old classes")
+#         return old_class_ids, new_class_ids, seen_class_ids
+
+#     @staticmethod
+#     def _assert_frozen_reference(reference_backbone: torch.nn.Module) -> None:
+#         reference_backbone.eval()
+#         if any(parameter.requires_grad for parameter in reference_backbone.parameters()):
+#             raise RuntimeError("previous backbone reference must remain frozen")
+#         if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
+#             raise RuntimeError("previous backbone reference must not carry gradients")
+
+#     @staticmethod
+#     def _assert_frozen_reference_classifier(
+#         reference_classifier: CosineClassificationHead,
+#     ) -> None:
+#         reference_classifier.eval()
+#         if any(parameter.requires_grad for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must remain frozen")
+#         if any(parameter.grad is not None for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must not carry gradients")
+
+#     @staticmethod
+#     @torch.no_grad()
+#     def _assert_reference_matches_phase_start(
+#         reference: torch.nn.Module,
+#         current: torch.nn.Module,
+#         *,
+#         name: str,
+#     ) -> None:
+#         ref_state = reference.state_dict()
+#         cur_state = current.state_dict()
+#         if tuple(ref_state.keys()) != tuple(cur_state.keys()):
+#             raise RuntimeError(f"previous/current {name} schemas differ at phase start")
+#         for key in ref_state:
+#             if not torch.equal(ref_state[key].detach().cpu(), cur_state[key].detach().cpu()):
+#                 raise RuntimeError(
+#                     f"previous {name} does not match finalized phase-start state at {key}"
+#                 )
+
+#     @torch.no_grad()
+#     def _current_class_weights(
+#         self,
+#         loader: Any,
+#         *,
+#         new_class_ids: tuple[int, ...],
+#     ) -> tuple[Tensor, int]:
+#         counts = {class_id: 0 for class_id in new_class_ids}
+#         total = 0
+#         valid = set(new_class_ids)
+#         for batch in loader:
+#             _, _, labels = self.unpack_batch(batch)
+#             observed = set(int(value) for value in labels.unique().detach().cpu().tolist())
+#             outside = observed - valid
+#             if outside:
+#                 raise RuntimeError(
+#                     f"incremental TRAIN loader contains non-current classes {sorted(outside)}"
+#                 )
+#             for class_id in new_class_ids:
+#                 count = int(labels.eq(class_id).sum().item())
+#                 counts[class_id] += count
+#                 total += count
+#         if total <= 0 or any(counts[class_id] <= 0 for class_id in new_class_ids):
+#             raise RuntimeError("incremental TRAIN split is empty or misses a current class")
+#         class_count = len(new_class_ids)
+#         weights = torch.tensor(
+#             [total / float(class_count * counts[class_id]) for class_id in new_class_ids],
+#             device=self.device,
+#             dtype=self.model.dtype,
+#         )
+#         return weights, total
+
+#     @staticmethod
+#     def _max_parameter_change(before: Tensor, after: Tensor) -> float:
+#         if before.shape != after.shape:
+#             raise ValueError("parameter snapshots have different shapes")
+#         if before.numel() == 0:
+#             return 0.0
+#         return float((after - before).abs().max().item())
+
+#     @staticmethod
+#     def _assert_future_rows_unchanged(
+#         classifier: CosineClassificationHead,
+#         future_class_tensor: Tensor,
+#         future_weight_before: Tensor | None,
+#     ) -> None:
+#         if future_weight_before is None or future_class_tensor.numel() == 0:
+#             return
+#         current = classifier.class_weight(future_class_tensor).detach()
+#         if not torch.equal(current, future_weight_before):
+#             raise RuntimeError("future classifier rows changed before their phase")
+
+#     @staticmethod
+#     def _row_grad_max(gradient: Tensor | None, class_ids: Tensor) -> float:
+#         if gradient is None or class_ids.numel() == 0:
+#             return 0.0
+#         rows = gradient.index_select(0, class_ids)
+#         return float(rows.abs().max().detach().item()) if rows.numel() else 0.0
+
+#     def train_incremental_phase(
+#         self,
+#         *,
+#         phase: int,
+#         epochs: int,
+#         batch_size: int,
+#         lr: float,
+#         reference_backbone: torch.nn.Module,
+#         reference_classifier: CosineClassificationHead,
+#     ) -> Dict[str, Any]:
+#         phase_id = _positive_int(phase, name="phase")
+#         epoch_count = _positive_int(epochs, name="epochs")
+#         train_batch_size = _positive_int(batch_size, name="batch_size")
+#         learning_rate = _finite_positive("lr_inc", lr)
+#         eval_batch_size = _positive_int(
+#             self.cfg("eval_batch_size", 256), name="eval_batch_size"
+#         )
+#         weight_decay = _finite_nonnegative(
+#             "weight_decay", self.cfg("weight_decay", 1e-4)
+#         )
+#         gradient_clip = _finite_nonnegative(
+#             "gradient_clip", self.cfg("gradient_clip", 0.0)
+#         )
+#         contrastive_weight = _finite_nonnegative(
+#             "contrastive_weight", self.cfg("contrastive_weight", 1.0)
+#         )
+#         q_consistency_weight = _finite_nonnegative(
+#             "q_consistency_weight", self.cfg("q_consistency_weight", 1.0)
+#         )
+#         kd_logit_weight = _finite_nonnegative(
+#             "kd_logit_weight", self.cfg("kd_logit_weight", 1.0)
+#         )
+#         kd_temperature = _finite_positive(
+#             "kd_temperature", self.cfg("kd_temperature", 2.0)
+#         )
+#         cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
+#         structural_weight = _finite_nonnegative(
+#             "margin_ranking_weight", self.cfg("margin_ranking_weight", 1.0)
+#         )
+
+#         self.model.validate_finalized_state()
+#         classifier = self._require_classifier()
+#         self._assert_frozen_reference(reference_backbone)
+#         self._assert_frozen_reference_classifier(reference_classifier)
+#         self._assert_reference_matches_phase_start(
+#             reference_backbone, self.model.backbone, name="backbone"
+#         )
+#         self._assert_reference_matches_phase_start(
+#             reference_classifier, classifier, name="classifier"
+#         )
+
+#         previous_phase = phase_id - 1
+#         previous_seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(previous_phase),
+#                 name="previous_seen_classes",
+#             )
+#         )
+#         old_reporting_loader = self.dataset.get_reporting_dataloader(
+#             previous_phase, batch_size=eval_batch_size
+#         )
+#         old_before = self.evaluate_loader(
+#             old_reporting_loader,
+#             class_ids=previous_seen_class_ids,
+#             target_class_ids=previous_seen_class_ids,
+#         )
+
+#         self.dataset.start_phase(phase_id)
+#         old_class_ids, new_class_ids, seen_class_ids = self._phase_classes(phase_id)
+#         old_class_tensor = torch.tensor(old_class_ids, device=self.device, dtype=torch.long)
+#         new_class_tensor = torch.tensor(new_class_ids, device=self.device, dtype=torch.long)
+#         seen_class_tensor = torch.tensor(seen_class_ids, device=self.device, dtype=torch.long)
+
+#         historical_structure = _clone_structure(
+#             self.model.structure_bank.class_structures(old_class_ids)
+#         )
+#         reference_historical_cds = self.model.structure_bank.build_cds(historical_structure)
+
+#         self.model.set_incremental_trainability()
+#         backbone_parameters = [
+#             parameter
+#             for parameter in self.model.backbone.parameters()
+#             if parameter.requires_grad
+#         ]
+#         if not backbone_parameters:
+#             raise RuntimeError("incremental backbone has no trainable parameters")
+
+#         train_eval_loader = self.dataset.get_phase_dataloader(
+#             phase_id, split="train", batch_size=eval_batch_size, shuffle=False
+#         )
+#         current_class_weights, expected_samples = self._current_class_weights(
+#             train_eval_loader, new_class_ids=new_class_ids
+#         )
+#         reference_train = self.collect_ordered_features(
+#             train_eval_loader, backbone=reference_backbone
+#         )
+#         reference_features_full = reference_train["ordered_features"].detach()
+#         reference_spectra = reference_train["raw_center_spectra"].detach()
+#         reference_labels = reference_train["labels"].detach()
+#         observed_new = tuple(
+#             sorted(int(value) for value in reference_labels.unique().detach().cpu().tolist())
+#         )
+#         if observed_new != tuple(sorted(new_class_ids)):
+#             raise RuntimeError("incremental TRAIN rows do not match current phase classes")
+
+#         current_physical_structure = self.model.estimate_physical_class_structure(
+#             reference_spectra, reference_labels, class_ids=new_class_ids
+#         )
+#         current_reference_structure = self.model.estimate_class_structure(
+#             reference_features_full,
+#             None,
+#             reference_labels,
+#             class_ids=new_class_ids,
+#             physical_structure=current_physical_structure,
+#         )
+#         phase_start_seen_structure = merge_class_structure_batches(
+#             (historical_structure, current_reference_structure)
+#         )
+#         phase_start_seen_cds = self.model.structure_bank.build_cds(
+#             phase_start_seen_structure
+#         )
+
+#         # Snapshot ownership before incoming-row admission.
+#         old_weight_before = classifier.class_weight(old_class_tensor).detach().clone()
+#         new_weight_random_before = classifier.class_weight(new_class_tensor).detach().clone()
+#         seen_set = set(seen_class_ids)
+#         future_class_ids = tuple(
+#             class_id
+#             for class_id in range(classifier.total_class_count)
+#             if class_id not in seen_set
+#         )
+#         future_class_tensor = torch.tensor(
+#             future_class_ids, device=self.device, dtype=torch.long
+#         )
+#         future_weight_before = (
+#             classifier.class_weight(future_class_tensor).detach().clone()
+#             if future_class_ids
+#             else None
+#         )
+
+#         # Deterministic, one-time incoming-row admission from the complete CDS.
+#         # Historical rows are never changed by this operation.
+#         admission = initialize_incoming_classifier_rows_from_whole_cds(
+#             classifier=classifier,
+#             seen_cds=phase_start_seen_cds,
+#             historical_class_count=len(old_class_ids),
+#         )
+#         phase_start_new_weight = classifier.class_weight(new_class_tensor).detach().clone()
+#         if not torch.equal(classifier.class_weight(old_class_tensor).detach(), old_weight_before):
+#             raise RuntimeError("incoming-row admission changed a historical classifier row")
+#         self._assert_future_rows_unchanged(
+#             classifier, future_class_tensor, future_weight_before
+#         )
+
+#         scale_requires_grad = bool(classifier.logit_scale_parameter.requires_grad)
+#         classifier.logit_scale_parameter.requires_grad_(False)
+#         classifier.logit_scale_parameter.grad = None
+#         classifier.weight.requires_grad_(True)
+#         phase_start_scale = float(classifier.logit_scale.detach().item())
+
+#         train_loader = self.dataset.get_phase_dataloader(
+#             phase_id, split="train", batch_size=train_batch_size, shuffle=True
+#         )
+#         val_loader = (
+#             self.dataset.get_phase_dataloader(
+#                 phase_id, split="val", batch_size=eval_batch_size, shuffle=False
+#             )
+#             if self.dataset.validation_enabled
+#             else None
+#         )
+
+#         phase_start_new_only = self.evaluate_loader(
+#             train_eval_loader, class_ids=new_class_ids, target_class_ids=new_class_ids
+#         )
+#         phase_start_new_all_seen = self.evaluate_loader(
+#             train_eval_loader, class_ids=seen_class_ids, target_class_ids=new_class_ids
+#         )
+#         phase_start_old_all_seen = self.evaluate_loader(
+#             old_reporting_loader, class_ids=seen_class_ids, target_class_ids=old_class_ids
+#         )
+#         print(
+#             f"[Phase {phase_id} start] "
+#             f"OldBA(previous-only)={100*float(old_before['balanced_accuracy']):.2f}% "
+#             f"OldBA(all-seen)={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% "
+#             f"NewBA(new-only)={100*float(phase_start_new_only['balanced_accuracy']):.2f}% "
+#             f"NewBA(all-seen)={100*float(phase_start_new_all_seen['balanced_accuracy']):.2f}% | "
+#             f"Admission accepted={100*float(admission.accepted_fraction.item()):.1f}% "
+#             f"Clear={float(admission.raw_joint_clearance_min.item()):.4f}->"
+#             f"{float(admission.final_joint_clearance_min.item()):.4f}",
+#             file=sys.stdout,
+#         )
+
+#         @torch.no_grad()
+#         def refresh_joint_structure():
+#             self.model.eval()
+#             rows = self.collect_ordered_features(train_eval_loader)
+#             if not torch.equal(rows["labels"], reference_labels):
+#                 raise RuntimeError("current TRAIN label order changed during CDS refresh")
+#             if not torch.equal(rows["raw_center_spectra"], reference_spectra):
+#                 raise RuntimeError("current TRAIN spectra changed during CDS refresh")
+#             current_features_full = rows["ordered_features"].detach()
+#             current_structure = self.model.estimate_class_structure(
+#                 current_features_full,
+#                 None,
+#                 reference_labels,
+#                 class_ids=new_class_ids,
+#                 physical_structure=current_physical_structure,
+#             )
+#             corrected_historical, transform, alignment = correct_historical_structure(
+#                 historical_structure=historical_structure,
+#                 current_reference_structure=current_reference_structure,
+#                 current_structure=current_structure,
+#                 reference_features=reference_features_full,
+#                 current_features=current_features_full,
+#             )
+#             if not torch.equal(
+#                 corrected_historical.physical_identity,
+#                 historical_structure.physical_identity,
+#             ):
+#                 raise RuntimeError("historical I_P changed during semantic correction")
+#             if not torch.equal(
+#                 corrected_historical.physical_variation,
+#                 historical_structure.physical_variation,
+#             ):
+#                 raise RuntimeError("historical V_P changed during semantic correction")
+#             merged = merge_class_structure_batches(
+#                 (corrected_historical, current_structure)
+#             )
+#             merged_ids = tuple(
+#                 int(value) for value in merged.class_ids.detach().cpu().tolist()
+#             )
+#             if merged_ids != seen_class_ids:
+#                 raise RuntimeError("CDS refresh produced incorrect seen-class order")
+#             seen_cds = self.model.structure_bank.build_cds(merged)
+#             return (
+#                 current_features_full,
+#                 corrected_historical,
+#                 current_structure,
+#                 merged,
+#                 seen_cds,
+#                 transform,
+#                 alignment,
+#             )
+
+#         # One optimizer, one scheduler, one phase loop.  Classifier weight decay is
+#         # zero so masked old/future rows are not silently changed by AdamW decay.
+#         optimizer = torch.optim.AdamW(
+#             [
+#                 {"params": backbone_parameters, "weight_decay": weight_decay},
+#                 {"params": [classifier.weight], "weight_decay": 0.0},
+#             ],
+#             lr=learning_rate,
+#         )
+#         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#             optimizer, T_max=epoch_count, eta_min=0.0
+#         )
+#         regulator = HSICDSDecisionRegionRegulator().to(self.device)
+
+#         joint_state = refresh_joint_structure()
+#         pre_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=joint_state[4],
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
+#         )
+
+#         history: list[dict[str, Any]] = []
+#         gradient_contract_checked = False
+#         progress = tqdm(
+#             range(epoch_count),
+#             desc=f"Phase {phase_id} joint CDS-cosine training",
+#             unit="epoch",
+#             dynamic_ncols=True,
+#             file=sys.stdout,
+#         )
+
+#         for epoch in progress:
+#             (
+#                 _epoch_features,
+#                 epoch_historical_structure,
+#                 _epoch_current_structure,
+#                 _epoch_merged,
+#                 epoch_seen_cds,
+#                 _epoch_transform,
+#                 _epoch_alignment,
+#             ) = joint_state
+
+#             self.model.train()
+#             sums = {name: 0.0 for name in (
+#                 "classification", "cds_classifier", "cds_classifier_old",
+#                 "cds_classifier_new", "contrastive", "q_consistency", "kd",
+#                 "cds", "intra", "inter", "physical_abs", "physical_rel",
+#                 "physical_joint", "old_old", "structural", "total"
+#             )}
+#             sample_count = 0
+#             correct_all_seen = 0
+
+#             for batch in train_loader:
+#                 patch, spectrum, labels = self.unpack_batch(batch)
+#                 if not bool(torch.isin(labels, new_class_tensor).all()):
+#                     raise RuntimeError("incremental TRAIN batch contains an old or future class")
+
+#                 optimizer.zero_grad(set_to_none=True)
+#                 classifier.logit_scale_parameter.grad = None
+
+#                 with torch.no_grad():
+#                     reference_features = self.model.extract_features_with_backbone(
+#                         reference_backbone,
+#                         patch,
+#                         center_spectrum=spectrum,
+#                         return_aux=False,
+#                     ).ordered_features.detach()
+#                     physical_evidence = self.model.physical_spectral_evidence(spectrum).detach()
+#                     teacher_old_logits = reference_classifier(
+#                         reference_features,
+#                         class_ids=old_class_tensor,
+#                         trainable_class_ids=(),
+#                     ).logits.detach()
+
+#                 current_features = self.model.extract_features(
+#                     patch, center_spectrum=spectrum, return_aux=False
+#                 ).ordered_features
+#                 current_local = _targets_local(labels, new_class_tensor)
+#                 sample_weights = current_class_weights.index_select(0, current_local)
+
+#                 # CRITICAL ownership rule: all seen classes compete, only incoming
+#                 # rows receive gradient from labels that contain current classes only.
+#                 all_seen_output = classifier(
+#                     current_features,
+#                     class_ids=seen_class_tensor,
+#                     trainable_class_ids=new_class_tensor,
+#                 )
+#                 classification = classification_objective(
+#                     logits=all_seen_output.logits,
+#                     class_ids=all_seen_output.class_ids,
+#                     labels_global=labels,
+#                     sample_weights=sample_weights,
+#                 )
+#                 contrastive = supervised_contrastive_q_loss(
+#                     ordered_features=current_features,
+#                     labels_global=labels,
+#                     logit_scale=classifier.logit_scale,
+#                     sample_weights=sample_weights,
+#                 )
+#                 q_consistency = reference_q_consistency_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                 )
+#                 student_old_logits = classifier(
+#                     current_features,
+#                     class_ids=old_class_tensor,
+#                     trainable_class_ids=(),
+#                 ).logits
+#                 kd = logit_distillation_loss(
+#                     student_old_logits=student_old_logits,
+#                     teacher_old_logits=teacher_old_logits,
+#                     temperature=kd_temperature,
+#                     sample_weights=sample_weights,
+#                 )
+#                 cds = historical_cds_preservation_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                     physical_spectral_evidence=physical_evidence,
+#                     reference_historical_structure=historical_structure,
+#                     current_historical_structure=epoch_historical_structure,
+#                 )
+#                 structural = regulator(
+#                     classifier=classifier,
+#                     seen_cds=epoch_seen_cds,
+#                     historical_class_count=len(old_class_ids),
+#                     reference_classifier=reference_classifier,
+#                     reference_historical_cds=reference_historical_cds,
+#                 )
+
+#                 # One coherent classifier-reconstruction rule is used for every
+#                 # incremental phase. Real current labels use the deployed all-seen
+#                 # cosine head but can update incoming rows only. In parallel, the
+#                 # whole seen-class CDS reconstructs the same classifier with equal
+#                 # per-class mass: I_Q/V_Q define directed robust class support and
+#                 # I_P/V_P define pair relevance. Old-source CDS may update old
+#                 # positives and seen rivals; new-source CDS keeps old rival rows
+#                 # detached. No prototype-only anchor or second classifier exists.
+#                 if not bool(torch.isfinite(structural.loss)):
+#                     raise RuntimeError("whole-CDS classifier reconstruction became NaN or Inf")
+
+#                 if not gradient_contract_checked:
+#                     tolerance = 64.0 * torch.finfo(classifier.weight.dtype).eps
+
+#                     ce_grad = torch.autograd.grad(
+#                         classification.loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     ce_old = self._row_grad_max(ce_grad, old_class_tensor)
+#                     ce_new = self._row_grad_max(ce_grad, new_class_tensor)
+#                     ce_future = self._row_grad_max(ce_grad, future_class_tensor)
+#                     if ce_old > tolerance:
+#                         raise RuntimeError("new-only CE leaked gradient into historical rows")
+#                     if ce_future > tolerance:
+#                         raise RuntimeError("new-only CE leaked gradient into future rows")
+#                     if ce_new <= tolerance:
+#                         raise RuntimeError("incoming rows received no real-current CE gradient")
+
+#                     old_cds_grad = torch.autograd.grad(
+#                         structural.old_class_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     old_cds_old = self._row_grad_max(old_cds_grad, old_class_tensor)
+#                     old_cds_new = self._row_grad_max(old_cds_grad, new_class_tensor)
+#                     old_cds_future = self._row_grad_max(old_cds_grad, future_class_tensor)
+#                     if old_cds_old <= tolerance or old_cds_new <= tolerance:
+#                         raise RuntimeError(
+#                             "historical whole-CDS reconstruction must update old positives and seen rivals"
+#                         )
+#                     if old_cds_future > tolerance:
+#                         raise RuntimeError("historical whole-CDS reconstruction leaked into future rows")
+
+#                     new_cds_grad = torch.autograd.grad(
+#                         structural.new_class_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     new_cds_old = self._row_grad_max(new_cds_grad, old_class_tensor)
+#                     new_cds_new = self._row_grad_max(new_cds_grad, new_class_tensor)
+#                     new_cds_future = self._row_grad_max(new_cds_grad, future_class_tensor)
+#                     if new_cds_old > tolerance:
+#                         raise RuntimeError("current-class CDS leaked gradient into historical rows")
+#                     if new_cds_new <= tolerance:
+#                         raise RuntimeError("current-class CDS produced no incoming-row gradient")
+#                     if new_cds_future > tolerance:
+#                         raise RuntimeError("current-class CDS leaked into future rows")
+
+#                     global_cds_grad = torch.autograd.grad(
+#                         structural.global_reconstruction_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     global_old = self._row_grad_max(global_cds_grad, old_class_tensor)
+#                     global_new = self._row_grad_max(global_cds_grad, new_class_tensor)
+#                     global_future = self._row_grad_max(global_cds_grad, future_class_tensor)
+#                     if global_old <= tolerance or global_new <= tolerance:
+#                         raise RuntimeError("global whole-CDS reconstruction must update all seen groups")
+#                     if global_future > tolerance:
+#                         raise RuntimeError("global whole-CDS reconstruction leaked into future rows")
+
+#                     retention_grad = torch.autograd.grad(
+#                         structural.old_old_retention_loss,
+#                         classifier.weight,
+#                         retain_graph=True,
+#                         allow_unused=True,
+#                     )[0]
+#                     ret_old = self._row_grad_max(retention_grad, old_class_tensor)
+#                     ret_new = self._row_grad_max(retention_grad, new_class_tensor)
+#                     ret_future = self._row_grad_max(retention_grad, future_class_tensor)
+#                     if ret_new > tolerance or ret_future > tolerance:
+#                         raise RuntimeError("old-old retention changed a non-historical row")
+
+#                     print(
+#                         "[Gradient ownership] "
+#                         f"NewCE old={ce_old:.3e} new={ce_new:.3e} future={ce_future:.3e} | "
+#                         f"OldCDS old={old_cds_old:.3e} new={old_cds_new:.3e} | "
+#                         f"NewCDS old={new_cds_old:.3e} new={new_cds_new:.3e} | "
+#                         f"GlobalCDS old={global_old:.3e} new={global_new:.3e} future={global_future:.3e} | "
+#                         f"Retention old={ret_old:.3e} new={ret_new:.3e} future={ret_future:.3e}",
+#                         file=sys.stdout,
+#                     )
+#                     gradient_contract_checked = True
+
+#                 loss = (
+#                     classification.loss
+#                     + contrastive_weight * contrastive.loss
+#                     + q_consistency_weight * q_consistency.loss
+#                     + kd_logit_weight * kd.loss
+#                     + cds_weight * cds.loss
+#                     + structural_weight * structural.loss
+#                 )
+#                 if not bool(torch.isfinite(loss)):
+#                     raise RuntimeError("joint incremental objective became NaN or Inf")
+#                 loss.backward()
+
+#                 if classifier.logit_scale_parameter.grad is not None:
+#                     raise RuntimeError("incremental training must not update cosine logit scale")
+#                 if classifier.weight.grad is None or not bool(
+#                     torch.isfinite(classifier.weight.grad).all()
+#                 ):
+#                     raise RuntimeError("joint classifier gradient is missing/non-finite")
+#                 if future_class_tensor.numel() and bool(
+#                     torch.count_nonzero(
+#                         classifier.weight.grad.index_select(0, future_class_tensor)
+#                     )
+#                 ):
+#                     raise RuntimeError("future classifier rows received gradients")
+
+#                 backbone_grad_seen = False
+#                 for parameter in backbone_parameters:
+#                     if parameter.grad is None:
+#                         continue
+#                     if not bool(torch.isfinite(parameter.grad).all()):
+#                         raise RuntimeError("incremental backbone gradient contains NaN or Inf")
+#                     if bool(torch.count_nonzero(parameter.grad)):
+#                         backbone_grad_seen = True
+#                 if not backbone_grad_seen:
+#                     raise RuntimeError("joint objective produced zero backbone gradient")
+
+#                 if gradient_clip > 0:
+#                     torch.nn.utils.clip_grad_norm_(
+#                         backbone_parameters + [classifier.weight],
+#                         gradient_clip,
+#                         error_if_nonfinite=True,
+#                     )
+#                 optimizer.step()
+#                 self._assert_future_rows_unchanged(
+#                     classifier, future_class_tensor, future_weight_before
+#                 )
+
+#                 n = int(labels.numel())
+#                 sums["classification"] += float(classification.loss.detach().item()) * n
+#                 sums["cds_classifier"] += float(
+#                     structural.global_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["cds_classifier_old"] += float(
+#                     structural.old_class_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["cds_classifier_new"] += float(
+#                     structural.new_class_reconstruction_loss.detach().item()
+#                 ) * n
+#                 sums["contrastive"] += float(contrastive.loss.detach().item()) * n
+#                 sums["q_consistency"] += float(q_consistency.loss.detach().item()) * n
+#                 sums["kd"] += float(kd.loss.detach().item()) * n
+#                 sums["cds"] += float(cds.loss.detach().item()) * n
+#                 sums["intra"] += float(cds.intra_loss.detach().item()) * n
+#                 sums["inter"] += float(cds.inter_loss.detach().item()) * n
+#                 sums["physical_abs"] += float(
+#                     cds.physical_absolute_support_mean.detach().item()
+#                 ) * n
+#                 sums["physical_rel"] += float(
+#                     cds.physical_relation_support_mean.detach().item()
+#                 ) * n
+#                 sums["physical_joint"] += float(
+#                     cds.physical_relevance_mean.detach().item()
+#                 ) * n
+#                 sums["structural"] += float(structural.loss.detach().item()) * n
+#                 sums["old_old"] += float(
+#                     structural.old_old_retention_loss.detach().item()
+#                 ) * n
+#                 sums["total"] += float(loss.detach().item()) * n
+#                 correct_all_seen += int(all_seen_output.prediction.detach().eq(labels).sum().item())
+#                 sample_count += n
+
+#             if sample_count != expected_samples:
+#                 raise RuntimeError("incremental TRAIN loader did not traverse the complete split")
+#             scheduler.step()
+#             if float(classifier.logit_scale.detach().item()) != phase_start_scale:
+#                 raise RuntimeError("cosine logit scale changed during incremental training")
+#             self._assert_future_rows_unchanged(
+#                 classifier, future_class_tensor, future_weight_before
+#             )
+
+#             # Refresh CDS coordinates for the NEXT epoch.  This performs no
+#             # optimizer step and is therefore not a second training stage.
+#             joint_state = refresh_joint_structure()
+#             epoch_structural = regulator(
+#                 classifier=classifier,
+#                 seen_cds=joint_state[4],
+#                 historical_class_count=len(old_class_ids),
+#                 reference_classifier=reference_classifier,
+#                 reference_historical_cds=reference_historical_cds,
+#             )
+#             alignment = joint_state[6]
+
+#             self.model.eval()
+#             old_only = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=old_class_ids,
+#                 target_class_ids=old_class_ids,
+#             )
+#             old_all = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=old_class_ids,
+#             )
+#             new_only = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=new_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             new_all = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             validation_all = (
+#                 None
+#                 if val_loader is None
+#                 else self.evaluate_loader(
+#                     val_loader,
+#                     class_ids=seen_class_ids,
+#                     target_class_ids=new_class_ids,
+#                 )
+#             )
+
+#             record = {
+#                 "stage": "joint",
+#                 "epoch": epoch + 1,
+#                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+#                 "classification_loss": sums["classification"] / sample_count,
+#                 "whole_cds_classifier_loss": sums["cds_classifier"] / sample_count,
+#                 "old_cds_classifier_loss": sums["cds_classifier_old"] / sample_count,
+#                 "new_cds_classifier_loss": sums["cds_classifier_new"] / sample_count,
+#                 "current_all_seen_accuracy": correct_all_seen / float(sample_count),
+#                 "contrastive_loss": sums["contrastive"] / sample_count,
+#                 "q_consistency_loss": sums["q_consistency"] / sample_count,
+#                 "kd_logit_loss": sums["kd"] / sample_count,
+#                 "cds_preservation_loss": sums["cds"] / sample_count,
+#                 "cds_intra_loss": sums["intra"] / sample_count,
+#                 "cds_inter_loss": sums["inter"] / sample_count,
+#                 "physical_absolute_support_mean": sums["physical_abs"] / sample_count,
+#                 "physical_relation_support_mean": sums["physical_rel"] / sample_count,
+#                 "physical_relevance_mean": sums["physical_joint"] / sample_count,
+#                 "structural_loss": sums["structural"] / sample_count,
+#                 "old_old_retention_loss": sums["old_old"] / sample_count,
+#                 "total_loss": sums["total"] / sample_count,
+#                 "old_only_ba": float(old_only["balanced_accuracy"]),
+#                 "old_all_seen_ba": float(old_all["balanced_accuracy"]),
+#                 "new_only_ba": float(new_only["balanced_accuracy"]),
+#                 "new_all_seen_ba": float(new_all["balanced_accuracy"]),
+#                 "validation_new_all_seen_ba": None
+#                 if validation_all is None
+#                 else float(validation_all["balanced_accuracy"]),
+#                 "old_new_violation_fraction": float(
+#                     epoch_structural.old_new_violation_fraction.detach().item()
+#                 ),
+#                 "old_old_violation_fraction": float(
+#                     epoch_structural.historical_internal_violation_fraction.detach().item()
+#                 ),
+#                 "joint_clearance_mean": float(
+#                     epoch_structural.joint_structural_clearance_mean.detach().item()
+#                 ),
+#                 "joint_clearance_min": float(
+#                     epoch_structural.joint_structural_clearance_min.detach().item()
+#                 ),
+#                 "epoch_mapping_error": float(alignment.mapping_error.item()),
+#                 "epoch_representation_drift_rms": float(
+#                     alignment.representation_drift_rms.item()
+#                 ),
+#             }
+#             history.append(record)
+#             tqdm.write(
+#                 f"[Joint {epoch + 1:03d}/{epoch_count:03d}] "
+#                 f"CEnew-all={record['classification_loss']:.4f} "
+#                 f"CDSCls={record['whole_cds_classifier_loss']:.4f}"
+#                 f"[Old={record['old_cds_classifier_loss']:.4f},"
+#                 f"New={record['new_cds_classifier_loss']:.4f}] "
+#                 f"Con={record['contrastive_loss']:.4f} "
+#                 f"Q={record['q_consistency_loss']:.4f} "
+#                 f"KD={record['kd_logit_loss']:.4f} "
+#                 f"CDS={record['cds_preservation_loss']:.4f}"
+#                 f"[I={record['cds_intra_loss']:.4f},R={record['cds_inter_loss']:.4f}] "
+#                 f"Struct={record['structural_loss']:.4f}"
+#                 f"[Ret={record['old_old_retention_loss']:.4f}] | "
+#                 f"OldOnly/All={100*record['old_only_ba']:.2f}%/"
+#                 f"{100*record['old_all_seen_ba']:.2f}% "
+#                 f"NewOnly/All={100*record['new_only_ba']:.2f}%/"
+#                 f"{100*record['new_all_seen_ba']:.2f}% "
+#                 f"OldNewViol={100*record['old_new_violation_fraction']:.1f}% "
+#                 f"OldOldViol={100*record['old_old_violation_fraction']:.1f}%",
+#                 file=sys.stdout,
+#             )
+
+#         progress.close()
+#         if not history:
+#             raise RuntimeError("joint incremental training produced no epochs")
+
+#         self.model.eval()
+#         (
+#             _final_features,
+#             final_historical_structure,
+#             final_current_structure,
+#             committed_structure,
+#             final_seen_cds,
+#             _final_transform,
+#             final_alignment,
+#         ) = joint_state
+#         final_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=final_seen_cds,
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
+#         )
+
+#         # Commit only corrected/real CDS.  The cosine classifier is already the
+#         # same classifier optimized during the one joint stage; no reset follows.
+#         self.model.replace_class_structure(committed_structure)
+#         self.model.validate_finalized_state()
+#         self.dataset.finalize_phase(phase_id)
+#         classifier.logit_scale_parameter.requires_grad_(scale_requires_grad)
+#         classifier.logit_scale_parameter.grad = None
+
+#         cumulative_loader = self.dataset.get_reporting_dataloader(
+#             phase_id, batch_size=eval_batch_size
+#         )
+#         cumulative = self.evaluate_loader(
+#             cumulative_loader,
+#             class_ids=seen_class_ids,
+#             target_class_ids=seen_class_ids,
+#         )
+#         groups = old_new_summary(
+#             cumulative, old_class_ids=old_class_ids, new_class_ids=new_class_ids
+#         )
+#         forgetting = float(old_before["balanced_accuracy"]) - float(
+#             groups["old"]["balanced_accuracy"]
+#         )
+#         phase_origin = phase_origin_confusion_diagnostics(
+#             cumulative,
+#             phase_to_classes={
+#                 index: self.dataset.phase_to_classes[index]
+#                 for index in range(phase_id + 1)
+#             },
+#         )
+
+#         final_record = history[-1]
+#         final_old_weight = classifier.class_weight(old_class_tensor).detach()
+#         final_new_weight = classifier.class_weight(new_class_tensor).detach()
+#         method_state = {
+#             "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}",
+#             "decision_rule": "one shared bias-free all-seen cosine classifier over Q",
+#             "physical_evidence": "I_P/V_P is phase-stable spectral evidence for CDS preservation, semantic correction and pair risk; never a second logit head",
+#             "training_chain": "one joint incremental optimization loop; no representation/classifier stage split and no post-hoc row reset",
+#             "gradient_ownership": "new-real all-seen CE -> Mamba+new rows only; old-source whole-CDS reconstruction -> old positives + seen rivals; new-source whole-CDS reconstruction -> new rows only with old rivals detached; old-old retention -> old rows; future rows never update",
+#             "semantic_drift": "global affine Q transport plus whole-CDS-conditioned class residual correction; I_P/V_P unchanged; multiplicative V_Q correction",
+#             "stores_old_images": False,
+#             "stores_old_feature_rows": False,
+#             "stores_synthetic_support": False,
+#             "uses_covariance_or_gaussian_memory": False,
+#             "uses_second_classifier": False,
+#             "uses_post_training_classifier_stage": False,
+#             "joint_epochs": epoch_count,
+#             "joint_lr": learning_rate,
+#             "contrastive_weight": contrastive_weight,
+#             "q_consistency_weight": q_consistency_weight,
+#             "kd_logit_weight": kd_logit_weight,
+#             "kd_temperature": kd_temperature,
+#             "cds_weight": cds_weight,
+#             "structural_weight": structural_weight,
+#             "phase_mapping_error": float(final_alignment.mapping_error.item()),
+#             "representation_drift_rms": float(
+#                 final_alignment.representation_drift_rms.item()
+#             ),
+#             "phase_scale_deviation_rms": float(
+#                 final_alignment.scale_deviation_rms.item()
+#             ),
+#             "phase_translation_rms": float(final_alignment.translation_rms.item()),
+#             "drift_learned_relevance_mean": float(
+#                 final_alignment.learned_relevance_mean.item()
+#             ),
+#             "drift_physical_relevance_mean": float(
+#                 final_alignment.physical_relevance_mean.item()
+#             ),
+#             "drift_effective_relevance_mean": float(
+#                 final_alignment.effective_relevance_mean.item()
+#             ),
+#             "drift_support_mass_mean": float(
+#                 final_alignment.class_specific_support_mass_mean.item()
+#             ),
+#             "drift_support_mass_min": float(
+#                 final_alignment.class_specific_support_mass_min.item()
+#             ),
+#             "drift_support_mass_max": float(
+#                 final_alignment.class_specific_support_mass_max.item()
+#             ),
+#             "drift_identity_correction_relative_mean": float(
+#                 final_alignment.identity_correction_relative_mean.item()
+#             ),
+#             "drift_identity_correction_relative_max": float(
+#                 final_alignment.identity_correction_relative_max.item()
+#             ),
+#             "drift_variation_correction_relative_mean": float(
+#                 final_alignment.variation_correction_relative_mean.item()
+#             ),
+#             "drift_variation_correction_relative_max": float(
+#                 final_alignment.variation_correction_relative_max.item()
+#             ),
+#             "drift_variation_negative_fraction_before_sanitize": float(
+#                 final_alignment.variation_negative_fraction_before_sanitize.item()
+#             ),
+#             "final_joint_classification_loss": float(final_record["classification_loss"]),
+#             "final_whole_cds_classifier_loss": float(final_record["whole_cds_classifier_loss"]),
+#             "final_old_cds_classifier_loss": float(final_record["old_cds_classifier_loss"]),
+#             "final_new_cds_classifier_loss": float(final_record["new_cds_classifier_loss"]),
+#             "classifier_balance": "real-current CE uses all-seen logits with new-row gradient ownership; whole-CDS classifier reconstruction is equal per seen class and uses I_Q/V_Q plus I_P/V_P pair relevance",
+#             "final_contrastive_loss": float(final_record["contrastive_loss"]),
+#             "final_q_consistency_loss": float(final_record["q_consistency_loss"]),
+#             "final_kd_logit_loss": float(final_record["kd_logit_loss"]),
+#             "final_cds_preservation_loss": float(final_record["cds_preservation_loss"]),
+#             "final_cds_intra_loss": float(final_record["cds_intra_loss"]),
+#             "final_cds_inter_loss": float(final_record["cds_inter_loss"]),
+#             "final_classifier_structural_loss": float(
+#                 final_structural.loss.detach().item()
+#             ),
+#             "final_global_cds_classifier_loss": float(
+#                 final_structural.global_reconstruction_loss.detach().item()
+#             ),
+#             "final_old_cds_classifier_component": float(
+#                 final_structural.old_class_reconstruction_loss.detach().item()
+#             ),
+#             "final_new_cds_classifier_component": float(
+#                 final_structural.new_class_reconstruction_loss.detach().item()
+#             ),
+#             "final_old_old_retention_loss": float(
+#                 final_structural.old_old_retention_loss.detach().item()
+#             ),
+#             "initial_old_new_violation_fraction": float(
+#                 pre_structural.old_new_violation_fraction.detach().item()
+#             ),
+#             "final_old_new_violation_fraction": float(
+#                 final_structural.old_new_violation_fraction.detach().item()
+#             ),
+#             "initial_old_old_violation_fraction": float(
+#                 pre_structural.historical_internal_violation_fraction.detach().item()
+#             ),
+#             "final_old_old_violation_fraction": float(
+#                 final_structural.historical_internal_violation_fraction.detach().item()
+#             ),
+#             "final_old_old_clearance_mean": float(
+#                 final_structural.historical_internal_clearance_mean.detach().item()
+#             ),
+#             "final_old_old_clearance_min": float(
+#                 final_structural.historical_internal_clearance_min.detach().item()
+#             ),
+#             "final_old_old_retention_mean": float(
+#                 final_structural.historical_internal_retention_mean.detach().item()
+#             ),
+#             "final_old_old_retention_min": float(
+#                 final_structural.historical_internal_retention_min.detach().item()
+#             ),
+#             "final_whole_cds_learned_risk_mean": float(
+#                 final_structural.learned_pair_risk_mean.detach().item()
+#             ),
+#             "final_whole_cds_physical_risk_mean": float(
+#                 final_structural.physical_pair_risk_mean.detach().item()
+#             ),
+#             "final_physical_absolute_support_mean": float(
+#                 final_record["physical_absolute_support_mean"]
+#             ),
+#             "final_physical_relation_support_mean": float(
+#                 final_record["physical_relation_support_mean"]
+#             ),
+#             "final_physical_relevance_mean": float(
+#                 final_record["physical_relevance_mean"]
+#             ),
+#             "historical_classifier_row_max_change": self._max_parameter_change(
+#                 old_weight_before, final_old_weight
+#             ),
+#             "incoming_classifier_initialization_max_change": self._max_parameter_change(
+#                 new_weight_random_before, phase_start_new_weight
+#             ),
+#             "incoming_classifier_training_max_change": self._max_parameter_change(
+#                 phase_start_new_weight, final_new_weight
+#             ),
+#             "incoming_admission_raw_clearance_min": float(
+#                 admission.raw_joint_clearance_min.item()
+#             ),
+#             "incoming_admission_final_clearance_min": float(
+#                 admission.final_joint_clearance_min.item()
+#             ),
+#             "incoming_admission_accepted_fraction": float(
+#                 admission.accepted_fraction.item()
+#             ),
+#             "phase_start_old_ba": float(old_before["balanced_accuracy"]),
+#             "phase_start_old_all_seen_ba": float(
+#                 phase_start_old_all_seen["balanced_accuracy"]
+#             ),
+#             "phase_start_new_only_ba": float(
+#                 phase_start_new_only["balanced_accuracy"]
+#             ),
+#             "phase_start_new_all_seen_ba": float(
+#                 phase_start_new_all_seen["balanced_accuracy"]
+#             ),
+#             "final_old_only_ba": float(final_record["old_only_ba"]),
+#             "final_old_all_seen_ba": float(final_record["old_all_seen_ba"]),
+#             "final_new_only_ba": float(final_record["new_only_ba"]),
+#             "final_new_all_seen_ba": float(final_record["new_all_seen_ba"]),
+#             "classifier_logit_scale_frozen_incremental": True,
+#             "second_classifier_stage": False,
+#         }
+
+#         return {
+#             "phase": phase_id,
+#             "old_class_ids": list(old_class_ids),
+#             "new_class_ids": list(new_class_ids),
+#             "seen_class_ids": list(seen_class_ids),
+#             "history": history,
+#             "final_epoch": epoch_count,
+#             "cumulative_test": cumulative,
+#             "old_new": groups,
+#             "forgetting": forgetting,
+#             "phase_origin_confusion": phase_origin,
+#             "method_state": method_state,
+#             "structure_committed": True,
+#             "phase_finalized": True,
+#         }
+
+
+# __all__ = ["IncrementalPhaseTrainer"]
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# """Single-stage joint NECIL-HSI incremental training.
+
+# Every incremental minibatch jointly updates the plastic Mamba representation and
+# the same all-seen cosine classifier. Real current HSI supplies all-seen CE and
+# SupCon; the frozen previous model supplies Q/logit stability; the complete CDS
+# protects historical intra/inter structure and all-seen decision boundaries.
+
+# Historical CDS is transported/corrected into the current learned coordinate once
+# per epoch as a state refresh inside the same optimization process. There is no
+# representation-then-classifier split, no post-hoc classifier reconstruction, no
+# old exemplar, pseudo old Q, inversion, Gaussian/covariance replay, or second head.
+# """
+
+# import math
+# import sys
+# from numbers import Integral, Real
+# from typing import Any, Dict
+
+# import torch
+# import torch.nn.functional as F
+# from tqdm import tqdm
+
+# from losses.loss import (
+#     joint_all_seen_classifier_loss,
+#     historical_cds_preservation_loss,
+#     logit_distillation_loss,
+#     reference_q_consistency_loss,
+#     supervised_contrastive_q_loss,
+# )
+# from models.classifier import CosineClassificationHead
+# from models.cds_decision_region import HSICDSDecisionRegionRegulator
+# from models.geometry_bank import ClassStructureBatch, merge_class_structure_batches
+# from models.phase_coordinate_alignment import correct_historical_structure
+# from utils.eval import old_new_summary, phase_origin_confusion_diagnostics
+
+# Tensor = torch.Tensor
+
+
+# def _positive_int(value: object, *, name: str) -> int:
+#     if isinstance(value, bool) or not isinstance(value, (Integral, Real)):
+#         raise ValueError(f"{name} must be a positive integer")
+#     number = float(value)
+#     if not math.isfinite(number) or not number.is_integer() or number <= 0:
+#         raise ValueError(f"{name} must be a positive integer")
+#     return int(number)
+
+
+# def _finite_positive(name: str, value: object) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result <= 0.0:
+#         raise ValueError(f"{name} must be finite and positive")
+#     return result
+
+
+# def _finite_nonnegative(name: str, value: object) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result < 0.0:
+#         raise ValueError(f"{name} must be finite and non-negative")
+#     return result
+
+
+# def _clone_structure(structure: ClassStructureBatch) -> ClassStructureBatch:
+#     if not isinstance(structure, ClassStructureBatch) or structure.class_count <= 0:
+#         raise ValueError("cannot clone an empty class structure")
+#     return ClassStructureBatch(
+#         class_ids=structure.class_ids.detach().clone(),
+#         sample_counts=structure.sample_counts.detach().clone(),
+#         learned_identity=structure.learned_identity.detach().clone(),
+#         learned_variation=structure.learned_variation.detach().clone(),
+#         physical_identity=structure.physical_identity.detach().clone(),
+#         physical_variation=structure.physical_variation.detach().clone(),
+#     )
+
+
+# def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
+#     matches = labels.unsqueeze(1).eq(class_ids.unsqueeze(0))
+#     if not bool(matches.sum(dim=1).eq(1).all()):
+#         raise ValueError("a current label is absent from current_class_ids")
+#     return matches.to(torch.long).argmax(dim=1)
+
+
+# class IncrementalPhaseTrainer:
+#     INCREMENTAL_RESULT_FIELDS = frozenset(
+#         {
+#             "phase",
+#             "old_class_ids",
+#             "new_class_ids",
+#             "seen_class_ids",
+#             "history",
+#             "final_epoch",
+#             "cumulative_test",
+#             "old_new",
+#             "forgetting",
+#             "method_state",
+#             "structure_committed",
+#             "phase_finalized",
+#         }
+#     )
+
+#     def _require_classifier(self) -> CosineClassificationHead:
+#         classifier = getattr(self.model, "classifier", None)
+#         if not isinstance(classifier, CosineClassificationHead):
+#             raise RuntimeError("model.classifier must be CosineClassificationHead")
+#         return classifier
+
+#     def _phase_classes(
+#         self,
+#         phase: int,
+#     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+#         old_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_old_classes(phase),
+#                 name=f"phase_{phase}_old_classes",
+#             )
+#         )
+#         new_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_new_classes(phase),
+#                 name=f"phase_{phase}_new_classes",
+#             )
+#         )
+#         seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(phase),
+#                 name=f"phase_{phase}_seen_classes",
+#             )
+#         )
+#         if not old_class_ids or not new_class_ids:
+#             raise RuntimeError("incremental phase requires old and new classes")
+#         if set(old_class_ids).intersection(new_class_ids):
+#             raise RuntimeError("old and new classes overlap")
+#         if seen_class_ids != old_class_ids + new_class_ids:
+#             raise RuntimeError("seen classes must equal old classes followed by new classes")
+#         if tuple(self.model.committed_class_ids) != old_class_ids:
+#             raise RuntimeError("committed historical CDS does not match old classes")
+#         return old_class_ids, new_class_ids, seen_class_ids
+
+#     @staticmethod
+#     def _assert_frozen_reference(reference_backbone: torch.nn.Module) -> None:
+#         reference_backbone.eval()
+#         if any(parameter.requires_grad for parameter in reference_backbone.parameters()):
+#             raise RuntimeError("previous backbone reference must remain frozen")
+#         if any(parameter.grad is not None for parameter in reference_backbone.parameters()):
+#             raise RuntimeError("previous backbone reference must not carry gradients")
+
+#     @staticmethod
+#     @torch.no_grad()
+#     def _assert_reference_matches_phase_start(
+#         reference_backbone: torch.nn.Module,
+#         current_backbone: torch.nn.Module,
+#     ) -> None:
+#         reference_state = reference_backbone.state_dict()
+#         current_state = current_backbone.state_dict()
+#         if tuple(reference_state.keys()) != tuple(current_state.keys()):
+#             raise RuntimeError("previous/current backbone schemas differ at phase start")
+#         for name in reference_state:
+#             if not torch.equal(
+#                 reference_state[name].detach().cpu(),
+#                 current_state[name].detach().cpu(),
+#             ):
+#                 raise RuntimeError(
+#                     f"previous backbone does not match finalized phase-start state at {name}"
+#                 )
+
+#     @staticmethod
+#     def _assert_frozen_reference_classifier(
+#         reference_classifier: CosineClassificationHead,
+#     ) -> None:
+#         reference_classifier.eval()
+#         if any(parameter.requires_grad for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must remain frozen")
+#         if any(parameter.grad is not None for parameter in reference_classifier.parameters()):
+#             raise RuntimeError("previous classifier reference must not carry gradients")
+
+#     @staticmethod
+#     @torch.no_grad()
+#     def _assert_reference_classifier_matches_phase_start(
+#         reference_classifier: CosineClassificationHead,
+#         current_classifier: CosineClassificationHead,
+#     ) -> None:
+#         reference_state = reference_classifier.state_dict()
+#         current_state = current_classifier.state_dict()
+#         if tuple(reference_state.keys()) != tuple(current_state.keys()):
+#             raise RuntimeError("previous/current classifier schemas differ at phase start")
+#         for name in reference_state:
+#             if not torch.equal(
+#                 reference_state[name].detach().cpu(),
+#                 current_state[name].detach().cpu(),
+#             ):
+#                 raise RuntimeError(
+#                     f"previous classifier does not match finalized phase-start state at {name}"
+#                 )
+
+#     @torch.no_grad()
+#     def _current_class_weights(
+#         self,
+#         loader: Any,
+#         *,
+#         new_class_ids: tuple[int, ...],
+#     ) -> tuple[Tensor, int]:
+#         counts = {class_id: 0 for class_id in new_class_ids}
+#         total = 0
+#         valid = set(new_class_ids)
+#         for batch in loader:
+#             _, _, labels = self.unpack_batch(batch)
+#             observed = set(int(value) for value in labels.unique().detach().cpu().tolist())
+#             outside = observed - valid
+#             if outside:
+#                 raise RuntimeError(
+#                     f"incremental TRAIN loader contains non-current classes {sorted(outside)}"
+#                 )
+#             for class_id in new_class_ids:
+#                 count = int(labels.eq(class_id).sum().item())
+#                 counts[class_id] += count
+#                 total += count
+#         if total <= 0 or any(counts[class_id] <= 0 for class_id in new_class_ids):
+#             raise RuntimeError("incremental TRAIN split is empty or misses a current class")
+#         class_count = len(new_class_ids)
+#         weights = torch.tensor(
+#             [
+#                 total / float(class_count * counts[class_id])
+#                 for class_id in new_class_ids
+#             ],
+#             device=self.device,
+#             dtype=self.model.dtype,
+#         )
+#         return weights, total
+
+#     @staticmethod
+#     def _max_parameter_change(before: Tensor, after: Tensor) -> float:
+#         if before.shape != after.shape:
+#             raise ValueError("parameter snapshots have different shapes")
+#         if before.numel() == 0:
+#             return 0.0
+#         return float((after - before).abs().max().item())
+
+#     @staticmethod
+#     @torch.no_grad()
+#     def _initialize_incoming_classifier_rows(
+#         classifier: CosineClassificationHead,
+#         *,
+#         new_class_ids: Tensor,
+#         current_structure: ClassStructureBatch,
+#     ) -> None:
+#         ids = torch.as_tensor(
+#             new_class_ids,
+#             device=classifier.weight.device,
+#             dtype=torch.long,
+#         ).flatten()
+#         structure_ids = current_structure.class_ids.to(
+#             device=classifier.weight.device,
+#             dtype=torch.long,
+#         )
+#         if not torch.equal(ids, structure_ids):
+#             raise RuntimeError("incoming CDS class order does not match classifier rows")
+#         flat = current_structure.learned_identity.to(
+#             device=classifier.weight.device,
+#             dtype=classifier.weight.dtype,
+#         ).reshape(ids.numel(), -1)
+#         if flat.shape != (ids.numel(), classifier.feature_dim):
+#             raise RuntimeError("incoming I_Q shape does not match cosine classifier")
+#         if not bool(torch.isfinite(flat).all()):
+#             raise RuntimeError("incoming I_Q contains NaN or Inf")
+#         eps = torch.finfo(flat.dtype).eps
+#         if bool((flat.norm(dim=1) <= eps).any()):
+#             raise RuntimeError("an incoming I_Q has zero norm")
+#         classifier.weight.index_copy_(0, ids, F.normalize(flat, p=2, dim=1, eps=eps))
+
+#     @staticmethod
+#     def _assert_future_rows_unchanged(
+#         classifier: CosineClassificationHead,
+#         future_class_tensor: Tensor,
+#         future_weight_before: Tensor | None,
+#     ) -> None:
+#         if future_weight_before is None or future_class_tensor.numel() == 0:
+#             return
+#         current = classifier.class_weight(future_class_tensor).detach()
+#         if not torch.equal(current, future_weight_before):
+#             raise RuntimeError("future classifier rows changed before their phase")
+
+#     def train_incremental_phase(
+#         self,
+#         *,
+#         phase: int,
+#         epochs: int,
+#         batch_size: int,
+#         lr: float,
+#         reference_backbone: torch.nn.Module,
+#         reference_classifier: CosineClassificationHead,
+#     ) -> Dict[str, Any]:
+#         """Run one joint incremental optimization stage.
+
+#         There is no representation stage followed by classifier reconstruction.
+#         The plastic backbone and the single all-seen cosine classifier are updated
+#         together in every minibatch. Historical CDS is refreshed into the current
+#         Q coordinate once per epoch and immediately participates in the same joint
+#         objective used for real current HSI.
+#         """
+#         phase_id = _positive_int(phase, name="phase")
+#         epoch_count = _positive_int(epochs, name="epochs")
+#         train_batch_size = _positive_int(batch_size, name="batch_size")
+#         learning_rate = _finite_positive("lr_inc", lr)
+#         eval_batch_size = _positive_int(self.cfg("eval_batch_size", 256), name="eval_batch_size")
+#         weight_decay = _finite_nonnegative("weight_decay", self.cfg("weight_decay", 1e-4))
+#         gradient_clip = _finite_nonnegative("gradient_clip", self.cfg("gradient_clip", 0.0))
+#         contrastive_weight = _finite_nonnegative("contrastive_weight", self.cfg("contrastive_weight", 1.0))
+#         q_consistency_weight = _finite_nonnegative("q_consistency_weight", self.cfg("q_consistency_weight", 1.0))
+#         kd_logit_weight = _finite_nonnegative("kd_logit_weight", self.cfg("kd_logit_weight", 1.0))
+#         kd_temperature = _finite_positive("kd_temperature", self.cfg("kd_temperature", 2.0))
+#         cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
+#         margin_weight = _finite_nonnegative("margin_ranking_weight", self.cfg("margin_ranking_weight", 1.0))
+
+#         self.model.validate_finalized_state()
+#         classifier = self._require_classifier()
+#         self._assert_frozen_reference(reference_backbone)
+#         self._assert_frozen_reference_classifier(reference_classifier)
+#         self._assert_reference_matches_phase_start(reference_backbone, self.model.backbone)
+#         self._assert_reference_classifier_matches_phase_start(reference_classifier, classifier)
+
+#         previous_phase = phase_id - 1
+#         previous_seen_class_ids = tuple(
+#             self._validated_class_ids(
+#                 self.dataset.get_seen_classes(previous_phase),
+#                 name="previous_seen_classes",
+#             )
+#         )
+#         old_reporting_loader = self.dataset.get_reporting_dataloader(
+#             previous_phase,
+#             batch_size=eval_batch_size,
+#         )
+#         old_before = self.evaluate_loader(
+#             old_reporting_loader,
+#             class_ids=previous_seen_class_ids,
+#             target_class_ids=previous_seen_class_ids,
+#         )
+
+#         self.dataset.start_phase(phase_id)
+#         old_class_ids, new_class_ids, seen_class_ids = self._phase_classes(phase_id)
+#         if len(new_class_ids) < 2:
+#             raise RuntimeError("joint incremental training requires at least two incoming classes")
+#         old_class_tensor = torch.tensor(old_class_ids, device=self.device, dtype=torch.long)
+#         new_class_tensor = torch.tensor(new_class_ids, device=self.device, dtype=torch.long)
+#         seen_class_tensor = torch.tensor(seen_class_ids, device=self.device, dtype=torch.long)
+
+#         historical_structure = _clone_structure(
+#             self.model.structure_bank.class_structures(old_class_ids)
+#         )
+#         reference_historical_cds = self.model.structure_bank.build_cds(historical_structure)
+
+#         self.model.set_incremental_trainability()
+#         backbone_parameters = [
+#             parameter for parameter in self.model.backbone.parameters() if parameter.requires_grad
+#         ]
+#         if not backbone_parameters:
+#             raise RuntimeError("incremental backbone has no trainable parameters")
+
+#         train_eval_loader = self.dataset.get_phase_dataloader(
+#             phase_id,
+#             split="train",
+#             batch_size=eval_batch_size,
+#             shuffle=False,
+#         )
+#         current_class_weights, expected_samples = self._current_class_weights(
+#             train_eval_loader,
+#             new_class_ids=new_class_ids,
+#         )
+#         reference_train = self.collect_ordered_features(
+#             train_eval_loader,
+#             backbone=reference_backbone,
+#         )
+#         reference_features_full = reference_train["ordered_features"].detach()
+#         reference_spectra = reference_train["raw_center_spectra"].detach()
+#         reference_labels = reference_train["labels"].detach()
+#         observed_new = tuple(
+#             sorted(int(v) for v in reference_labels.unique().detach().cpu().tolist())
+#         )
+#         if observed_new != tuple(sorted(new_class_ids)):
+#             raise RuntimeError("incremental TRAIN rows do not match current phase classes")
+
+#         current_physical_structure = self.model.estimate_physical_class_structure(
+#             reference_spectra,
+#             reference_labels,
+#             class_ids=new_class_ids,
+#         )
+#         current_reference_structure = self.model.estimate_class_structure(
+#             reference_features_full,
+#             None,
+#             reference_labels,
+#             class_ids=new_class_ids,
+#             physical_structure=current_physical_structure,
+#         )
+
+#         old_weight_before = classifier.class_weight(old_class_tensor).detach().clone()
+#         new_weight_random_before = classifier.class_weight(new_class_tensor).detach().clone()
+#         seen_set = set(seen_class_ids)
+#         future_class_ids = tuple(
+#             class_id
+#             for class_id in range(classifier.total_class_count)
+#             if class_id not in seen_set
+#         )
+#         future_class_tensor = torch.tensor(future_class_ids, device=self.device, dtype=torch.long)
+#         future_weight_before = (
+#             classifier.class_weight(future_class_tensor).detach().clone()
+#             if future_class_ids
+#             else None
+#         )
+
+#         # Incoming rows need a legal phase-start direction, not random future-row
+#         # geometry. This is initialization only; all seen rows are jointly trainable
+#         # from the first incremental optimizer step onward.
+#         self._initialize_incoming_classifier_rows(
+#             classifier,
+#             new_class_ids=new_class_tensor,
+#             current_structure=current_reference_structure,
+#         )
+#         phase_start_new_weight = classifier.class_weight(new_class_tensor).detach().clone()
+#         if not torch.equal(classifier.class_weight(old_class_tensor).detach(), old_weight_before):
+#             raise RuntimeError("incoming-row initialization changed a historical row")
+
+#         scale_requires_grad = bool(classifier.logit_scale_parameter.requires_grad)
+#         classifier.logit_scale_parameter.requires_grad_(False)
+#         classifier.logit_scale_parameter.grad = None
+#         phase_start_logit_scale = float(classifier.logit_scale.detach().item())
+
+#         train_loader = self.dataset.get_phase_dataloader(
+#             phase_id,
+#             split="train",
+#             batch_size=train_batch_size,
+#             shuffle=True,
+#         )
+#         val_loader = (
+#             self.dataset.get_phase_dataloader(
+#                 phase_id,
+#                 split="val",
+#                 batch_size=eval_batch_size,
+#                 shuffle=False,
+#             )
+#             if self.dataset.validation_enabled
+#             else None
+#         )
+
+#         phase_start_new_only = self.evaluate_loader(
+#             train_eval_loader,
+#             class_ids=new_class_ids,
+#             target_class_ids=new_class_ids,
+#         )
+#         phase_start_new_all_seen = self.evaluate_loader(
+#             train_eval_loader,
+#             class_ids=seen_class_ids,
+#             target_class_ids=new_class_ids,
+#         )
+#         phase_start_old_all_seen = self.evaluate_loader(
+#             old_reporting_loader,
+#             class_ids=seen_class_ids,
+#             target_class_ids=old_class_ids,
+#         )
+#         print(
+#             f"[Phase {phase_id} start] "
+#             f"OldBA(previous-only)={100*float(old_before['balanced_accuracy']):.2f}% "
+#             f"OldBA(all-seen)={100*float(phase_start_old_all_seen['balanced_accuracy']):.2f}% "
+#             f"NewBA(new-only)={100*float(phase_start_new_only['balanced_accuracy']):.2f}% "
+#             f"NewBA(all-seen)={100*float(phase_start_new_all_seen['balanced_accuracy']):.2f}%",
+#             file=sys.stdout,
+#         )
+
+#         def refresh_joint_structure() -> tuple[ClassStructureBatch, ClassStructureBatch, Any, Any]:
+#             """Refresh legal transient CDS in the *current* learned coordinate."""
+#             self.model.eval()
+#             rows = self.collect_ordered_features(train_eval_loader)
+#             if not torch.equal(rows["labels"], reference_labels):
+#                 raise RuntimeError("current TRAIN label order changed during joint training")
+#             if not torch.equal(rows["raw_center_spectra"], reference_spectra):
+#                 raise RuntimeError("current TRAIN spectra changed during joint training")
+#             current_features_full = rows["ordered_features"].detach()
+#             current_structure = self.model.estimate_class_structure(
+#                 current_features_full,
+#                 None,
+#                 reference_labels,
+#                 class_ids=new_class_ids,
+#                 physical_structure=current_physical_structure,
+#             )
+#             corrected_historical, transform, alignment = correct_historical_structure(
+#                 historical_structure=historical_structure,
+#                 current_reference_structure=current_reference_structure,
+#                 current_structure=current_structure,
+#                 reference_features=reference_features_full,
+#                 current_features=current_features_full,
+#             )
+#             if not torch.equal(
+#                 corrected_historical.physical_identity,
+#                 historical_structure.physical_identity,
+#             ):
+#                 raise RuntimeError("historical I_P changed during joint drift correction")
+#             if not torch.equal(
+#                 corrected_historical.physical_variation,
+#                 historical_structure.physical_variation,
+#             ):
+#                 raise RuntimeError("historical V_P changed during joint drift correction")
+#             merged = merge_class_structure_batches((corrected_historical, current_structure))
+#             merged_ids = tuple(
+#                 int(value) for value in merged.class_ids.detach().cpu().tolist()
+#             )
+#             if merged_ids != seen_class_ids:
+#                 raise RuntimeError("joint CDS refresh produced incorrect class order")
+#             seen_cds = self.model.structure_bank.build_cds(merged)
+#             return corrected_historical, current_structure, (merged, seen_cds), (transform, alignment)
+
+#         # One optimizer, one scheduler, one epoch loop. The classifier and Mamba
+#         # are never split into separate adaptation/reconstruction stages.
+#         optimizer = torch.optim.AdamW(
+#             [
+#                 {"params": backbone_parameters, "weight_decay": weight_decay},
+#                 {"params": [classifier.weight], "weight_decay": 0.0},
+#             ],
+#             lr=learning_rate,
+#         )
+#         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#             optimizer,
+#             T_max=epoch_count,
+#             eta_min=0.0,
+#         )
+#         regulator = HSICDSDecisionRegionRegulator().to(self.device)
+
+#         (
+#             working_historical,
+#             working_current,
+#             (working_merged, working_seen_cds),
+#             (working_transform, working_alignment),
+#         ) = refresh_joint_structure()
+#         pre_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=working_seen_cds,
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
+#         )
+
+#         history: list[dict[str, Any]] = []
+#         progress = tqdm(
+#             range(epoch_count),
+#             desc=f"Phase {phase_id} joint incremental training",
+#             unit="epoch",
+#             dynamic_ncols=True,
+#             file=sys.stdout,
+#         )
+
+#         for epoch in progress:
+#             historical_classifier_support = working_historical.learned_identity.detach()
+#             if historical_classifier_support.shape != (
+#                 len(old_class_ids),
+#                 self.model.spectral_token_count,
+#                 self.model.spectral_token_dim,
+#             ):
+#                 raise RuntimeError("corrected historical I_Q has invalid joint-support shape")
+
+#             self.model.train()
+#             sums = {name: 0.0 for name in (
+#                 "joint", "new_ce", "old_anchor", "old_anchor_acc", "old_anchor_margin",
+#                 "old_anchor_viol", "new_acc", "contrastive", "q_consistency", "kd",
+#                 "cds", "intra", "inter", "physical_abs", "physical_rel",
+#                 "physical_joint", "structural", "total"
+#             )}
+#             sample_count = 0
+
+#             for batch in train_loader:
+#                 patch, spectrum, labels = self.unpack_batch(batch)
+#                 if not bool(torch.isin(labels, new_class_tensor).all()):
+#                     raise RuntimeError("incremental TRAIN batch contains an old or future class")
+
+#                 optimizer.zero_grad(set_to_none=True)
+#                 classifier.logit_scale_parameter.grad = None
+
+#                 with torch.no_grad():
+#                     reference_features = self.model.extract_features_with_backbone(
+#                         reference_backbone,
+#                         patch,
+#                         center_spectrum=spectrum,
+#                         return_aux=False,
+#                     ).ordered_features.detach()
+#                     physical_evidence = self.model.physical_spectral_evidence(spectrum).detach()
+#                     teacher_old_logits = reference_classifier(
+#                         reference_features,
+#                         class_ids=old_class_tensor,
+#                         trainable_class_ids=(),
+#                     ).logits.detach()
+
+#                 current_features = self.model.extract_features(
+#                     patch,
+#                     center_spectrum=spectrum,
+#                     return_aux=False,
+#                 ).ordered_features
+#                 current_local = _targets_local(labels, new_class_tensor)
+#                 sample_weights = current_class_weights.index_select(0, current_local)
+
+#                 # The classifier and representation are learned together here.
+#                 # Current samples see ALL old+new competitors. Corrected old I_Q
+#                 # is only a conditional safety anchor, not an always-on CE source.
+#                 joint = joint_all_seen_classifier_loss(
+#                     classifier=classifier,
+#                     seen_class_ids=seen_class_tensor,
+#                     historical_identity=historical_classifier_support,
+#                     historical_class_ids=old_class_tensor,
+#                     current_features=current_features,
+#                     current_labels=labels,
+#                     current_class_ids=new_class_tensor,
+#                     current_sample_weights=sample_weights,
+#                 )
+#                 contrastive = supervised_contrastive_q_loss(
+#                     ordered_features=current_features,
+#                     labels_global=labels,
+#                     logit_scale=classifier.logit_scale,
+#                     sample_weights=sample_weights,
+#                 )
+#                 q_consistency = reference_q_consistency_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                 )
+#                 # KD is feature-side stability. Detaching old classifier rows here
+#                 # prevents current-only teacher logits from dictating historical
+#                 # classifier updates; the joint CDS constraints own that role.
+#                 student_old_logits = classifier(
+#                     current_features,
+#                     class_ids=old_class_tensor,
+#                     trainable_class_ids=(),
+#                 ).logits
+#                 kd = logit_distillation_loss(
+#                     student_old_logits=student_old_logits,
+#                     teacher_old_logits=teacher_old_logits,
+#                     temperature=kd_temperature,
+#                     sample_weights=sample_weights,
+#                 )
+#                 cds = historical_cds_preservation_loss(
+#                     reference_features=reference_features,
+#                     current_features=current_features,
+#                     physical_spectral_evidence=physical_evidence,
+#                     reference_historical_structure=historical_structure,
+#                     current_historical_structure=working_historical,
+#                 )
+#                 structural = regulator(
+#                     classifier=classifier,
+#                     seen_cds=working_seen_cds,
+#                     historical_class_count=len(old_class_ids),
+#                     reference_classifier=reference_classifier,
+#                     reference_historical_cds=reference_historical_cds,
+#                 )
+
+#                 loss = (
+#                     joint.loss
+#                     + contrastive_weight * contrastive.loss
+#                     + q_consistency_weight * q_consistency.loss
+#                     + kd_logit_weight * kd.loss
+#                     + cds_weight * cds.loss
+#                     + margin_weight * structural.loss
+#                 )
+#                 if not bool(torch.isfinite(loss)):
+#                     raise RuntimeError("joint incremental objective became NaN or Inf")
+#                 loss.backward()
+
+#                 if classifier.logit_scale_parameter.grad is not None:
+#                     raise RuntimeError("joint incremental training must not update cosine scale")
+#                 if classifier.weight.grad is None or not bool(torch.isfinite(classifier.weight.grad).all()):
+#                     raise RuntimeError("joint classifier gradient is missing/non-finite")
+#                 if future_class_ids and bool(
+#                     torch.count_nonzero(
+#                         classifier.weight.grad.index_select(0, future_class_tensor)
+#                     )
+#                 ):
+#                     raise RuntimeError("future classifier rows received joint-training gradients")
+#                 for parameter in backbone_parameters:
+#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
+#                         raise RuntimeError("joint backbone gradient contains NaN or Inf")
+
+#                 if gradient_clip > 0:
+#                     torch.nn.utils.clip_grad_norm_(
+#                         backbone_parameters + [classifier.weight],
+#                         gradient_clip,
+#                         error_if_nonfinite=True,
+#                     )
+#                 optimizer.step()
+#                 self._assert_future_rows_unchanged(
+#                     classifier,
+#                     future_class_tensor,
+#                     future_weight_before,
+#                 )
+
+#                 n = int(labels.numel())
+#                 sums["joint"] += float(joint.loss.detach().item()) * n
+#                 sums["new_ce"] += float(joint.current_ce_loss.detach().item()) * n
+#                 sums["old_anchor"] += float(joint.historical_anchor_loss.detach().item()) * n
+#                 sums["old_anchor_acc"] += float(joint.historical_accuracy.detach().item()) * n
+#                 sums["old_anchor_margin"] += float(joint.historical_margin_mean.detach().item()) * n
+#                 sums["old_anchor_viol"] += float(joint.historical_violation_fraction.detach().item()) * n
+#                 sums["new_acc"] += float(joint.current_accuracy.detach().item()) * n
+#                 sums["contrastive"] += float(contrastive.loss.detach().item()) * n
+#                 sums["q_consistency"] += float(q_consistency.loss.detach().item()) * n
+#                 sums["kd"] += float(kd.loss.detach().item()) * n
+#                 sums["cds"] += float(cds.loss.detach().item()) * n
+#                 sums["intra"] += float(cds.intra_loss.detach().item()) * n
+#                 sums["inter"] += float(cds.inter_loss.detach().item()) * n
+#                 sums["physical_abs"] += float(cds.physical_absolute_support_mean.detach().item()) * n
+#                 sums["physical_rel"] += float(cds.physical_relation_support_mean.detach().item()) * n
+#                 sums["physical_joint"] += float(cds.physical_relevance_mean.detach().item()) * n
+#                 sums["structural"] += float(structural.loss.detach().item()) * n
+#                 sums["total"] += float(loss.detach().item()) * n
+#                 sample_count += n
+
+#             if sample_count != expected_samples:
+#                 raise RuntimeError("joint TRAIN loader did not traverse the complete split")
+#             scheduler.step()
+#             if float(classifier.logit_scale.detach().item()) != phase_start_logit_scale:
+#                 raise RuntimeError("shared cosine logit scale changed during joint training")
+#             self._assert_future_rows_unchanged(
+#                 classifier,
+#                 future_class_tensor,
+#                 future_weight_before,
+#             )
+
+#             # Refresh the drift correction and whole CDS *inside the same training
+#             # process* for the next epoch. This is state refresh, not a second
+#             # optimization stage and no parameter is updated here.
+#             self.model.eval()
+#             (
+#                 working_historical,
+#                 working_current,
+#                 (working_merged, working_seen_cds),
+#                 (working_transform, working_alignment),
+#             ) = refresh_joint_structure()
+#             epoch_structural = regulator(
+#                 classifier=classifier,
+#                 seen_cds=working_seen_cds,
+#                 historical_class_count=len(old_class_ids),
+#                 reference_classifier=reference_classifier,
+#                 reference_historical_cds=reference_historical_cds,
+#             )
+
+#             old_only = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=old_class_ids,
+#                 target_class_ids=old_class_ids,
+#             )
+#             old_all = self.evaluate_loader(
+#                 old_reporting_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=old_class_ids,
+#             )
+#             new_only = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=new_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             new_all = self.evaluate_loader(
+#                 train_eval_loader,
+#                 class_ids=seen_class_ids,
+#                 target_class_ids=new_class_ids,
+#             )
+#             validation_all = (
+#                 None
+#                 if val_loader is None
+#                 else self.evaluate_loader(
+#                     val_loader,
+#                     class_ids=seen_class_ids,
+#                     target_class_ids=new_class_ids,
+#                 )
+#             )
+
+#             record = {
+#                 "stage": "joint",
+#                 "epoch": epoch + 1,
+#                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+#                 "joint_classification_loss": sums["joint"] / sample_count,
+#                 "current_all_seen_ce_loss": sums["new_ce"] / sample_count,
+#                 "historical_anchor_loss": sums["old_anchor"] / sample_count,
+#                 "historical_anchor_accuracy": sums["old_anchor_acc"] / sample_count,
+#                 "historical_anchor_margin_mean": sums["old_anchor_margin"] / sample_count,
+#                 "historical_anchor_violation_fraction": sums["old_anchor_viol"] / sample_count,
+#                 "current_all_seen_accuracy": sums["new_acc"] / sample_count,
+#                 "contrastive_loss": sums["contrastive"] / sample_count,
+#                 "q_consistency_loss": sums["q_consistency"] / sample_count,
+#                 "kd_logit_loss": sums["kd"] / sample_count,
+#                 "cds_preservation_loss": sums["cds"] / sample_count,
+#                 "cds_intra_loss": sums["intra"] / sample_count,
+#                 "cds_inter_loss": sums["inter"] / sample_count,
+#                 "physical_absolute_support_mean": sums["physical_abs"] / sample_count,
+#                 "physical_relation_support_mean": sums["physical_rel"] / sample_count,
+#                 "physical_relevance_mean": sums["physical_joint"] / sample_count,
+#                 "structural_boundary_loss": sums["structural"] / sample_count,
+#                 "total_loss": sums["total"] / sample_count,
+#                 "old_only_ba": float(old_only["balanced_accuracy"]),
+#                 "old_all_seen_ba": float(old_all["balanced_accuracy"]),
+#                 "new_only_ba": float(new_only["balanced_accuracy"]),
+#                 "new_all_seen_ba": float(new_all["balanced_accuracy"]),
+#                 "validation_new_all_seen_ba": None if validation_all is None else float(validation_all["balanced_accuracy"]),
+#                 "pair_violation_fraction": float(epoch_structural.pair_violation_fraction.detach().item()),
+#                 "old_side_violation_fraction": float(epoch_structural.reference_violation_fraction.detach().item()),
+#                 "current_side_violation_fraction": float(epoch_structural.current_violation_fraction.detach().item()),
+#                 "old_old_violation_fraction": float(epoch_structural.historical_internal_violation_fraction.detach().item()),
+#                 "pair_retention_mean": float(epoch_structural.pair_retention_mean.detach().item()),
+#                 "pair_retention_min": float(epoch_structural.pair_retention_min.detach().item()),
+#                 "epoch_mapping_error": float(working_alignment.mapping_error.item()),
+#                 "epoch_representation_drift_rms": float(working_alignment.representation_drift_rms.item()),
+#             }
+#             history.append(record)
+#             tqdm.write(
+#                 f"[Joint {epoch + 1:03d}/{epoch_count:03d}] "
+#                 f"Cls={record['joint_classification_loss']:.4f} "
+#                 f"NewCE={record['current_all_seen_ce_loss']:.4f} "
+#                 f"OldAnchor={record['historical_anchor_loss']:.4f} "
+#                 f"OldAnchorAcc={100*record['historical_anchor_accuracy']:.1f}% "
+#                 f"Con={record['contrastive_loss']:.4f} Q={record['q_consistency_loss']:.4f} "
+#                 f"KD={record['kd_logit_loss']:.4f} "
+#                 f"CDS={record['cds_preservation_loss']:.4f} "
+#                 f"Struct={record['structural_boundary_loss']:.4f} | "
+#                 f"OldOnly/All={100*record['old_only_ba']:.2f}%/{100*record['old_all_seen_ba']:.2f}% "
+#                 f"NewOnly/All={100*record['new_only_ba']:.2f}%/{100*record['new_all_seen_ba']:.2f}% "
+#                 f"PairViol={100*record['pair_violation_fraction']:.1f}%",
+#                 file=sys.stdout,
+#             )
+
+#         progress.close()
+#         if not history:
+#             raise RuntimeError("joint incremental training produced no epochs")
+
+#         self.model.eval()
+#         final_structural = regulator(
+#             classifier=classifier,
+#             seen_cds=working_seen_cds,
+#             historical_class_count=len(old_class_ids),
+#             reference_classifier=reference_classifier,
+#             reference_historical_cds=reference_historical_cds,
+#         )
+
+#         # The final refreshed CDS is the only state committed. There is no
+#         # classifier-only post-processing stage after this point.
+#         self.model.replace_class_structure(working_merged)
+#         self.model.validate_finalized_state()
+#         self.dataset.finalize_phase(phase_id)
+#         classifier.logit_scale_parameter.requires_grad_(scale_requires_grad)
+#         classifier.logit_scale_parameter.grad = None
+
+#         cumulative_loader = self.dataset.get_reporting_dataloader(
+#             phase_id,
+#             batch_size=eval_batch_size,
+#         )
+#         cumulative = self.evaluate_loader(
+#             cumulative_loader,
+#             class_ids=seen_class_ids,
+#             target_class_ids=seen_class_ids,
+#         )
+#         groups = old_new_summary(
+#             cumulative,
+#             old_class_ids=old_class_ids,
+#             new_class_ids=new_class_ids,
+#         )
+#         forgetting = float(old_before["balanced_accuracy"]) - float(
+#             groups["old"]["balanced_accuracy"]
+#         )
+#         phase_origin = phase_origin_confusion_diagnostics(
+#             cumulative,
+#             phase_to_classes={
+#                 index: self.dataset.phase_to_classes[index]
+#                 for index in range(phase_id + 1)
+#             },
+#         )
+
+#         final_record = history[-1]
+#         final_old_weight = classifier.class_weight(old_class_tensor).detach()
+#         final_new_weight = classifier.class_weight(new_class_tensor).detach()
+#         method_state = {
+#             "persistent_cds": "{I_Q,V_Q,I_P,V_P,N}",
+#             "physical_evidence": "direct robustly normalized native spectrum P[B,1]",
+#             "training_reference": "frozen previous backbone/classifier + finalized historical CDS",
+#             "training_chain": "single joint incremental optimization: real-current all-seen classification + SupCon + Q consistency + old-logit KD + whole-CDS preservation + whole-CDS boundary protection; epoch-wise CDS coordinate refresh; no second optimization stage",
+#             "active_objectives": "one joint loss in every minibatch; current real Q uses all-seen CE, corrected historical I_Q uses zero-margin safety anchoring, and I_Q/V_Q/I_P/V_P regulate historical/current decision regions",
+#             "semantic_drift": "epoch-wise task affine plus whole-CDS-conditioned class residual correction, refreshed inside joint training and committed once at phase end",
+#             "phase_mapping_error": float(working_alignment.mapping_error.item()),
+#             "representation_drift_rms": float(working_alignment.representation_drift_rms.item()),
+#             "phase_scale_deviation_rms": float(working_alignment.scale_deviation_rms.item()),
+#             "phase_translation_rms": float(working_alignment.translation_rms.item()),
+#             "drift_support_mass_mean": float(working_alignment.class_specific_support_mass_mean.item()),
+#             "drift_support_mass_min": float(working_alignment.class_specific_support_mass_min.item()),
+#             "drift_support_mass_max": float(working_alignment.class_specific_support_mass_max.item()),
+#             "drift_identity_correction_relative_mean": float(working_alignment.identity_correction_relative_mean.item()),
+#             "drift_identity_correction_relative_max": float(working_alignment.identity_correction_relative_max.item()),
+#             "drift_variation_correction_relative_mean": float(working_alignment.variation_correction_relative_mean.item()),
+#             "drift_variation_correction_relative_max": float(working_alignment.variation_correction_relative_max.item()),
+#             "drift_variation_negative_fraction_before_sanitize": float(working_alignment.variation_negative_fraction_before_sanitize.item()),
+#             "final_joint_classification_loss": float(final_record["joint_classification_loss"]),
+#             "final_current_all_seen_ce_loss": float(final_record["current_all_seen_ce_loss"]),
+#             "final_historical_anchor_loss": float(final_record["historical_anchor_loss"]),
+#             "final_historical_anchor_accuracy": float(final_record["historical_anchor_accuracy"]),
+#             "final_historical_anchor_margin_mean": float(final_record["historical_anchor_margin_mean"]),
+#             "final_historical_anchor_violation_fraction": float(final_record["historical_anchor_violation_fraction"]),
+#             "final_contrastive_loss": float(final_record["contrastive_loss"]),
+#             "final_q_consistency_loss": float(final_record["q_consistency_loss"]),
+#             "final_kd_logit_loss": float(final_record["kd_logit_loss"]),
+#             "final_cds_preservation_loss": float(final_record["cds_preservation_loss"]),
+#             "final_cds_intra_loss": float(final_record["cds_intra_loss"]),
+#             "final_cds_inter_loss": float(final_record["cds_inter_loss"]),
+#             "final_physical_absolute_support_mean": float(final_record["physical_absolute_support_mean"]),
+#             "final_physical_relation_support_mean": float(final_record["physical_relation_support_mean"]),
+#             "final_physical_relevance_mean": float(final_record["physical_relevance_mean"]),
+#             "final_structural_boundary_loss": float(final_structural.loss.detach().item()),
+#             "reference_clearance_mean": float(final_structural.reference_clearance_mean.detach().item()),
+#             "reference_clearance_min": float(final_structural.reference_clearance_min.detach().item()),
+#             "final_historical_clearance_mean": float(final_structural.historical_structural_clearance_mean.detach().item()),
+#             "final_historical_clearance_min": float(final_structural.historical_structural_clearance_min.detach().item()),
+#             "final_clearance_retention_mean": float(final_structural.reference_retention_mean.detach().item()),
+#             "final_clearance_retention_min": float(final_structural.reference_retention_min.detach().item()),
+#             "pre_margin_violation_fraction": float(pre_structural.pair_violation_fraction.detach().item()),
+#             "final_margin_violation_fraction": float(final_structural.pair_violation_fraction.detach().item()),
+#             "final_current_side_violation_fraction": float(final_structural.current_violation_fraction.detach().item()),
+#             "final_old_old_clearance_mean": float(final_structural.historical_internal_clearance_mean.detach().item()),
+#             "final_old_old_clearance_min": float(final_structural.historical_internal_clearance_min.detach().item()),
+#             "final_old_old_retention_mean": float(final_structural.historical_internal_retention_mean.detach().item()),
+#             "final_old_old_retention_min": float(final_structural.historical_internal_retention_min.detach().item()),
+#             "pre_old_old_violation_fraction": float(pre_structural.historical_internal_violation_fraction.detach().item()),
+#             "final_old_old_violation_fraction": float(final_structural.historical_internal_violation_fraction.detach().item()),
+#             "final_whole_cds_learned_risk_mean": float(final_structural.learned_pair_risk_mean.detach().item()),
+#             "final_whole_cds_physical_risk_mean": float(final_structural.physical_pair_risk_mean.detach().item()),
+#             "historical_classifier_row_max_change": self._max_parameter_change(old_weight_before, final_old_weight),
+#             "incoming_classifier_initialization_max_change": self._max_parameter_change(new_weight_random_before, phase_start_new_weight),
+#             "incoming_classifier_training_max_change": self._max_parameter_change(phase_start_new_weight, final_new_weight),
+#             "phase_start_old_all_seen_ba": float(phase_start_old_all_seen["balanced_accuracy"]),
+#             "phase_start_new_all_seen_ba": float(phase_start_new_all_seen["balanced_accuracy"]),
+#             "final_old_only_ba": float(final_record["old_only_ba"]),
+#             "final_old_all_seen_ba": float(final_record["old_all_seen_ba"]),
+#             "final_new_only_ba": float(final_record["new_only_ba"]),
+#             "final_new_all_seen_ba": float(final_record["new_all_seen_ba"]),
+#             "joint_epochs": epoch_count,
+#             "classifier_logit_scale_frozen_incremental": True,
+#             "backbone_and_classifier_jointly_trainable": True,
+#             "second_classifier_stage": False,
+#         }
+
+#         return {
+#             "phase": phase_id,
+#             "old_class_ids": list(old_class_ids),
+#             "new_class_ids": list(new_class_ids),
+#             "seen_class_ids": list(seen_class_ids),
 #             "history": history,
 #             "final_epoch": epoch_count,
 #             "cumulative_test": cumulative,
@@ -2478,5 +4471,5 @@ __all__ = ["IncrementalPhaseTrainer"]
 #             "phase_finalized": True,
 #         }
 
-
 # __all__ = ["IncrementalPhaseTrainer"]
+
