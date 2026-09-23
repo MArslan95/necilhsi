@@ -39,6 +39,13 @@ class LogitDistillationObjective:
 
 
 @dataclass(frozen=True)
+class FeatureDistillationObjective:
+    loss: Tensor
+    cosine_similarity_mean: Tensor
+    rms_drift: Tensor
+
+
+@dataclass(frozen=True)
 class CDSPreservationObjective:
     loss: Tensor
     intra_loss: Tensor
@@ -57,6 +64,19 @@ class CDSSeparationObjective:
     loss: Tensor
     learned_positive_support_mean: Tensor
     learned_historical_rival_support_mean: Tensor
+    learned_support_margin_mean: Tensor
+    learned_support_margin_min: Tensor
+    physical_confusability_mean: Tensor
+    effective_pair_risk_mean: Tensor
+    violation_fraction: Tensor
+
+@dataclass(frozen=True)
+class WholeCDSPICObjective:
+    loss: Tensor
+    valid_anchor_fraction: Tensor
+    positive_similarity_mean: Tensor
+    current_negative_similarity_mean: Tensor
+    historical_negative_similarity_mean: Tensor
     learned_support_margin_mean: Tensor
     learned_support_margin_min: Tensor
     physical_confusability_mean: Tensor
@@ -244,6 +264,60 @@ def logit_distillation_loss(
     )
 
 
+
+def ordered_feature_distillation_loss(
+    *,
+    reference_features: Tensor,
+    current_features: Tensor,
+    sample_weights: Tensor | None = None,
+) -> FeatureDistillationObjective:
+    """FCS-style feature KD in the same ordered Q coordinate used by CDS.
+
+    The frozen previous representation is a training reference only.  Both Q^-
+    and Q^+ are mapped to the canonical cosine/CDS coordinate before the loss so
+    this term constrains semantic direction rather than arbitrary feature norm.
+    Token order is preserved; no second representation is created.
+    """
+    reference = normalize_ordered_decision_features(
+        torch.as_tensor(reference_features)
+    ).detach()
+    current = normalize_ordered_decision_features(torch.as_tensor(current_features))
+    if current.shape != reference.shape:
+        raise ValueError("current_features must match reference_features")
+    if current.device != reference.device or current.dtype != reference.dtype:
+        raise ValueError("reference/current Q must share device/dtype")
+    delta = current - reference
+
+    # IMPORTANT: do not use sqrt(mean(delta**2)) as the optimization loss.
+    # At the beginning of an incremental phase the current backbone is an exact
+    # copy of the frozen teacher, so delta == 0.  The forward value sqrt(0) is
+    # finite, but its derivative is undefined and PyTorch returns NaN gradients.
+    #
+    # Because both tensors are already globally L2-normalized per sample,
+    #   0.5 * ||q_t - q_{t-1}||_2^2 == 1 - cos(q_t, q_{t-1}).
+    # This squared chord/cosine distance has the same semantic objective, is
+    # exactly zero at phase start, and has an exactly zero (finite) gradient
+    # when student and teacher coincide.  Token order is still preserved because
+    # the distance is computed over the ordered KxD tensor without pooling into
+    # a second representation.
+    per_sample = 0.5 * delta.square().sum(dim=(1, 2))
+    loss = _weighted_mean(per_sample, sample_weights)
+    flat_ref = reference.reshape(reference.size(0), -1)
+    flat_cur = current.reshape(current.size(0), -1)
+    cosine = F.cosine_similarity(flat_cur, flat_ref, dim=1).mean()
+
+    # RMS is diagnostic only.  Detaching avoids retaining a second sqrt branch
+    # in the optimization graph and makes the phase-start zero-drift case safe.
+    with torch.no_grad():
+        rms = delta.detach().square().mean().sqrt()
+    if not all(bool(torch.isfinite(v)) for v in (loss, cosine, rms)):
+        raise RuntimeError("ordered feature distillation became NaN or Inf")
+    return FeatureDistillationObjective(
+        loss=loss,
+        cosine_similarity_mean=cosine,
+        rms_drift=rms,
+    )
+
 def historical_cds_preservation_loss(
     *,
     reference_features: Tensor,
@@ -254,9 +328,10 @@ def historical_cds_preservation_loss(
 ) -> CDSPreservationObjective:
     """Preserve relations to the entire historical CDS on real current HSI.
 
-    Teacher support is evaluated in the finalized Phase-(t-1) Q coordinate.
-    Student support is evaluated in the current Q coordinate using the task-wise
-    transported historical CDS.  The full old-class support vector is preserved,
+    Teacher and student supports are both evaluated against the immutable
+    finalized Phase-(t-1) historical CDS during incremental SGD.  Ordered feature
+    KD keeps Q_t compatible with that reference; semantic migration happens once
+    after convergence.  The full old-class support vector is preserved,
     and pairwise differences among all historical classes provide the inter-CDS
     term.  Native physical CDS weights the preservation and remains unchanged.
     """
@@ -344,6 +419,178 @@ def historical_cds_preservation_loss(
         teacher_relation_support_mean=teacher_relation.mean(),
         student_absolute_support_mean=student_absolute.mean(),
         student_relation_support_mean=student_relation.mean(),
+    )
+
+
+def whole_cds_pic_loss(
+    *,
+    current_features: Tensor,
+    labels_global: Tensor,
+    physical_spectral_evidence: Tensor,
+    seen_cds: ClassDiscriminativeStructureState,
+    historical_class_count: int,
+    logit_scale: Tensor,
+    sample_weights: Tensor | None = None,
+) -> WholeCDSPICObjective:
+    """Prototype-involved contrastive learning using the complete HSI Whole-CDS.
+
+    Incremental batches contain only current classes.  Ordinary supervised
+    contrastive learning therefore supplies only current/current attraction and
+    repulsion and can keep increasing plasticity while historical structure
+    deteriorates.  This objective follows the FCS separation principle but uses
+    the HSI Whole-CDS rather than a stored prototype:
+
+    * same current class: positive;
+    * different current class: negative;
+    * every historical ``I_Q``: historical negative anchor;
+    * ``V_Q`` and ``I_P/V_P`` enter through Whole-CDS pair risk and
+      sample-specific physical confusability, strengthening dangerous old/new
+      negatives without creating a second classifier.
+
+    The persistent memory remains exactly ``{I_Q,V_Q,I_P,V_P}``; no old feature
+    rows or synthetic samples are stored.
+    """
+    if not isinstance(seen_cds, ClassDiscriminativeStructureState):
+        raise TypeError("seen_cds must be ClassDiscriminativeStructureState")
+    q = normalize_ordered_decision_features(torch.as_tensor(current_features))
+    labels = torch.as_tensor(labels_global, device=q.device, dtype=torch.long).flatten()
+    physical = torch.as_tensor(
+        physical_spectral_evidence, device=q.device, dtype=q.dtype
+    ).detach()
+    if labels.shape != (q.size(0),):
+        raise ValueError("labels_global must be [N]")
+    if physical.ndim != 3 or physical.size(0) != q.size(0) or physical.size(2) != 1:
+        raise ValueError("physical_spectral_evidence must be [N,B,1]")
+    if not bool(torch.isfinite(physical).all()):
+        raise ValueError("physical_spectral_evidence contains NaN or Inf")
+
+    classes = seen_cds.classes
+    ids = classes.class_ids.to(device=q.device, dtype=torch.long).flatten()
+    count = int(ids.numel())
+    old_count = int(historical_class_count)
+    if count < 2 or old_count <= 0 or old_count >= count:
+        raise ValueError("historical_class_count must split old and current classes")
+    if classes.learned_identity.shape[1:] != q.shape[1:]:
+        raise ValueError("current Q and learned CDS use different coordinates")
+    if classes.physical_identity.shape[1:] != physical.shape[1:]:
+        raise ValueError("physical evidence and physical CDS use different coordinates")
+
+    matches = labels.unsqueeze(1).eq(ids.unsqueeze(0))
+    if not bool(matches.sum(dim=1).eq(1).all()):
+        raise ValueError("a current label is absent from seen CDS")
+    target_index = matches.to(torch.long).argmax(dim=1)
+    if bool((target_index < old_count).any()):
+        raise ValueError("Whole-CDS PIC expects current-class labels only")
+
+    scale = torch.as_tensor(logit_scale, device=q.device, dtype=q.dtype).detach()
+    if scale.ndim != 0 or not bool(torch.isfinite(scale)) or not bool(scale > 0):
+        raise ValueError("logit_scale must be a finite positive scalar")
+    eps = torch.finfo(q.dtype).eps
+
+    flat = F.normalize(q.reshape(q.size(0), -1), p=2, dim=1, eps=eps)
+    current_similarity = (flat @ flat.t()).clamp(-1.0, 1.0) * scale
+    n = int(q.size(0))
+    eye = torch.eye(n, device=q.device, dtype=torch.bool)
+    same = labels[:, None].eq(labels[None, :])
+    positive_mask = same & ~eye
+    current_negative_mask = (~same) & ~eye
+    candidate_mask = ~eye
+
+    historical_identity = classes.learned_identity[:old_count].to(
+        device=q.device, dtype=q.dtype
+    ).detach()
+    historical_anchor = F.normalize(
+        historical_identity.reshape(old_count, -1), p=2, dim=1, eps=eps
+    )
+    historical_similarity = (flat @ historical_anchor.t()).clamp(-1.0, 1.0) * scale
+
+    # Whole-CDS pair risk contains learned identity+relation and physical
+    # identity+relation structure.  Sample-specific physical support further
+    # emphasizes spectral confusions actually present in the current sample.
+    with torch.no_grad():
+        _, _, physical_support = ordered_cds_support_components(
+            physical,
+            classes.physical_identity.to(device=q.device, dtype=q.dtype).detach(),
+            classes.physical_variation.to(device=q.device, dtype=q.dtype).detach(),
+        )
+        effective_risk, _learned_risk, _physical_risk = whole_cds_pair_risk(seen_cds)
+        effective_risk = effective_risk.to(device=q.device, dtype=q.dtype)
+        rows = torch.arange(n, device=q.device)
+        positive_physical = physical_support[rows, target_index]
+        rival_physical = physical_support[:, :old_count]
+        spectral_confusability = torch.sqrt(
+            positive_physical.unsqueeze(1).clamp_min(0.0)
+            * rival_physical.clamp_min(0.0)
+        ).clamp(0.0, 1.0)
+        pair_risk = effective_risk.index_select(0, target_index)[:, :old_count]
+        historical_weight = 1.0 + pair_risk * spectral_confusability
+
+    current_logits = current_similarity.masked_fill(~candidate_mask, -torch.inf)
+    historical_logits = historical_similarity + historical_weight.clamp_min(eps).log()
+    log_denom = torch.logsumexp(torch.cat((current_logits, historical_logits), dim=1), dim=1)
+    positive_count = positive_mask.sum(dim=1)
+    valid_anchor = positive_count > 0
+    if bool(valid_anchor.any()):
+        log_probability = current_similarity - log_denom.unsqueeze(1)
+        per_anchor = -(
+            log_probability * positive_mask.to(dtype=q.dtype)
+        ).sum(dim=1) / positive_count.clamp_min(1).to(dtype=q.dtype)
+        if sample_weights is None:
+            loss = per_anchor[valid_anchor].mean()
+        else:
+            weights = torch.as_tensor(sample_weights)
+            if weights.shape != (n,) or weights.device != q.device or weights.dtype != q.dtype:
+                raise ValueError("sample_weights must be [N] and match Q device/dtype")
+            loss = _weighted_mean(per_anchor[valid_anchor], weights[valid_anchor])
+    else:
+        loss = q.sum() * 0.0
+
+    # Structural diagnostics retain the same interpretable old/new CDS margin
+    # used by the previous separation loss.
+    _, _, learned_support = ordered_cds_support_components(
+        q,
+        classes.learned_identity.to(device=q.device, dtype=q.dtype).detach(),
+        classes.learned_variation.to(device=q.device, dtype=q.dtype).detach(),
+    )
+    rows = torch.arange(n, device=q.device)
+    positive_learned = learned_support[rows, target_index]
+    rival_learned = learned_support[:, :old_count]
+    support_margin = positive_learned.unsqueeze(1) - rival_learned
+
+    zero = q.new_zeros(())
+    positive_values = current_similarity[positive_mask]
+    current_negative_values = current_similarity[current_negative_mask]
+    positive_mean = positive_values.mean() if positive_values.numel() else zero
+    current_negative_mean = (
+        current_negative_values.mean() if current_negative_values.numel() else zero
+    )
+    historical_negative_mean = historical_similarity.mean()
+    valid_fraction = valid_anchor.to(dtype=q.dtype).mean()
+    values = (
+        loss,
+        valid_fraction,
+        positive_mean,
+        current_negative_mean,
+        historical_negative_mean,
+        support_margin.mean(),
+        support_margin.min(),
+        spectral_confusability.mean(),
+        pair_risk.mean(),
+        support_margin.le(0.0).to(q.dtype).mean(),
+    )
+    if not all(bool(torch.isfinite(v)) for v in values):
+        raise RuntimeError("Whole-CDS PIC objective became NaN or Inf")
+    return WholeCDSPICObjective(
+        loss=loss,
+        valid_anchor_fraction=valid_fraction,
+        positive_similarity_mean=positive_mean,
+        current_negative_similarity_mean=current_negative_mean,
+        historical_negative_similarity_mean=historical_negative_mean,
+        learned_support_margin_mean=support_margin.mean(),
+        learned_support_margin_min=support_margin.min(),
+        physical_confusability_mean=spectral_confusability.mean(),
+        effective_pair_risk_mean=pair_risk.mean(),
+        violation_fraction=support_margin.le(0.0).to(q.dtype).mean(),
     )
 
 
@@ -465,16 +712,18 @@ __all__ = [
     "ClassificationObjective",
     "SupervisedContrastiveObjective",
     "LogitDistillationObjective",
+    "FeatureDistillationObjective",
     "CDSPreservationObjective",
     "CDSSeparationObjective",
+    "WholeCDSPICObjective",
     "classification_objective",
     "supervised_contrastive_q_loss",
     "logit_distillation_loss",
+    "ordered_feature_distillation_loss",
     "historical_cds_preservation_loss",
+    "whole_cds_pic_loss",
     "cross_phase_cds_separation_loss",
 ]
-
-
 
 
 

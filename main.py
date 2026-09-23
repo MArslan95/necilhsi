@@ -288,8 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
     method.add_argument("--kd_temperature", type=float, default=2.0)
     method.add_argument("--cds_weight", type=float, default=1.0)
     method.add_argument(
+        "--feature_kd_weight", type=float, default=10.0,
+        help="FCS-style ordered feature-distillation weight for incremental stability",
+    )
+    method.add_argument(
+        "--historical_support_weight", type=float, default=1.0,
+        help="positive fixed historical-CDS classifier support weight",
+    )
+    method.add_argument(
         "--admission_max_iter", type=int, default=80,
-        help="numerical solver budget for Whole-CDS-balanced incoming-row reconstruction",
+        help="DEPRECATED compatibility argument; no phase-start admission solver is run",
     )
 
     reporting = parser.add_argument_group("Reporting")
@@ -342,6 +350,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "contrastive_weight",
         "kd_logit_weight",
         "cds_weight",
+        "feature_kd_weight",
+        "historical_support_weight",
     ):
         _finite_float(getattr(args, name), name=name, minimum=0.0)
     _finite_float(args.kd_temperature, name="kd_temperature", minimum=0.0, strict_minimum=True)
@@ -437,12 +447,12 @@ def _build_data(args: argparse.Namespace) -> tuple[IncrementalHSIDatasetManager,
         "representation": "one ordered learned Q[K,D] plus direct robustly normalized physical spectrum P[B,1]",
         "persistent_cds": "{I_Q,V_Q,I_P,V_P}; inter-class learned/physical relations are derived on demand",
         "incremental_semantic_shift": (
-            "during one joint incremental stage, paired Q-/Q+ is refreshed at epoch boundaries; a task-wise affine baseline plus whole-CDS-conditioned current-class residuals correct every historical I_Q/V_Q while I_P/V_P stay fixed"
+            "historical CDS is immutable during incremental SGD; after convergence one reliability-shrunk observable global Q_(t-1)->Q_t map migrates historical I_Q/V_Q exactly once while I_P/V_P stay fixed; no class-specific old drift is extrapolated"
         ),
         "classifier": "one bias-free all-seen cosine head; Whole-CDS reconstructs/protects its rows during training while inference remains cosine(Q,W)",
         "base_objective": "class-balanced real-base CE + supervised contrast on Q + class-balanced Whole-CDS classifier reconstruction",
         "incremental_objective": (
-            "Whole-CDS incoming-row reconstruction from complete old+new {I_Q,V_Q,I_P,V_P} plus real current TRAIN Q precedes SGD; robust clearance remains diagnostic rather than a hard feasibility gate; then one joint stage uses real-current all-seen CE + supervised contrast + old-logit KD + historical intra/inter Whole-CDS preservation + direct current-Q versus migrated-historical-CDS separation + class-balanced Whole-CDS classifier reconstruction + previous old/old retention"
+            "no phase-start repair or CDS row seeding; one joint stage uses real-current all-seen CE with all seen rows live + fixed historical positive support through the same classifier + ordered feature KD + old-logit KD + fixed-reference intra/inter Whole-CDS preservation + Whole-CDS PIC + symmetric class-balanced Whole-CDS classifier protection; historical CDS is migrated only once after convergence"
         ),
         "preprocessing_fit_scope": str(preprocessing_state["fit_scope"]),
         "preprocessing_fit_pixel_count": int(preprocessing_state["fit_pixel_count"]),
@@ -695,10 +705,11 @@ def _report_incremental_phase(
         f"CDSCls={method['final_whole_cds_classifier_loss']:.4f}"
         f"[Old={method['final_old_cds_classifier_loss']:.4f},"
         f"New={method['final_new_cds_classifier_loss']:.4f}] "
-        f"Con={method['final_contrastive_loss']:.4f} "
-        f"KD={method['final_kd_logit_loss']:.4f} "
+        f"PIC={method['final_pic_loss']:.4f} "
+        f"FKD={method['final_feature_kd_loss']:.4f} "
+        f"OldSupport={method['final_historical_support_loss']:.4f} "
+        f"LogitKD={method['final_kd_logit_loss']:.4f} "
         f"CDSPreserve={method['final_cds_preservation_loss']:.4f} "
-        f"CDSSep={method['final_cds_separation_loss']:.4f} "
         f"SepMargin={method['final_cds_separation_margin']:.4f} "
         f"SepViol={100*method['final_cds_separation_violation_fraction']:.2f}% "
         f"[Intra={method['final_cds_intra_loss']:.4f},"
@@ -715,6 +726,12 @@ def _report_incremental_phase(
         f"{method['final_old_old_clearance_min']:.4f} "
         f"Retention={method['final_old_old_retention_mean']:.4f}/"
         f"{method['final_old_old_retention_min']:.4f}"
+    )
+    print(
+        "Whole-CDS PIC | "
+        f"ValidAnchors={100*method['final_pic_valid_anchor_fraction']:.1f}% "
+        f"PhysicalConf={method['final_pic_physical_confusability_mean']:.4f} "
+        f"PairRisk={method['final_pic_effective_pair_risk_mean']:.4f}"
     )
     print(
         "Whole-CDS pair risk | "
@@ -904,7 +921,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

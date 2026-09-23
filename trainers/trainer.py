@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-"""Top-level orchestration and checkpointing for HSI CDS NECIL."""
-
 import copy
 import hashlib
 import os
@@ -38,11 +35,6 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
         self.assert_model_contract()
 
     def _freeze_finalized_phase_snapshot(self, phase: int) -> None:
-        """Freeze the finalized previous backbone and classifier for the next phase.
-
-        The snapshot is temporary process state, not persistent exemplar memory.
-        Checkpoints continue to store only the model and persistent CDS state.
-        """
         phase_id = int(phase)
         latest = self._assert_finalized_state()
         if latest != phase_id:
@@ -132,6 +124,27 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
             "labels_sha256": self._array_fingerprint(labels),
             "coordinates_sha256": self._array_fingerprint(coords),
             "split_membership_sha256": self._split_fingerprint(),
+        }
+
+    @torch.no_grad()
+    def _finalized_evaluation_fingerprint(self, phase: int) -> Dict[str, Any]:
+        phase_id = int(phase)
+        class_ids = self._seen_through_phase(phase_id)
+        loader = self.dataset.get_reporting_dataloader(
+            phase_id, batch_size=int(getattr(self.args, "eval_batch_size", 256))
+        )
+        metrics = self.evaluate_loader(
+            loader, class_ids=class_ids, target_class_ids=class_ids
+        )
+        return {
+            "phase": phase_id,
+            "class_ids": [int(v) for v in class_ids],
+            "confusion_matrix": [
+                [int(v) for v in row] for row in metrics["confusion_matrix"]
+            ],
+            "overall_accuracy": float(metrics["overall_accuracy"]),
+            "balanced_accuracy": float(metrics["balanced_accuracy"]),
+            "minimum_class_accuracy": float(metrics["minimum_class_accuracy"]),
         }
 
     def _finalized_phases(self) -> list[int]:
@@ -237,6 +250,7 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
             "dataset_identity": self._dataset_identity(),
             "finalized_phases": list(range(latest + 1)),
             "trainer_history": self.history,
+            "evaluation_fingerprint": self._finalized_evaluation_fingerprint(latest),
         }
         try:
             torch.save(payload, temporary)
@@ -288,19 +302,50 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
         latest = self._assert_finalized_state()
         if latest != finalized[-1]:
             raise RuntimeError("restored model/protocol phase mismatch")
+
+        # Behavioral resume gate: protocol hashes alone cannot detect a model/eval
+        # mismatch. New checkpoints therefore require exact confusion reproduction.
+        actual_fingerprint = self._finalized_evaluation_fingerprint(latest)
+        stored_fingerprint = payload.get("evaluation_fingerprint")
+        evaluation_verified = False
+        if stored_fingerprint is not None:
+            if not isinstance(stored_fingerprint, Mapping):
+                raise RuntimeError("checkpoint evaluation_fingerprint must be a mapping")
+            expected_ids = [int(v) for v in stored_fingerprint.get("class_ids", ())]
+            expected_confusion = stored_fingerprint.get("confusion_matrix")
+            if expected_ids != actual_fingerprint["class_ids"]:
+                raise RuntimeError("checkpoint evaluation class IDs do not reproduce")
+            if expected_confusion != actual_fingerprint["confusion_matrix"]:
+                raise RuntimeError(
+                    "checkpoint model does not reproduce its finalized confusion matrix before incremental setup"
+                )
+            evaluation_verified = True
+            print(
+                f"[Checkpoint verified] phase={latest} "
+                f"OA={100*actual_fingerprint['overall_accuracy']:.2f}% "
+                f"BA={100*actual_fingerprint['balanced_accuracy']:.2f}% "
+                f"Min={100*actual_fingerprint['minimum_class_accuracy']:.2f}%"
+            )
+        else:
+            print(
+                f"[Legacy checkpoint loaded] phase={latest} "
+                f"OA={100*actual_fingerprint['overall_accuracy']:.2f}% "
+                f"BA={100*actual_fingerprint['balanced_accuracy']:.2f}% "
+                f"Min={100*actual_fingerprint['minimum_class_accuracy']:.2f}% "
+            )
+
         self._freeze_finalized_phase_snapshot(latest)
         return {
             "checkpoint": str(source),
             "finalized_phases": list(finalized),
             "committed_class_ids": list(self.model.committed_class_ids),
             "next_phase": latest + 1 if latest + 1 in self.phase_schedule else None,
+            "evaluation_verified": evaluation_verified,
+            "resume_evaluation": actual_fingerprint,
         }
 
 
 __all__ = ["Trainer"]
-
-
-
 
 
 

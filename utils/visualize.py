@@ -1,4 +1,11 @@
 from __future__ import annotations
+
+"""Reporting-only qualitative visualization for finalized NECIL-HSI phases.
+
+Only separate per-phase figures are saved. Visualization never participates in
+optimization, model selection, CDS construction, or checkpoint state.
+"""
+
 import math
 import os
 from numbers import Integral, Real
@@ -230,9 +237,6 @@ def save_full_phase_qualitative_maps(
 
 
 __all__ = ["save_full_phase_qualitative_maps"]
-
-
-
 
 
 

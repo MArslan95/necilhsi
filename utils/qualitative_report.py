@@ -184,8 +184,6 @@ __all__ = ["generate_phase_qualitative_maps", "generate_base_qualitative_maps"]
 
 
 
-
-
 # from __future__ import annotations
 
 # """Reporting-only qualitative maps for finalized full-CDS NECIL-HSI phases."""
