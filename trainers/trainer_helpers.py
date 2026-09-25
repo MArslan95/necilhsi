@@ -203,14 +203,14 @@ class TrainerHelper:
         return {
             "representation": "one ordered learned Q[K,D]",
             "physical_spectral_evidence": "direct robustly normalized native spectrum P[B,1]",
-            "persistent_cds": "{I_Q,V_Q,I_P,V_P}",
-            "prediction_head": "one bias-free all-seen cosine head reconstructed/protected by Whole-CDS training; inference is cosine(Q,W)",
-            "base_training": "real base TRAIN samples optimize all-seen-base CE + supervised contrast on Q + class-balanced Whole-CDS classifier reconstruction",
-            "incremental_reference": "frozen previous backbone/classifier are temporary phase references only; the learned current backbone remains plastic",
-            "incremental_feature_stability": "old-logit KD plus historical intra/inter Whole-CDS preservation; no raw-Q consistency term",
-            "incremental_cds": "one joint stage migrates historical I_Q/V_Q, preserves historical intra/inter structure, and directly separates real current Q from migrated historical CDS using phase-stable I_P/V_P relevance",
-            "classifier_recovery": "before SGD, incoming rows are reconstructed from complete old+new Whole-CDS plus real current TRAIN Q while historical/future rows stay bitwise fixed; robust clearance is diagnostic rather than a hard separability constraint; during training the same all-seen cosine head receives old CDS positive support, new CDS positive support, I_P/V_P pair relevance, and old-old clearance retention",
-            "phase_commit": "commit corrected old I_Q/V_Q plus real current CDS; keep old I_P/V_P fixed; persistent method state is only {I_Q,V_Q,I_P,V_P}; no replay or second classifier stage",
+            "persistent_cds": "{I_Q,V_Q,I_P,V_P}; learned/physical inter-class relations are derived on demand",
+            "prediction_head": "one bias-free all-seen cosine head; inference is cosine(Q,W)",
+            "base_training": "real base CE + risk-aware Whole-CDS contrastive separation using intra, inter and spectral structure",
+            "incremental_reference": "frozen previous backbone/classifier are temporary teacher references; the current backbone remains plastic",
+            "incremental_feature_stability": "ordered feature KD + old-logit KD on transient complete-CDS historical support",
+            "incremental_cds": "transient old HSI reconstructed from complete CDS; all-seen risk-aware CDS separation and complete old-CDS preservation stay active through every incremental epoch",
+            "classifier_recovery": "none: class-balanced old-synthetic + new-real CE trains the one deployed all-seen head directly",
+            "phase_commit": "retain historical CDS as the semantic anchor, append real-current CDS, discard transient support; no coordinate transport and no second classifier stage",
         }
 
     def unpack_batch(
@@ -403,6 +403,11 @@ class TrainerHelper:
 
 
 __all__ = ["TrainerHelper"]
+
+
+
+
+
 
 
 

@@ -222,9 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Non-exemplar HSI class-incremental learning with one ordered Q[K,D], "
-            "direct physical spectral evidence P[B,1], one persistent CDS bank, "
-            "whole-CDS historical relation preservation, class-aware semantic-drift correction, "
-            "and one joint backbone/classifier incremental optimization stage."
+            "direct physical spectral evidence P[B,1], one persistent Whole-CDS bank, "
+            "risk-aware intra/inter/spectral separation, immutable historical classifier anchors, "
+            "and one joint backbone/incoming-classifier incremental optimization stage."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -286,18 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
     method.add_argument("--contrastive_weight", type=float, default=1.0)
     method.add_argument("--kd_logit_weight", type=float, default=1.0)
     method.add_argument("--kd_temperature", type=float, default=2.0)
-    method.add_argument("--cds_weight", type=float, default=1.0)
+    method.add_argument(
+        "--cds_weight", type=float, default=1.0,
+        help="joint weight for Whole-CDS preservation and classifier-region protection",
+    )
     method.add_argument(
         "--feature_kd_weight", type=float, default=10.0,
-        help="FCS-style ordered feature-distillation weight for incremental stability",
-    )
-    method.add_argument(
-        "--historical_support_weight", type=float, default=1.0,
-        help="positive fixed historical-CDS classifier support weight",
-    )
-    method.add_argument(
-        "--admission_max_iter", type=int, default=80,
-        help="DEPRECATED compatibility argument; no phase-start admission solver is run",
+        help="ordered-Q stability weight on real current HSI",
     )
 
     reporting = parser.add_argument_group("Reporting")
@@ -312,7 +307,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "base_classes", "increment", "patch_size", "d_model", "spectral_token_count",
         "d_state", "d_conv", "expand", "num_spectral_layers", "num_spatial_layers",
         "stem_norm_groups", "epochs_base", "epochs_inc", "batch_size", "eval_batch_size",
-        "spatial_block_size", "visualization_dpi", "admission_max_iter",
+        "spatial_block_size", "visualization_dpi",
     )
     for name in positive_integer_fields:
         _exact_int(getattr(args, name), name=name, minimum=1)
@@ -351,9 +346,9 @@ def validate_args(args: argparse.Namespace) -> None:
         "kd_logit_weight",
         "cds_weight",
         "feature_kd_weight",
-        "historical_support_weight",
     ):
         _finite_float(getattr(args, name), name=name, minimum=0.0)
+
     _finite_float(args.kd_temperature, name="kd_temperature", minimum=0.0, strict_minimum=True)
     if str(args.run_mode) == "incremental" and not str(args.resume_checkpoint).strip():
         raise ValueError("--resume_checkpoint is required for --run_mode incremental")
@@ -425,6 +420,7 @@ def _build_data(args: argparse.Namespace) -> tuple[IncrementalHSIDatasetManager,
         require_phase_context_isolation=args.require_phase_context_isolation,
         context_policy="full_scene_reflect",
     )
+    manager.preprocessing_state = preprocessing_state
     split_counts = {
         int(class_id): {
             split: int(np.asarray(protocol["split_by_class"][class_id][split]).size)
@@ -447,12 +443,12 @@ def _build_data(args: argparse.Namespace) -> tuple[IncrementalHSIDatasetManager,
         "representation": "one ordered learned Q[K,D] plus direct robustly normalized physical spectrum P[B,1]",
         "persistent_cds": "{I_Q,V_Q,I_P,V_P}; inter-class learned/physical relations are derived on demand",
         "incremental_semantic_shift": (
-            "historical CDS is immutable during incremental SGD; after convergence one reliability-shrunk observable global Q_(t-1)->Q_t map migrates historical I_Q/V_Q exactly once while I_P/V_P stay fixed; no class-specific old drift is extrapolated"
+            "historical Whole-CDS remains the persistent reference; a detached current-coordinate working CDS is derived from observable current-class Q drift while physical I_P/V_P remain fixed"
         ),
-        "classifier": "one bias-free all-seen cosine head; Whole-CDS reconstructs/protects its rows during training while inference remains cosine(Q,W)",
-        "base_objective": "class-balanced real-base CE + supervised contrast on Q + class-balanced Whole-CDS classifier reconstruction",
+        "classifier": "one bias-free all-seen cosine head; finalized historical rows are immutable and only incoming rows are trained in incremental phases; inference remains cosine(Q,W)",
+        "base_objective": "class-balanced real-base CE + Whole-CDS robust classifier protection + supervised contrastive separation",
         "incremental_objective": (
-            "no phase-start repair or CDS row seeding; one joint stage uses real-current all-seen CE with all seen rows live + fixed historical positive support through the same classifier + ordered feature KD + old-logit KD + fixed-reference intra/inter Whole-CDS preservation + Whole-CDS PIC + symmetric class-balanced Whole-CDS classifier protection; historical CDS is migrated only once after convergence"
+            "real-new CE on incoming classes only + risk-aware Whole-CDS contrastive separation + historical Whole-CDS intra/inter preservation + ordered feature KD + old-logit KD + Whole-CDS decision-region protection of incoming rows against fixed historical classifier anchors"
         ),
         "preprocessing_fit_scope": str(preprocessing_state["fit_scope"]),
         "preprocessing_fit_pixel_count": int(preprocessing_state["fit_pixel_count"]),
@@ -681,40 +677,19 @@ def _report_incremental_phase(
         f"F={100*report['forgetting']:.2f}%"
     )
     print(
-        "Phase transport | "
-        f"Err={method['phase_mapping_error']:.4f} | "
-        f"Drift={method['representation_drift_rms']:.4f} | "
-        f"ScaleShift={method['phase_scale_deviation_rms']:.4f} | "
-        f"Translation={method['phase_translation_rms']:.4f}"
-    )
-    print(
-        "Class-aware drift | "
-        f"Support={method['drift_support_mass_mean']:.3f}/"
-        f"{method['drift_support_mass_min']:.3f}/"
-        f"{method['drift_support_mass_max']:.3f} | "
-        f"Icorr={method['drift_identity_correction_relative_mean']:.4f}/"
-        f"{method['drift_identity_correction_relative_max']:.4f} | "
-        f"Vcorr={method['drift_variation_correction_relative_mean']:.4f}/"
-        f"{method['drift_variation_correction_relative_max']:.4f} | "
-        f"Vneg={100*method['drift_variation_negative_fraction_before_sanitize']:.2f}%"
-    )
-    print(
-        "Joint training | "
+        "Whole-CDS joint training | "
         f"Epochs={int(method['joint_epochs'])} "
-        f"CEnew-all={method['final_joint_classification_loss']:.4f} "
+        f"CEnew={method['final_joint_classification_loss']:.4f} "
         f"CDSCls={method['final_whole_cds_classifier_loss']:.4f}"
-        f"[Old={method['final_old_cds_classifier_loss']:.4f},"
-        f"New={method['final_new_cds_classifier_loss']:.4f}] "
-        f"PIC={method['final_pic_loss']:.4f} "
-        f"FKD={method['final_feature_kd_loss']:.4f} "
-        f"OldSupport={method['final_historical_support_loss']:.4f} "
-        f"LogitKD={method['final_kd_logit_loss']:.4f} "
-        f"CDSPreserve={method['final_cds_preservation_loss']:.4f} "
+        f"[OldSrc={method['final_old_cds_classifier_loss']:.4f},"
+        f"NewSrc={method['final_new_cds_classifier_loss']:.4f}] "
+        f"Sep={method['final_cds_separation_loss']:.4f} "
         f"SepMargin={method['final_cds_separation_margin']:.4f} "
         f"SepViol={100*method['final_cds_separation_violation_fraction']:.2f}% "
-        f"[Intra={method['final_cds_intra_loss']:.4f},"
-        f"Inter={method['final_cds_inter_loss']:.4f}] "
-        f"Ret={method['final_old_old_retention_loss']:.4f}"
+        f"Pres={method['final_cds_preservation_loss']:.4f} "
+        f"[Intra={method['final_cds_intra_loss']:.4f},Inter={method['final_cds_inter_loss']:.4f}] "
+        f"FKD={method['final_feature_kd_loss']:.4f} "
+        f"LogitKD={method['final_kd_logit_loss']:.4f}"
     )
     print(
         "Historical protection | "
@@ -728,27 +703,16 @@ def _report_incremental_phase(
         f"{method['final_old_old_retention_min']:.4f}"
     )
     print(
-        "Whole-CDS PIC | "
-        f"ValidAnchors={100*method['final_pic_valid_anchor_fraction']:.1f}% "
-        f"PhysicalConf={method['final_pic_physical_confusability_mean']:.4f} "
-        f"PairRisk={method['final_pic_effective_pair_risk_mean']:.4f}"
-    )
-    print(
-        "Whole-CDS pair risk | "
+        "Whole-CDS risk | "
         f"Learned={method['final_whole_cds_learned_risk_mean']:.4f} "
-        f"Physical={method['final_whole_cds_physical_risk_mean']:.4f}"
+        f"Physical={method['final_whole_cds_physical_risk_mean']:.4f} "
+        f"PhysicalConf={method['final_pic_physical_confusability_mean']:.4f} "
+        f"EffectivePair={method['final_pic_effective_pair_risk_mean']:.4f}"
     )
     print(
-        "Spectral CDS | "
-        f"PAbs={method['final_physical_absolute_support_mean']:.4f} "
-        f"PRel={method['final_physical_relation_support_mean']:.4f} "
-        f"PJoint={method['final_physical_relevance_mean']:.4f}"
-    )
-    print(
-        "Classifier rows | "
-        f"OldChange={method['historical_classifier_row_max_change']:.3e} "
-        f"NewInitChange={method['incoming_classifier_initialization_max_change']:.3e} "
-        f"NewTrainChange={method['incoming_classifier_training_max_change']:.3e}"
+        "Classifier ownership | "
+        f"OldRowChange={method['historical_classifier_row_max_change']:.3e} "
+        f"NewRowChange={method['incoming_classifier_training_max_change']:.3e}"
     )
     print(
         "Competition | "
@@ -825,7 +789,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         "seen_class_ids": list(model.committed_class_ids),
         "latest_test": _metric_summary(latest_metrics),
         "method": (
-            "One-stage joint NECIL-HSI: real-new all-seen learning jointly updates Mamba and the same cosine head while epoch-refreshed whole-CDS semantic correction preserves historical structure"
+            "NECIL-HSI with one learned Q and one cosine head: Whole-CDS preserves/separates structure, historical classifier rows remain immutable, and incoming rows are positioned against fixed old decision anchors in the same deployed cosine geometry"
         ),
         "protocol": {
             "exemplar_memory_size": 0,

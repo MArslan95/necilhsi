@@ -1,19 +1,24 @@
 from __future__ import annotations
 
-"""One-stage incremental training for the finalized NECIL-HSI architecture.
+"""One-stage incremental training for the coherent Whole-CDS NECIL-HSI architecture.
 
 Problem-to-mechanism contract
 -----------------------------
-* semantic shift: historical CDS is fixed during SGD and migrated ONCE after convergence;
-* feature stability: ordered feature KD + old-logit KD + fixed-reference CDS preservation;
-* feature plasticity: real-current all-seen CE;
-* historical positive support: fixed historical I_Q supervises the SAME classifier;
-* cross-phase separation: Whole-CDS PIC replaces current-only incremental SupCon;
-* decision recovery: symmetric all-seen Whole-CDS region protection.
+* semantic shift: immutable historical CDS is the reference; the existing phase
+  alignment builds a detached Whole-CDS-conditioned working historical CDS in
+  the current Q coordinate;
+* feature stability: ordered feature KD + old-logit KD + fixed-reference
+  Whole-CDS preservation;
+* feature plasticity: real-current CE on incoming classes only;
+* cross-phase separation: one risk-aware Whole-CDS contrastive objective uses
+  I_Q/V_Q and I_P/V_P directly;
+* classifier bias: finalized historical classifier rows remain fixed while the
+  existing Whole-CDS decision-region regulator positions incoming rows against
+  those anchors using the SAME cosine decision function used at inference.
 
-Persistent method memory is only {I_Q,V_Q,I_P,V_P}.  No old images/features,
-Gaussian/covariance memory, second representation, classifier-repair stage, or
-CDS->classifier-row initialization is introduced.
+Persistent method memory is only {I_Q,V_Q,I_P,V_P}. No old images, pseudo HSI,
+model inversion, pseudo-feature replay, second representation, or second
+classifier is introduced.
 """
 import math
 import sys
@@ -25,7 +30,7 @@ from tqdm import tqdm
 
 from losses.loss import (
     classification_objective,
-    whole_cds_pic_loss,
+    whole_cds_contrastive_loss,
     historical_cds_preservation_loss,
     logit_distillation_loss,
     ordered_feature_distillation_loss,
@@ -101,6 +106,7 @@ class IncrementalPhaseTrainer:
             "phase_finalized",
         }
     )
+
 
     def _require_classifier(self) -> CosineClassificationHead:
         classifier = getattr(self.model, "classifier", None)
@@ -264,12 +270,15 @@ class IncrementalPhaseTrainer:
         kd_temperature = _finite_positive(
             "kd_temperature", self.cfg("kd_temperature", 2.0)
         )
-        cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
+        # One CDS weight owns both structural preservation and classifier-region
+        # protection.  This removes the previous parser/trainer inconsistency where
+        # a deprecated ``cds_classifier_weight=0`` could silently disable the very
+        # classifier protection the architecture relied on.
+        cds_weight = _finite_nonnegative(
+            "cds_weight", self.cfg("cds_weight", 1.0)
+        )
         feature_kd_weight = _finite_nonnegative(
             "feature_kd_weight", self.cfg("feature_kd_weight", 10.0)
-        )
-        historical_support_weight = _finite_nonnegative(
-            "historical_support_weight", self.cfg("historical_support_weight", 1.0)
         )
         
         self.model.validate_finalized_state()
@@ -347,13 +356,6 @@ class IncrementalPhaseTrainer:
             class_ids=new_class_ids,
             physical_structure=current_physical_structure,
         )
-        phase_start_seen_structure = merge_class_structure_batches(
-            (historical_structure, current_reference_structure)
-        )
-        phase_start_seen_cds = self.model.structure_bank.build_cds(
-            phase_start_seen_structure
-        )
-
         # Snapshot classifier ownership before Phase-t optimization.  Incoming
         # rows retain their native classifier initialization from model creation;
         # Whole-CDS is supervision, never an initializer or a pre-SGD repair.
@@ -425,13 +427,15 @@ class IncrementalPhaseTrainer:
 
         @torch.no_grad()
         def refresh_current_structure():
-            """Refresh only the current-class CDS; historical CDS stays fixed.
+            """Build one coherent all-seen CDS in the CURRENT Q coordinate.
 
-            The previous implementation re-estimated a migrated historical CDS after
-            every epoch.  That made the historical target move together with the
-            student and the IP run ended with OldOldViol=60%.  During optimization
-            the finalized Phase-(t-1) CDS is now immutable.  Only current-class
-            structure is refreshed as new-class features legitimately evolve.
+            The finalized Phase-(t-1) ``historical_structure`` remains immutable
+            and is the preservation reference.  ``correct_historical_structure``
+            uses only paired real current-class Q^-/Q^+ observations plus the
+            already-stored Whole-CDS relevance to construct a detached working
+            historical CDS in Q_t.  Current-class CDS is estimated from real
+            current TRAIN data.  The two are then merged in one coordinate for
+            separation and classifier supervision.
             """
             self.model.eval()
             rows = self.collect_ordered_features(train_eval_loader)
@@ -439,6 +443,7 @@ class IncrementalPhaseTrainer:
                 raise RuntimeError("current TRAIN label order changed during CDS refresh")
             if not torch.equal(rows["raw_center_spectra"], reference_spectra):
                 raise RuntimeError("current TRAIN spectra changed during CDS refresh")
+
             current_features_full = rows["ordered_features"].detach()
             current_structure = self.model.estimate_class_structure(
                 current_features_full,
@@ -447,24 +452,42 @@ class IncrementalPhaseTrainer:
                 class_ids=new_class_ids,
                 physical_structure=current_physical_structure,
             )
-            merged = merge_class_structure_batches((historical_structure, current_structure))
-            merged_ids = tuple(int(v) for v in merged.class_ids.detach().cpu().tolist())
+
+            working_historical_structure, _transform, alignment = (
+                correct_historical_structure(
+                    historical_structure=historical_structure,
+                    current_reference_structure=current_reference_structure,
+                    current_structure=current_structure,
+                    reference_features=reference_features_full,
+                    current_features=current_features_full,
+                )
+            )
+            if not torch.equal(
+                working_historical_structure.physical_identity,
+                historical_structure.physical_identity,
+            ) or not torch.equal(
+                working_historical_structure.physical_variation,
+                historical_structure.physical_variation,
+            ):
+                raise RuntimeError("working historical CDS changed physical I_P/V_P")
+
+            merged = merge_class_structure_batches(
+                (working_historical_structure, current_structure)
+            )
+            merged_ids = tuple(
+                int(v) for v in merged.class_ids.detach().cpu().tolist()
+            )
             if merged_ids != seen_class_ids:
-                raise RuntimeError("current CDS refresh produced incorrect seen-class order")
+                raise RuntimeError("working CDS produced incorrect seen-class order")
             seen_cds = self.model.structure_bank.build_cds(merged)
-            # Bitwise invariant: the historical source used by all active losses is
-            # never overwritten or transported inside the SGD loop.
-            if not torch.equal(
-                merged.learned_identity[: len(old_class_ids)],
-                historical_structure.learned_identity,
-            ):
-                raise RuntimeError("historical I_Q moved during incremental SGD")
-            if not torch.equal(
-                merged.learned_variation[: len(old_class_ids)],
-                historical_structure.learned_variation,
-            ):
-                raise RuntimeError("historical V_Q moved during incremental SGD")
-            return current_features_full, current_structure, merged, seen_cds
+            return (
+                current_features_full,
+                current_structure,
+                working_historical_structure,
+                merged,
+                seen_cds,
+                alignment,
+            )
 
         # One optimizer, one scheduler, one phase loop.  Classifier weight decay is
         # zero so masked old/future rows are not silently changed by AdamW decay.
@@ -483,10 +506,11 @@ class IncrementalPhaseTrainer:
         joint_state = refresh_current_structure()
         pre_structural = regulator(
             classifier=classifier,
-            seen_cds=joint_state[3],
+            seen_cds=joint_state[4],
             historical_class_count=len(old_class_ids),
             reference_classifier=reference_classifier,
             reference_historical_cds=reference_historical_cds,
+            trainable_class_ids=new_class_tensor,
         )
 
         history: list[dict[str, Any]] = []
@@ -503,13 +527,15 @@ class IncrementalPhaseTrainer:
             (
                 _epoch_features,
                 _epoch_current_structure,
+                epoch_historical_structure,
                 _epoch_merged,
                 epoch_seen_cds,
+                _epoch_alignment,
             ) = joint_state
 
             self.model.train()
             sums = {name: 0.0 for name in (
-                "classification", "historical_support", "feature_kd", "feature_rms",
+                "classification", "feature_kd", "feature_rms",
                 "cds_classifier", "cds_classifier_old", "cds_classifier_new", "pic", "kd",
                 "cds", "intra", "inter", "physical_abs",
                 "physical_rel", "physical_joint", "pic_margin",
@@ -548,20 +574,28 @@ class IncrementalPhaseTrainer:
                 current_local = _targets_local(labels, new_class_tensor)
                 sample_weights = current_class_weights.index_select(0, current_local)
 
-                # FCS shared-classifier principle: every seen row participates in
-                # the same real-current CE.  Historical rows are legitimate
-                # negatives for new samples; their missing positive supervision is
-                # supplied below by fixed historical CDS in the SAME classifier.
+                # Real current labels train ONLY the incoming classifier rows.
+                # Historical rows have no real positive samples in this phase and
+                # therefore must not be rewritten by current-only CE.  Cross-phase
+                # old/new competition is handled by the existing Whole-CDS
+                # decision-region regulator with frozen historical anchors.
+                new_output = classifier(
+                    current_features,
+                    class_ids=new_class_tensor,
+                    trainable_class_ids=new_class_tensor,
+                )
+                classification = classification_objective(
+                    logits=new_output.logits,
+                    class_ids=new_output.class_ids,
+                    labels_global=labels,
+                    sample_weights=sample_weights,
+                )
+
+                # Read-only deployed decision rule for online all-seen accuracy.
                 all_seen_output = classifier(
                     current_features,
                     class_ids=seen_class_tensor,
-                    trainable_class_ids=seen_class_tensor,
-                )
-                classification = classification_objective(
-                    logits=all_seen_output.logits,
-                    class_ids=all_seen_output.class_ids,
-                    labels_global=labels,
-                    sample_weights=sample_weights,
+                    trainable_class_ids=(),
                 )
                 # Direct feature KD is the missing stability mechanism exposed by
                 # the IP run: old-only BA fell 91.70 -> 73.47 even though old/new
@@ -585,35 +619,17 @@ class IncrementalPhaseTrainer:
                     sample_weights=sample_weights,
                 )
 
-                # Historical positive classifier support.  Fixed old I_Q is
-                # not a classifier weight; it is a historical feature-space sample
-                # passed through the same deployed all-seen classifier, mirroring
-                # FCS prototype CE.  V_Q and inter/physical CDS remain active in
-                # the symmetric Whole-CDS region loss below.
-                historical_output = classifier(
-                    historical_structure.learned_identity.detach(),
-                    class_ids=seen_class_tensor,
-                    trainable_class_ids=seen_class_tensor,
-                )
-                historical_support = classification_objective(
-                    logits=historical_output.logits,
-                    class_ids=historical_output.class_ids,
-                    labels_global=old_class_tensor,
-                    sample_weights=None,
-                )
-
                 cds = historical_cds_preservation_loss(
                     reference_features=reference_features,
                     current_features=current_features,
                     physical_spectral_evidence=physical_evidence,
                     reference_historical_structure=historical_structure,
-                    current_historical_structure=historical_structure,
+                    current_historical_structure=epoch_historical_structure,
                 )
-                # Incremental ordinary SupCon is replaced by Whole-CDS PIC.
-                # Same-current samples are positives; different-current samples and
-                # fixed historical CDS identities are negatives.  V_Q and native
-                # I_P/V_P strengthen dangerous old/new pairs through Whole-CDS risk.
-                pic = whole_cds_pic_loss(
+                # One continual separation objective: current/current SupCon plus
+                # direct all-seen Whole-CDS discrimination. I_Q, V_Q, I_P and V_P
+                # are all inside the optimized class score, not only diagnostics.
+                pic = whole_cds_contrastive_loss(
                     current_features=current_features,
                     labels_global=labels,
                     physical_spectral_evidence=physical_evidence,
@@ -632,6 +648,7 @@ class IncrementalPhaseTrainer:
                     historical_class_count=len(old_class_ids),
                     reference_classifier=reference_classifier,
                     reference_historical_cds=reference_historical_cds,
+                    trainable_class_ids=new_class_tensor,
                 )
                 if not bool(torch.isfinite(structural.loss)):
                     raise RuntimeError(
@@ -648,26 +665,16 @@ class IncrementalPhaseTrainer:
                     ce_old = self._row_grad_max(ce_grad, old_class_tensor)
                     ce_new = self._row_grad_max(ce_grad, new_class_tensor)
                     ce_future = self._row_grad_max(ce_grad, future_class_tensor)
-                    if ce_old <= tolerance or ce_new <= tolerance:
+                    if ce_old > tolerance:
                         raise RuntimeError(
-                            "real-current all-seen CE must update both historical rivals and incoming positives"
+                            "real-current CE leaked gradient into finalized historical rows"
+                        )
+                    if ce_new <= tolerance:
+                        raise RuntimeError(
+                            "real-current CE produced no incoming-row gradient"
                         )
                     if ce_future > tolerance:
                         raise RuntimeError("real-current CE leaked into future rows")
-
-                    hist_grad = torch.autograd.grad(
-                        historical_support.loss, classifier.weight,
-                        retain_graph=True, allow_unused=True,
-                    )[0]
-                    hist_old = self._row_grad_max(hist_grad, old_class_tensor)
-                    hist_new = self._row_grad_max(hist_grad, new_class_tensor)
-                    hist_future = self._row_grad_max(hist_grad, future_class_tensor)
-                    if hist_old <= tolerance or hist_new <= tolerance:
-                        raise RuntimeError(
-                            "historical positive support must update old positives and seen rivals"
-                        )
-                    if hist_future > tolerance:
-                        raise RuntimeError("historical support leaked into future rows")
 
                     cds_grad = torch.autograd.grad(
                         structural.loss, classifier.weight,
@@ -676,16 +683,20 @@ class IncrementalPhaseTrainer:
                     cds_old = self._row_grad_max(cds_grad, old_class_tensor)
                     cds_new = self._row_grad_max(cds_grad, new_class_tensor)
                     cds_future = self._row_grad_max(cds_grad, future_class_tensor)
-                    if cds_old <= tolerance or cds_new <= tolerance:
+                    if cds_old > tolerance:
                         raise RuntimeError(
-                            "symmetric Whole-CDS supervision must update every seen classifier group"
+                            "Whole-CDS classifier protection leaked into finalized historical rows"
+                        )
+                    if cds_new <= tolerance:
+                        raise RuntimeError(
+                            "Whole-CDS classifier protection produced no incoming-row gradient"
                         )
                     if cds_future > tolerance:
                         raise RuntimeError("Whole-CDS supervision leaked into future rows")
 
                     for name, objective in (
                         ("feature KD", feature_kd.loss),
-                        ("Whole-CDS PIC", pic.loss),
+                        ("Whole-CDS contrastive", pic.loss),
                     ):
                         grad = torch.autograd.grad(
                             objective, classifier.weight, retain_graph=True, allow_unused=True
@@ -698,11 +709,11 @@ class IncrementalPhaseTrainer:
                     # bug did exactly that at zero drift).  Check every objective that
                     # acts on current Q before allowing the combined backward pass.
                     for name, objective in (
-                        ("current all-seen CE", classification.loss),
+                        ("current new-class CE", classification.loss),
                         ("feature KD", feature_kd.loss),
                         ("old-logit KD", kd.loss),
                         ("intra/inter CDS preservation", cds.loss),
-                        ("Whole-CDS PIC", pic.loss),
+                        ("Whole-CDS contrastive", pic.loss),
                     ):
                         q_grad = torch.autograd.grad(
                             objective, current_features, retain_graph=True, allow_unused=True
@@ -717,9 +728,8 @@ class IncrementalPhaseTrainer:
                     print(
                         "[Gradient ownership] "
                         f"NewCE old={ce_old:.3e} new={ce_new:.3e} future={ce_future:.3e} | "
-                        f"OldSupport old={hist_old:.3e} new={hist_new:.3e} future={hist_future:.3e} | "
                         f"WholeCDS old={cds_old:.3e} new={cds_new:.3e} future={cds_future:.3e} | "
-                        "FeatureKD classifier=0 | WholeCDSPIC classifier=0",
+                        "HistoricalW=frozen | FeatureKD classifier=0 | WholeCDSContrast classifier=0",
                         file=sys.stdout,
                     )
                     gradient_contract_checked = True
@@ -729,7 +739,6 @@ class IncrementalPhaseTrainer:
                     + contrastive_weight * pic.loss
                     + feature_kd_weight * feature_kd.loss
                     + kd_logit_weight * kd.loss
-                    + historical_support_weight * historical_support.loss
                     + cds_weight * (cds.loss + structural.loss)
                 )
                 if not bool(torch.isfinite(loss)):
@@ -742,6 +751,14 @@ class IncrementalPhaseTrainer:
                     torch.isfinite(classifier.weight.grad).all()
                 ):
                     raise RuntimeError("joint classifier gradient is missing/non-finite")
+                if bool(
+                    torch.count_nonzero(
+                        classifier.weight.grad.index_select(0, old_class_tensor)
+                    )
+                ):
+                    raise RuntimeError(
+                        "finalized historical classifier rows received incremental gradients"
+                    )
                 if future_class_tensor.numel() and bool(
                     torch.count_nonzero(
                         classifier.weight.grad.index_select(0, future_class_tensor)
@@ -767,15 +784,18 @@ class IncrementalPhaseTrainer:
                         error_if_nonfinite=True,
                     )
                 optimizer.step()
+                if not torch.equal(
+                    classifier.class_weight(old_class_tensor).detach(), old_weight_before
+                ):
+                    raise RuntimeError(
+                        "finalized historical classifier rows changed during incremental training"
+                    )
                 self._assert_future_rows_unchanged(
                     classifier, future_class_tensor, future_weight_before
                 )
 
                 n = int(labels.numel())
                 sums["classification"] += float(classification.loss.detach().item()) * n
-                sums["historical_support"] += float(
-                    historical_support.loss.detach().item()
-                ) * n
                 sums["feature_kd"] += float(feature_kd.loss.detach().item()) * n
                 sums["feature_rms"] += float(feature_kd.rms_drift.detach().item()) * n
                 sums["cds_classifier"] += float(structural.loss.detach().item()) * n
@@ -838,15 +858,17 @@ class IncrementalPhaseTrainer:
                 classifier, future_class_tensor, future_weight_before
             )
 
-            # Only current-class CDS is refreshed for the next epoch.  The
-            # historical CDS remains bitwise fixed until one-time final migration.
+            # Refresh current-class CDS and its detached working historical
+            # alignment for the next epoch. The persistent historical reference
+            # itself remains immutable.
             joint_state = refresh_current_structure()
             epoch_structural = regulator(
                 classifier=classifier,
-                seen_cds=joint_state[3],
+                seen_cds=joint_state[4],
                 historical_class_count=len(old_class_ids),
                 reference_classifier=reference_classifier,
                 reference_historical_cds=reference_historical_cds,
+                trainable_class_ids=new_class_tensor,
             )
 
             self.model.eval()
@@ -885,7 +907,6 @@ class IncrementalPhaseTrainer:
                 "epoch": epoch + 1,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "classification_loss": sums["classification"] / sample_count,
-                "historical_support_loss": sums["historical_support"] / sample_count,
                 "feature_kd_loss": sums["feature_kd"] / sample_count,
                 "whole_cds_classifier_loss": sums["cds_classifier"] / sample_count,
                 "old_cds_classifier_loss": sums["cds_classifier_old"] / sample_count,
@@ -936,8 +957,7 @@ class IncrementalPhaseTrainer:
             history.append(record)
             tqdm.write(
                 f"[Joint {epoch + 1:03d}/{epoch_count:03d}] "
-                f"CEnew-all={record['classification_loss']:.4f} "
-                f"OldSupport={record['historical_support_loss']:.4f} "
+                f"CEnew={record['classification_loss']:.4f} "
                 f"FKD={record['feature_kd_loss']:.4f} "
                 f"CDSCls={record['whole_cds_classifier_loss']:.4f} "
                 f"PIC={record['pic_loss']:.4f} "
@@ -965,42 +985,30 @@ class IncrementalPhaseTrainer:
         (
             final_features_full,
             final_current_structure,
-            final_training_merged,
-            final_training_seen_cds,
+            final_historical_structure,
+            committed_structure,
+            committed_seen_cds,
+            final_alignment,
         ) = joint_state
 
-        # The ONLY historical semantic migration in the phase occurs here, after
-        # the representation has converged.  It is estimated from legal paired
-        # current-class Q^-/Q^+ observations and applied once to the immutable
-        # Phase-(t-1) historical CDS.
-        final_historical_structure, _final_transform, final_alignment = (
-            correct_historical_structure(
-                historical_structure=historical_structure,
-                current_reference_structure=current_reference_structure,
-                current_structure=final_current_structure,
-                reference_features=reference_features_full,
-                current_features=final_features_full,
-            )
-        )
         if not torch.equal(
-            final_historical_structure.physical_identity, historical_structure.physical_identity
+            final_historical_structure.physical_identity,
+            historical_structure.physical_identity,
         ) or not torch.equal(
-            final_historical_structure.physical_variation, historical_structure.physical_variation
+            final_historical_structure.physical_variation,
+            historical_structure.physical_variation,
         ):
-            raise RuntimeError("one-time migration changed physical I_P/V_P")
-        committed_structure = merge_class_structure_batches(
-            (final_historical_structure, final_current_structure)
-        )
-        committed_seen_cds = self.model.structure_bank.build_cds(committed_structure)
+            raise RuntimeError("final working CDS changed physical I_P/V_P")
 
-        # Historical-protection diagnostics are evaluated in the fixed training
-        # coordinate, exactly where the classifier was protected throughout SGD.
+        # Final diagnostics use the exact committed current-coordinate CDS, the
+        # same semantic state used during the final joint epoch.
         final_structural = regulator(
             classifier=classifier,
-            seen_cds=final_training_seen_cds,
+            seen_cds=committed_seen_cds,
             historical_class_count=len(old_class_ids),
             reference_classifier=reference_classifier,
             reference_historical_cds=reference_historical_cds,
+            trainable_class_ids=new_class_tensor,
         )
 
         # Commit only corrected/real CDS.  The cosine classifier is already the
@@ -1036,13 +1044,17 @@ class IncrementalPhaseTrainer:
         final_record = history[-1]
         final_old_weight = classifier.class_weight(old_class_tensor).detach()
         final_new_weight = classifier.class_weight(new_class_tensor).detach()
+        if not torch.equal(final_old_weight, old_weight_before):
+            raise RuntimeError(
+                "historical classifier rows changed across the incremental phase"
+            )
         method_state = {
             "persistent_cds": "{I_Q,V_Q,I_P,V_P}",
             "decision_rule": "one shared bias-free all-seen cosine classifier over Q",
             "physical_evidence": "I_P/V_P is phase-stable spectral evidence used in intra/inter preservation, cross-phase separation and Whole-CDS pair risk",
-            "training_chain": "single joint incremental optimization; native incoming rows; all-seen CE + fixed historical positive CE + ordered feature KD + old-logit KD + fixed-reference intra/inter preservation + Whole-CDS PIC + symmetric Whole-CDS classifier protection",
-            "gradient_ownership": "real-current CE updates all seen rows; historical CDS support updates old positives and seen rivals; symmetric Whole-CDS updates all seen rows; future rows never update",
-            "semantic_drift": "historical learned CDS is immutable during SGD and transported once after convergence by a reliability-shrunk observable global Q map; no class-specific old motion; I_P/V_P unchanged",
+            "training_chain": "single joint incremental optimization; native incoming rows; new-class CE + ordered feature KD + old-logit KD + immutable-reference/working-coordinate Whole-CDS preservation + risk-aware Whole-CDS contrastive separation + frozen-old Whole-CDS classifier protection",
+            "gradient_ownership": "historical classifier rows are immutable; real-current CE updates incoming rows only; Whole-CDS classifier protection updates incoming rows against fixed historical anchors; future rows never update",
+            "semantic_drift": "persistent historical CDS is immutable; a detached current-coordinate working CDS is refreshed from observable current-class Q drift using Whole-CDS relevance; I_P/V_P stay unchanged",
             "stores_old_images": False,
             "stores_old_feature_rows": False,
             "stores_synthetic_support": False,
@@ -1056,12 +1068,11 @@ class IncrementalPhaseTrainer:
             "contrastive_weight": contrastive_weight,
             "pic_weight": contrastive_weight,
             "feature_kd_weight": feature_kd_weight,
-            "historical_support_weight": historical_support_weight,
             "kd_logit_weight": kd_logit_weight,
             "kd_temperature": kd_temperature,
             "cds_weight": cds_weight,
-            "feature_stability": "ordered feature KD + old-logit KD + fixed historical intra/inter Whole-CDS preservation",
-            "cross_phase_separation": "Whole-CDS PIC: same-current positives, other-current negatives, fixed historical I_Q negatives; V_Q/I_P/V_P weight dangerous pairs",
+            "feature_stability": "ordered feature KD + old-logit KD + immutable-reference/working-coordinate Whole-CDS preservation",
+            "cross_phase_separation": "risk-aware Whole-CDS contrastive separation in one current Q coordinate; I_Q/V_Q/I_P/V_P and inter-class pair risk all affect the optimized loss",
             "phase_mapping_error": float(final_alignment.mapping_error.item()),
             "representation_drift_rms": float(final_alignment.representation_drift_rms.item()),
             "phase_scale_deviation_rms": float(final_alignment.scale_deviation_rms.item()),
@@ -1078,7 +1089,6 @@ class IncrementalPhaseTrainer:
             "drift_variation_correction_relative_max": float(final_alignment.variation_correction_relative_max.item()),
             "drift_variation_negative_fraction_before_sanitize": float(final_alignment.variation_negative_fraction_before_sanitize.item()),
             "final_joint_classification_loss": float(final_record["classification_loss"]),
-            "final_historical_support_loss": float(final_record["historical_support_loss"]),
             "final_feature_kd_loss": float(final_record["feature_kd_loss"]),
             "final_whole_cds_classifier_loss": float(final_record["whole_cds_classifier_loss"]),
             "final_old_cds_classifier_loss": float(final_record["old_cds_classifier_loss"]),
@@ -1086,7 +1096,7 @@ class IncrementalPhaseTrainer:
             "final_cds_separation_loss": float(final_record["cds_separation_loss"]),
             "final_cds_separation_margin": float(final_record["cds_separation_margin"]),
             "final_cds_separation_violation_fraction": float(final_record["cds_separation_violation_fraction"]),
-            "classifier_balance": "current real positives and fixed historical positives train the same all-seen head; Whole-CDS decision-region protection is symmetric across all seen classes",
+            "classifier_balance": "real current CE trains incoming rows only; finalized historical rows stay fixed; the existing Whole-CDS regulator positions incoming rows against fixed old/new structural boundaries using the same deployed cosine logits",
             "final_contrastive_loss": float(final_record["contrastive_loss"]),
             "final_pic_loss": float(final_record["pic_loss"]),
             "final_pic_positive_similarity": float(final_record["pic_positive_similarity"]),
@@ -1148,6 +1158,9 @@ class IncrementalPhaseTrainer:
 
 
 __all__ = ["IncrementalPhaseTrainer"]
+
+
+
 
 
 
