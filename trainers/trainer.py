@@ -233,6 +233,7 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
         self.history[phase_id] = {
             "final_epoch": int(result["final_epoch"]),
             "epochs": list(result["history"]),
+            "classifier_reconstruction": list(result["classifier_history"]),
             "method_state": dict(result["method_state"]),
         }
         phase_dir = Path(self.save_dir) / f"phase_{phase_id}"
@@ -346,6 +347,13 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
 
 
 __all__ = ["Trainer"]
+
+
+
+
+
+
+
 
 
 

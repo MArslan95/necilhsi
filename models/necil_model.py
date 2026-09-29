@@ -28,10 +28,10 @@ class NECILOutput:
 class NECILModel(nn.Module):
     """NECIL-HSI model: one Q, one fixed P, one Whole-CDS bank, one head.
 
-    Persistent method memory is {I_Q,V_Q,I_P,V_P}. Whole-CDS is the
-    prototype-like historical class state used for transient historical support,
-    intra/inter preservation and risk-aware separation. The only deployed
-    classifier is the all-seen cosine head over Q.
+    Persistent method memory is {I_Q,V_Q,I_P,V_P}. Whole-CDS is a structured
+    historical class state used for intra/inter preservation, risk-aware
+    separation, coordinate correction and classifier finalization. The only
+    deployed classifier is the all-seen cosine head over Q.
     """
 
     def __init__(self, args: Any) -> None:
@@ -334,7 +334,6 @@ class NECILModel(nn.Module):
 
 
 __all__ = ["NECILModel", "NECILOutput"]
-
 
 
 
