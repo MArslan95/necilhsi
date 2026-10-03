@@ -1,140 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 
+from dataclasses import dataclass
 
 
 import torch
 
-import torch.nn as nn
-
 import torch.nn.functional as F
-
 
 
 from models.classifier import CosineClassificationHead
 
-from models.geometry_bank import (
-
-    ClassDiscriminativeStructureState,
-
-    combine_learned_physical_relevance,
-
-)
-
-
+from models.geometry_bank import ClassDiscriminativeStructureState
 
 Tensor = torch.Tensor
 
 
 @dataclass(frozen=True)
-
-class WholeCDSClassifierProtectionObjective:
-
-    """Compatibility view of the finalized all-seen classifier objective."""
-
-
-
-    loss: Tensor
-
-    global_reconstruction_loss: Tensor
-
-    old_class_reconstruction_loss: Tensor
-
-    new_class_reconstruction_loss: Tensor
-
-    old_old_retention_loss: Tensor
-
-
-
-    historical_identity_margin_mean: Tensor
-
-    historical_identity_margin_min: Tensor
-
-    historical_deformation_exposure_mean: Tensor
-
-    historical_structural_clearance_mean: Tensor
-
-    historical_structural_clearance_min: Tensor
-
-
-
-    current_identity_margin_mean: Tensor
-
-    current_identity_margin_min: Tensor
-
-    current_deformation_exposure_mean: Tensor
-
-    current_structural_clearance_mean: Tensor
-
-    current_structural_clearance_min: Tensor
-
-
-
-    historical_internal_clearance_mean: Tensor
-
-    historical_internal_clearance_min: Tensor
-
-    historical_internal_retention_mean: Tensor
-
-    historical_internal_retention_min: Tensor
-
-    historical_internal_violation_fraction: Tensor
-
-
-
-    joint_structural_clearance_mean: Tensor
-
-    joint_structural_clearance_min: Tensor
-
-    unsafe_pair_fraction: Tensor
-
-    pair_weight_mean: Tensor
-
-    learned_pair_risk_mean: Tensor
-
-    physical_pair_risk_mean: Tensor
-
-    effective_pair_risk_mean: Tensor
-
-    old_new_structural_violation_mean: Tensor
-
-    old_new_violation_fraction: Tensor
-
-
-
-    reference_clearance_mean: Tensor
-
-    reference_clearance_min: Tensor
-
-    reference_retention_mean: Tensor
-
-    reference_retention_min: Tensor
-
-    reference_violation_fraction: Tensor
-
-
-
-    @property
-
-    def historical_robust_classification_loss(self) -> Tensor:
-
-        return self.old_class_reconstruction_loss
-
-
-
-    @property
-
-    def current_robust_structural_loss(self) -> Tensor:
-
-        return self.new_class_reconstruction_loss
-
-
-
-
-
-@dataclass(frozen=True)
-
 class WholeCDSClassBalancedObjective:
 
     loss: Tensor
@@ -172,34 +54,51 @@ class WholeCDSClassBalancedObjective:
     new_new_violation_fraction: Tensor
 
 
-
-
-
-
 @dataclass(frozen=True)
-class IncomingClassifierCalibrationState:
-    """State of real-current fitting under historical old->new CDS constraints."""
+class BalancedDecisionAdmissionState:
 
-    real_loss: Tensor
-    real_accuracy: Tensor
-    real_margin_mean: Tensor
-    historical_clearance_mean: Tensor
-    historical_clearance_min: Tensor
-    historical_violation_fraction: Tensor
-    historical_risk_weighted_violation: Tensor
+    balanced_loss: Tensor
+
+    historical_positive_loss: Tensor
+
+    current_positive_loss: Tensor
+
+    real_new_loss: Tensor
+
+    real_all_seen_accuracy: Tensor
+
+    new_only_accuracy: Tensor
+    new_only_loss: Tensor
+
+    historical_per_class_loss: Tensor
+
+    current_per_class_loss: Tensor
+
+    cds_loss: Tensor
+
+    clearance_mean: Tensor
+
+    clearance_min: Tensor
+
+    violation_fraction: Tensor
+
+    old_new_violation_fraction: Tensor
+
+    old_old_violation_fraction: Tensor
+
+    new_new_violation_fraction: Tensor
+
     learned_pair_risk_mean: Tensor
+
     physical_pair_risk_mean: Tensor
+
     effective_pair_risk_mean: Tensor
 
 
 def _validate_cds(
-
     *,
-
     classifier: CosineClassificationHead,
-
     cds: ClassDiscriminativeStructureState,
-
 ) -> tuple[Tensor, Tensor, Tensor, int, int, int]:
 
     if not isinstance(classifier, CosineClassificationHead):
@@ -210,30 +109,26 @@ def _validate_cds(
 
         raise TypeError("cds must be ClassDiscriminativeStructureState")
 
-
-
     classes = cds.classes
 
-    ids = classes.class_ids.to(device=classifier.weight.device, dtype=torch.long).flatten()
+    ids = classes.class_ids.to(
+        device=classifier.weight.device, dtype=torch.long
+    ).flatten()
 
     count = int(ids.numel())
 
     if count < 2 or int(torch.unique(ids).numel()) != count:
 
-        raise ValueError("CDS classifier objective requires at least two unique classes")
-
-
+        raise ValueError(
+            "Whole-CDS decision objective requires at least two unique classes"
+        )
 
     identity = classes.learned_identity.to(
-
         device=classifier.weight.device, dtype=classifier.weight.dtype
-
     ).detach()
 
     variation = classes.learned_variation.to(
-
         device=classifier.weight.device, dtype=classifier.weight.dtype
-
     ).detach()
 
     if identity.ndim != 3 or identity.size(0) != count or identity.size(1) < 2:
@@ -246,7 +141,9 @@ def _validate_cds(
 
         raise ValueError("V_Q must be [C,K,K,D]")
 
-    if not bool(torch.isfinite(identity).all()) or not bool(torch.isfinite(variation).all()):
+    if not bool(torch.isfinite(identity).all()) or not bool(
+        torch.isfinite(variation).all()
+    ):
 
         raise ValueError("I_Q/V_Q contains NaN or Inf")
 
@@ -256,35 +153,30 @@ def _validate_cds(
 
     if int(classifier.feature_dim) != k * d:
 
-        raise ValueError("classifier feature dimension does not match Q")
+        raise ValueError("classifier feature dimension does not match ordered Q")
 
     return ids, identity, variation, count, k, d
 
 
-
-
-
 def _directed_identity_margin_and_relation_exposure(
-
     *,
-
     source_identity: Tensor,
-
     source_deformation: Tensor,
-
     boundary: Tensor,
-
-) -> tuple[Tensor, Tensor, Tensor]:
-
-    """Robust directed cosine clearance from complete learned CDS.
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return identity margin plus both Whole-CDS intra-class exposures.
 
 
 
-    I_Q supplies ordered identity. V_Q supplies diagonal absolute variation and
+    ``V_Q`` carries two distinct structures: its diagonal stores absolute ordered
 
-    off-diagonal ordered-token relation variation. V_Q is a robust scale field,
+    token/channel variation and its off-diagonal entries store ordered token-pair
 
-    never a covariance or Gaussian memory.
+    relation variation.  They are not collapsed with a hard max.  Stage 3 requires
+
+    the deployed boundary to satisfy both structural views, so both clearances are
+
+    retained and optimized.
 
     """
 
@@ -312,8 +204,6 @@ def _directed_identity_margin_and_relation_exposure(
 
         raise ValueError("boundary-clearance tensors contain NaN or Inf")
 
-
-
     eps = torch.finfo(identity.dtype).eps
 
     flat_identity = identity.reshape(s, -1)
@@ -324,103 +214,126 @@ def _directed_identity_margin_and_relation_exposure(
 
     margin = (normal * identity_unit[:, None, :]).sum(dim=2)
 
+    # The differential of normalized I_Q along each cosine boundary direction.
 
-
-    tangent = (
-
-        normal - margin[:, :, None] * identity_unit[:, None, :]
-
-    ) / identity_norm[:, None, :]
+    tangent = (normal - margin[:, :, None] * identity_unit[:, None, :]) / identity_norm[
+        :, None, :
+    ]
 
     tangent_kd = tangent.reshape(s, normal.size(1), k, d)
 
-
+    # Diagonal V_Q: absolute ordered token/channel extent.
 
     index = torch.arange(k, device=identity.device)
 
     absolute_scale = deformation[:, index, index, :]
 
-    absolute_exposure = (
+    absolute_exposure = (tangent_kd.abs() * absolute_scale[:, None, :, :]).sum(
+        dim=(2, 3)
+    )
 
-        tangent_kd.abs() * absolute_scale[:, None, :, :]
+    # Off-diagonal V_Q: ordered relation extent.  Only one orientation of each
 
-    ).sum(dim=(2, 3))
+    # pair is accumulated because V_Q stores an ordered pair field symmetrically
 
-
+    # for this exposure calculation.
 
     relation_sensitivity = (
-
         tangent_kd[:, :, :, None, :] - tangent_kd[:, :, None, :, :]
-
     ).abs()
 
     upper = torch.triu(
-
         torch.ones(k, k, device=identity.device, dtype=torch.bool), diagonal=1
-
     )
 
     relational_exposure = (
-
-        relation_sensitivity
-
-        * deformation[:, None, :, :, :]
-
-        * upper.view(1, 1, k, k, 1)
-
+        relation_sensitivity * deformation[:, None, :, :, :] * upper.view(1, 1, k, k, 1)
     ).sum(dim=(2, 3, 4)) / float(k)
 
+    absolute_clearance = margin - absolute_exposure
 
+    relational_clearance = margin - relational_exposure
 
-    exposure = torch.maximum(absolute_exposure, relational_exposure)
+    values = (
+        margin,
+        absolute_exposure,
+        relational_exposure,
+        absolute_clearance,
+        relational_clearance,
+    )
 
-    clearance = margin - exposure
-
-    if not all(bool(torch.isfinite(v).all()) for v in (margin, exposure, clearance)):
+    if not all(bool(torch.isfinite(v).all()) for v in values):
 
         raise RuntimeError("Whole-CDS boundary clearance became NaN or Inf")
 
-    return margin, exposure, clearance
-
-
-
+    return values
 
 
 def _effective_pair_risk(learned: Tensor, physical: Tensor) -> Tensor:
+    """Fuse learned inter-class geometry with physical spectral evidence.
+
+    Learned CDS defines semantic rivalry. Physical I_P/V_P may strengthen an
+    already supported learned-space rivalry, but physical similarity alone must
+    never create a semantic class relation. This keeps Q as the single learned
+    decision space while P remains HSI-specific evidence about which learned
+    boundaries deserve stronger protection.
+
+    R_eff = R_Q + (1 - R_Q) * R_Q * R_P.
+
+    Thus R_Q == 0 implies R_eff == 0, while strong physical similarity can
+    amplify a non-zero learned rivalry without creating a second semantic system.
+    """
 
     learned_value = torch.as_tensor(learned)
-
     physical_value = torch.as_tensor(
-
         physical, device=learned_value.device, dtype=learned_value.dtype
-
     )
-
     if learned_value.ndim != 2 or learned_value.shape != physical_value.shape:
-
         raise ValueError("learned/physical risk must share a rank-two shape")
+    if not bool(torch.isfinite(learned_value).all()) or not bool(
+        torch.isfinite(physical_value).all()
+    ):
+        raise ValueError("learned/physical risk contains NaN or Inf")
 
-    return combine_learned_physical_relevance(learned_value, physical_value)
-
-
-
+    learned_value = learned_value.clamp(0.0, 1.0)
+    physical_value = physical_value.clamp(0.0, 1.0)
+    return (
+        learned_value + (1.0 - learned_value) * learned_value * physical_value
+    ).clamp(0.0, 1.0)
 
 
 def _classwise_robust_loss(
-
     *,
-
-    clearance: Tensor,
-
+    absolute_clearance: Tensor,
+    relational_clearance: Tensor,
     pair_weight: Tensor,
-
     valid_mask: Tensor,
-
     scale: Tensor,
-
 ) -> Tensor:
+    """CE-shaped historical positive loss using both intra-class structures.
 
-    if clearance.shape != pair_weight.shape or clearance.shape != valid_mask.shape:
+
+
+    Each class/rival pair receives one total pair mass.  That mass is split
+
+    equally between the absolute and ordered-relation constraints, so retaining
+
+    both branches does not double the neutral loss scale.  Log-sum-exp then lets
+
+    the more violated branch dominate naturally without zeroing the other branch's
+
+    gradient via a hard ``max``.
+
+    """
+
+    if absolute_clearance.shape != relational_clearance.shape:
+
+        raise ValueError("absolute/relational clearance shapes disagree")
+
+    if (
+        absolute_clearance.shape != pair_weight.shape
+        or pair_weight.shape != valid_mask.shape
+    ):
 
         raise ValueError("clearance, pair_weight and valid_mask must share shape")
 
@@ -428,22 +341,37 @@ def _classwise_robust_loss(
 
         raise TypeError("valid_mask must be boolean")
 
-    eps = torch.finfo(clearance.dtype).eps
-
-    terms = pair_weight.clamp_min(eps).log() - scale * clearance
-
-    terms = terms.masked_fill(~valid_mask, -torch.inf)
-
     if not bool(valid_mask.any(dim=1).all()):
 
         raise RuntimeError("every source class must have at least one rival")
 
-    zero = torch.zeros((clearance.size(0), 1), device=clearance.device, dtype=clearance.dtype)
+    eps = torch.finfo(absolute_clearance.dtype).eps
 
-    return torch.logsumexp(torch.cat((zero, terms), dim=1), dim=1)
+    # Half the pair mass is assigned to each structural view.  If both views are
 
+    # identical, their summed exponential contribution equals the original
 
+    # single-view pair mass exactly.
 
+    log_branch_weight = (0.5 * pair_weight).clamp_min(eps).log()
+
+    absolute_terms = log_branch_weight - scale * absolute_clearance
+
+    relational_terms = log_branch_weight - scale * relational_clearance
+
+    absolute_terms = absolute_terms.masked_fill(~valid_mask, -torch.inf)
+
+    relational_terms = relational_terms.masked_fill(~valid_mask, -torch.inf)
+
+    zero = torch.zeros(
+        (absolute_clearance.size(0), 1),
+        device=absolute_clearance.device,
+        dtype=absolute_clearance.dtype,
+    )
+
+    return torch.logsumexp(
+        torch.cat((zero, absolute_terms, relational_terms), dim=1), dim=1
+    )
 
 
 def _masked_stats(values: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -461,83 +389,59 @@ def _masked_stats(values: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]
         return zero, zero, zero
 
     return (
-
         selected.mean(),
-
         selected.min(),
-
         selected.lt(0.0).to(values.dtype).mean(),
-
     )
 
 
-
-
-
 def _boundary_state(
-
     *,
-
     classifier: CosineClassificationHead,
-
     cds: ClassDiscriminativeStructureState,
-
-    trainable_class_ids: Tensor | None = None,
-
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]:
 
     ids, identity, variation, count, _k, _d = _validate_cds(
-
         classifier=classifier, cds=cds
-
     )
 
     eps = torch.finfo(identity.dtype).eps
 
-    raw_rows = classifier.class_weight(ids)
-    if trainable_class_ids is None:
-        owned_rows = raw_rows
-    else:
-        trainable_ids = torch.as_tensor(
-            trainable_class_ids, device=ids.device, dtype=torch.long
-        ).flatten()
-        if trainable_ids.ndim != 1 or trainable_ids.numel() == 0:
-            raise ValueError("trainable_class_ids must be a non-empty rank-one tensor")
-        if int(torch.unique(trainable_ids).numel()) != int(trainable_ids.numel()):
-            raise ValueError("trainable_class_ids must be unique")
-        membership = trainable_ids.unsqueeze(1).eq(ids.unsqueeze(0))
-        if not bool(membership.sum(dim=1).eq(1).all()):
-            raise ValueError("trainable_class_ids must be contained in CDS class IDs")
-        trainable_mask = ids.unsqueeze(1).eq(trainable_ids.unsqueeze(0)).any(dim=1)
-        owned_rows = torch.where(
-            trainable_mask.unsqueeze(1), raw_rows, raw_rows.detach()
-        )
-    rows = F.normalize(owned_rows, p=2, dim=1, eps=eps)
+    rows = F.normalize(classifier.class_weight(ids), p=2, dim=1, eps=eps)
 
     boundary = rows[:, None, :] - rows[None, :, :]
 
-    margin, exposure, clearance = _directed_identity_margin_and_relation_exposure(
-
+    (
+        margin,
+        absolute_exposure,
+        relational_exposure,
+        absolute_clearance,
+        relational_clearance,
+    ) = _directed_identity_margin_and_relation_exposure(
         source_identity=identity,
-
         source_deformation=variation,
-
         boundary=boundary,
-
     )
 
-
-
     learned = cds.relations.learned_combined_proximity.to(
-
         device=identity.device, dtype=identity.dtype
-
     ).detach()
 
     physical = cds.relations.physical_combined_proximity.to(
-
         device=identity.device, dtype=identity.dtype
-
     ).detach()
 
     if learned.shape != (count, count) or physical.shape != (count, count):
@@ -550,79 +454,67 @@ def _boundary_state(
 
     valid = ~torch.eye(count, device=identity.device, dtype=torch.bool)
 
-    return ids, margin, exposure, clearance, learned, physical, effective, pair_weight, valid
+    # Diagnostics use the conservative clearance: both structural views must be
 
+    # valid, so a pair is only as safe as its smaller clearance.  The training
 
+    # objective itself retains the two branches separately.
 
+    conservative_clearance = torch.minimum(absolute_clearance, relational_clearance)
+
+    return (
+        ids,
+        margin,
+        absolute_exposure,
+        relational_exposure,
+        absolute_clearance,
+        relational_clearance,
+        conservative_clearance,
+        learned,
+        physical,
+        effective,
+        pair_weight,
+        valid,
+    )
 
 
 def whole_cds_class_balanced_classifier_loss(
-
     *,
-
     classifier: CosineClassificationHead,
-
     cds: ClassDiscriminativeStructureState,
-
     historical_class_count: int | None = None,
-
-    trainable_class_ids: Tensor | None = None,
-
 ) -> WholeCDSClassBalancedObjective:
 
-    """Finalize the one deployed cosine head from the finalized all-seen Whole-CDS.
-
-
-
-    I_Q and V_Q define robust directed boundary clearance. Learned and physical
-
-    inter-class CDS relations determine which rival boundaries deserve stronger
-
-    protection. No CDS score is added to inference logits: deployment remains
-
-    cosine(Q,W), while Whole-CDS is a training-time boundary constraint.
-
-    """
-
     (
-
-        ids, _margin, _exposure, clearance, learned, physical,
-
-        effective, pair_weight, valid,
-
-    ) = _boundary_state(
-
-        classifier=classifier,
-
-        cds=cds,
-
-        trainable_class_ids=trainable_class_ids,
-
-    )
+        ids,
+        _margin,
+        _absolute_exposure,
+        _relational_exposure,
+        absolute_clearance,
+        relational_clearance,
+        clearance,
+        learned,
+        physical,
+        effective,
+        pair_weight,
+        valid,
+    ) = _boundary_state(classifier=classifier, cds=cds)
 
     count = int(ids.numel())
 
     scale = classifier.logit_scale.to(
-
         device=clearance.device, dtype=clearance.dtype
-
     ).detach()
 
     per_class = _classwise_robust_loss(
-
-        clearance=clearance,
-
+        absolute_clearance=absolute_clearance,
+        relational_clearance=relational_clearance,
         pair_weight=pair_weight,
-
         valid_mask=valid,
-
         scale=scale,
-
     )
 
     loss = per_class.mean()
-
-
 
     if historical_class_count is None:
 
@@ -634,9 +526,9 @@ def whole_cds_class_balanced_classifier_loss(
 
         if old_count <= 0 or old_count >= count:
 
-            raise ValueError("historical_class_count must split old and new seen classes")
-
-
+            raise ValueError(
+                "historical_class_count must split old and new seen classes"
+            )
 
     if old_count > 0:
 
@@ -660,292 +552,216 @@ def whole_cds_class_balanced_classifier_loss(
 
         new_new_mask = valid
 
+    old_new_mean, old_new_min, old_new_violation = _masked_stats(
+        clearance, old_new_mask
+    )
 
+    old_old_mean, old_old_min, old_old_violation = _masked_stats(
+        clearance, old_old_mask
+    )
 
-    old_new_mean, old_new_min, old_new_violation = _masked_stats(clearance, old_new_mask)
-
-    old_old_mean, old_old_min, old_old_violation = _masked_stats(clearance, old_old_mask)
-
-    new_new_mean, new_new_min, new_new_violation = _masked_stats(clearance, new_new_mask)
-
-
+    new_new_mean, new_new_min, new_new_violation = _masked_stats(
+        clearance, new_new_mask
+    )
 
     scalars = (
-
         loss,
-
         clearance[valid].mean(),
-
         clearance[valid].min(),
-
         learned[valid].mean(),
-
         physical[valid].mean(),
-
         effective[valid].mean(),
-
         clearance[valid].lt(0.0).to(clearance.dtype).mean(),
-
-        old_new_mean, old_new_min, old_new_violation,
-
-        old_old_mean, old_old_min, old_old_violation,
-
-        new_new_mean, new_new_min, new_new_violation,
-
+        old_new_mean,
+        old_new_min,
+        old_new_violation,
+        old_old_mean,
+        old_old_min,
+        old_old_violation,
+        new_new_mean,
+        new_new_min,
+        new_new_violation,
     )
 
     if not all(bool(torch.isfinite(v)) for v in scalars):
 
-        raise RuntimeError("Whole-CDS classifier finalization became NaN or Inf")
-
-
+        raise RuntimeError("Whole-CDS classifier objective became NaN or Inf")
 
     return WholeCDSClassBalancedObjective(
-
         loss=loss,
-
         per_class_loss=per_class,
-
         clearance_mean=clearance[valid].mean(),
-
         clearance_min=clearance[valid].min(),
-
         learned_pair_risk_mean=learned[valid].mean(),
-
         physical_pair_risk_mean=physical[valid].mean(),
-
         effective_pair_risk_mean=effective[valid].mean(),
-
         violation_fraction=clearance[valid].lt(0.0).to(clearance.dtype).mean(),
-
         old_new_clearance_mean=old_new_mean,
-
         old_new_clearance_min=old_new_min,
-
         old_new_violation_fraction=old_new_violation,
-
         old_old_clearance_mean=old_old_mean,
-
         old_old_clearance_min=old_old_min,
-
         old_old_violation_fraction=old_old_violation,
-
         new_new_clearance_mean=new_new_mean,
-
         new_new_clearance_min=new_new_min,
-
         new_new_violation_fraction=new_new_violation,
-
     )
 
 
+def _targets_local(labels: Tensor, class_ids: Tensor) -> Tensor:
+    matches = labels.unsqueeze(1).eq(class_ids.unsqueeze(0))
+    if not bool(matches.sum(dim=1).eq(1).all()):
+        raise ValueError("labels contain a class outside the requested class IDs")
+    return matches.to(torch.long).argmax(dim=1)
 
 
-
-
-def _historical_old_to_new_boundary_state(
+def _real_new_diagnostics(
     *,
     classifier: CosineClassificationHead,
-    cds: ClassDiscriminativeStructureState,
-    historical_class_count: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Return historical old->new robust clearance and Whole-CDS pair risk.
+    current_features: Tensor,
+    current_labels: Tensor,
+    seen_ids: Tensor,
+    new_ids: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Read-only deployed-head diagnostics on the real current observations."""
+    with torch.no_grad():
+        output = classifier(
+            current_features,
+            class_ids=seen_ids,
+            trainable_class_ids=(),
+        )
+        targets_seen = _targets_local(current_labels, seen_ids)
+        real_new_loss = F.cross_entropy(output.logits, targets_seen)
+        accuracy = output.prediction.eq(current_labels).to(output.logits.dtype).mean()
 
-    Only historical I_Q/V_Q define the robust occupied region. New-class CDS is
-    intentionally not used as classifier supervision because real current HSI
-    is available for the incoming side.
+        new_only = classifier(
+            current_features,
+            class_ids=new_ids,
+            trainable_class_ids=(),
+        )
+        targets_new = _targets_local(current_labels, new_ids)
+        new_only_loss = F.cross_entropy(new_only.logits, targets_new)
+        new_only_accuracy = (
+            new_only.prediction.eq(current_labels).to(output.logits.dtype).mean()
+        )
+    return real_new_loss, accuracy, new_only_loss, new_only_accuracy
+
+
+def _historical_cross_phase_per_class_loss(
+    *,
+    classifier: CosineClassificationHead,
+    seen_cds: ClassDiscriminativeStructureState,
+    historical_class_count: int,
+) -> tuple[Tensor, Tensor]:
+    """Robust positive evidence for historical classes against current rivals only.
+
+    Old-old boundaries are already solved by the previous finalized classifier and are
+    not re-optimized in Stage 3.  Whole-CDS supplies the missing historical positive
+    side of each old/new boundary through I_Q/V_Q, while I_P/V_P enter through the
+    learned/physical rival risk.
     """
-    ids, identity, variation, count, _k, _d = _validate_cds(
-        classifier=classifier, cds=cds
-    )
+    (
+        ids,
+        _margin,
+        _absolute_exposure,
+        _relational_exposure,
+        absolute_clearance,
+        relational_clearance,
+        _clearance,
+        _learned,
+        _physical,
+        _effective,
+        pair_weight,
+        _valid,
+    ) = _boundary_state(classifier=classifier, cds=seen_cds)
     old_count = int(historical_class_count)
+    count = int(ids.numel())
     if old_count <= 0 or old_count >= count:
         raise ValueError("historical_class_count must split old and new seen classes")
 
-    old_ids = ids[:old_count]
-    new_ids = ids[old_count:]
-    eps = torch.finfo(identity.dtype).eps
-
-    # Historical rows are fixed anchors. Incoming rows are the only rows that
-    # the calibration solver is allowed to rotate.
-    old_rows = F.normalize(
-        classifier.class_weight(old_ids).detach(), p=2, dim=1, eps=eps
-    )
-    new_rows = F.normalize(
-        classifier.class_weight(new_ids), p=2, dim=1, eps=eps
-    )
-    boundary = old_rows[:, None, :] - new_rows[None, :, :]
-
-    margin, exposure, clearance = _directed_identity_margin_and_relation_exposure(
-        source_identity=identity[:old_count],
-        source_deformation=variation[:old_count],
-        boundary=boundary,
-    )
-
-    learned_all = cds.relations.learned_combined_proximity.to(
-        device=identity.device, dtype=identity.dtype
+    old_to_new_abs = absolute_clearance[:old_count, old_count:]
+    old_to_new_rel = relational_clearance[:old_count, old_count:]
+    old_to_new_weight = pair_weight[:old_count, old_count:]
+    valid = torch.ones_like(old_to_new_weight, dtype=torch.bool)
+    scale = classifier.logit_scale.to(
+        device=old_to_new_abs.device, dtype=old_to_new_abs.dtype
     ).detach()
-    physical_all = cds.relations.physical_combined_proximity.to(
-        device=identity.device, dtype=identity.dtype
-    ).detach()
-    learned = learned_all[:old_count, old_count:]
-    physical = physical_all[:old_count, old_count:]
-    effective = _effective_pair_risk(learned, physical)
-
-    if not all(
-        bool(torch.isfinite(value).all())
-        for value in (margin, exposure, clearance, learned, physical, effective)
-    ):
-        raise RuntimeError("historical old/new CDS boundary state became NaN or Inf")
-
-    return old_ids, new_ids, clearance, learned, physical, effective
+    per_class = _classwise_robust_loss(
+        absolute_clearance=old_to_new_abs,
+        relational_clearance=old_to_new_rel,
+        pair_weight=old_to_new_weight,
+        valid_mask=valid,
+        scale=scale,
+    )
+    return per_class, pair_weight
 
 
-def _real_current_classifier_state(
+def _current_cross_phase_per_class_loss(
     *,
     classifier: CosineClassificationHead,
     current_features: Tensor,
     current_labels: Tensor,
-    seen_class_ids: Tensor,
-    incoming_class_ids: Tensor,
-    sample_weights: Tensor | None,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Class-balanced real-current all-seen CE, accuracy and true-vs-rival margin."""
-    features = torch.as_tensor(current_features)
-    labels = torch.as_tensor(
-        current_labels, device=features.device, dtype=torch.long
-    ).flatten()
-    seen_ids = torch.as_tensor(
-        seen_class_ids, device=features.device, dtype=torch.long
-    ).flatten()
-    incoming_ids = torch.as_tensor(
-        incoming_class_ids, device=features.device, dtype=torch.long
-    ).flatten()
+    seen_ids: Tensor,
+    old_count: int,
+    pair_weight: Tensor,
+) -> Tensor:
+    """Class-balanced real-current CE over the deployed all-seen classifier.
 
-    if labels.ndim != 1 or labels.numel() != features.size(0):
-        raise ValueError("current_labels must match current_features batch dimension")
-    if not bool(torch.isin(labels, incoming_ids).all()):
-        raise ValueError("classifier calibration may use only current/incoming labels")
+    Current samples are the strongest positive evidence available for incoming
+    classes.  They therefore train exactly the decision rule used at inference:
+    tau*cosine(Q, W) over *all seen classes*.  The loss is averaged within each
+    incoming class before the old/new class-balanced Stage-3 mean, so HSI class
+    frequency does not determine a class's vote.
+
+    ``pair_weight`` is retained in the private signature for compatibility with
+    the historical branch call site, but current real-HSI evidence is not reweighted
+    by CDS; CDS supplies the missing historical positive evidence instead.
+    """
+    del pair_weight
+    count = int(seen_ids.numel())
+    old_count = int(old_count)
+    if old_count <= 0 or old_count >= count:
+        raise ValueError("old_count must split seen_ids")
+    new_ids = seen_ids[old_count:]
+    if current_labels.ndim != 1 or current_features.size(0) != current_labels.numel():
+        raise ValueError("current features/labels are misaligned")
+    if not bool(torch.isin(current_labels, new_ids).all()):
+        raise ValueError("Stage 3 current evidence must contain current labels only")
 
     output = classifier(
-        features,
+        current_features,
         class_ids=seen_ids,
-        trainable_class_ids=incoming_ids,
+        trainable_class_ids=new_ids,
     )
-    matches = labels.unsqueeze(1).eq(output.class_ids.unsqueeze(0))
-    if not bool(matches.sum(dim=1).eq(1).all()):
-        raise RuntimeError("a current label is absent from seen classifier IDs")
-    targets = matches.to(torch.long).argmax(dim=1)
+    targets_seen = _targets_local(current_labels, seen_ids)
+    sample_loss = F.cross_entropy(output.logits, targets_seen, reduction="none")
 
-    per_sample = F.cross_entropy(output.logits, targets, reduction="none")
-    if sample_weights is None:
-        weights = torch.ones_like(per_sample)
-    else:
-        weights = torch.as_tensor(
-            sample_weights, device=per_sample.device, dtype=per_sample.dtype
-        ).flatten()
-        if weights.shape != per_sample.shape:
-            raise ValueError("sample_weights must be [N]")
-        if not bool(torch.isfinite(weights).all()) or bool((weights <= 0).any()):
-            raise ValueError("sample_weights must be finite and positive")
-    loss = (weights * per_sample).sum() / weights.sum().clamp_min(
-        torch.finfo(per_sample.dtype).eps
-    )
-
-    prediction = output.class_ids.index_select(
-        0, output.logits.argmax(dim=1)
-    )
-    accuracy = prediction.eq(labels).to(output.logits.dtype).mean()
-
-    true_logits = output.logits.gather(1, targets[:, None]).squeeze(1)
-    rival_logits = output.logits.masked_fill(
-        F.one_hot(targets, num_classes=output.logits.size(1)).to(torch.bool),
-        -torch.inf,
-    ).max(dim=1).values
-    margin = (weights * (true_logits - rival_logits)).sum() / weights.sum().clamp_min(
-        torch.finfo(weights.dtype).eps
-    )
-
-    if not all(bool(torch.isfinite(v)) for v in (loss, accuracy, margin)):
-        raise RuntimeError("real-current classifier state became NaN or Inf")
-    return loss, accuracy, margin
+    per_class = []
+    for class_id in new_ids:
+        mask = current_labels.eq(class_id)
+        if not bool(mask.any()):
+            raise RuntimeError("Stage 3 current evidence misses a current class")
+        per_class.append(sample_loss[mask].mean())
+    result = torch.stack(per_class)
+    if not bool(torch.isfinite(result).all()):
+        raise RuntimeError("real-current all-seen CE became NaN or Inf")
+    return result
 
 
-def _incoming_calibration_state(
-    *,
-    classifier: CosineClassificationHead,
-    current_features: Tensor,
-    current_labels: Tensor,
-    seen_class_ids: Tensor,
-    incoming_class_ids: Tensor,
-    sample_weights: Tensor | None,
-    cds: ClassDiscriminativeStructureState,
-    historical_class_count: int,
-) -> IncomingClassifierCalibrationState:
-    real_loss, real_accuracy, real_margin = _real_current_classifier_state(
-        classifier=classifier,
-        current_features=current_features,
-        current_labels=current_labels,
-        seen_class_ids=seen_class_ids,
-        incoming_class_ids=incoming_class_ids,
-        sample_weights=sample_weights,
-    )
-    (
-        _old_ids,
-        _new_ids,
-        clearance,
-        learned,
-        physical,
-        effective,
-    ) = _historical_old_to_new_boundary_state(
-        classifier=classifier,
-        cds=cds,
-        historical_class_count=historical_class_count,
-    )
-    negative = F.relu(-clearance)
-    weighted_violation = (
-        (1.0 + effective) * negative
-    ).sum() / (1.0 + effective).sum().clamp_min(
-        torch.finfo(clearance.dtype).eps
-    )
-
-    return IncomingClassifierCalibrationState(
-        real_loss=real_loss,
-        real_accuracy=real_accuracy,
-        real_margin_mean=real_margin,
-        historical_clearance_mean=clearance.mean(),
-        historical_clearance_min=clearance.min(),
-        historical_violation_fraction=clearance.lt(0.0).to(clearance.dtype).mean(),
-        historical_risk_weighted_violation=weighted_violation,
-        learned_pair_risk_mean=learned.mean(),
-        physical_pair_risk_mean=physical.mean(),
-        effective_pair_risk_mean=effective.mean(),
-    )
-
-
-def calibrate_incoming_classifier_with_whole_cds(
+def _balanced_state(
     *,
     classifier: CosineClassificationHead,
     current_features: Tensor,
     current_labels: Tensor,
     seen_cds: ClassDiscriminativeStructureState,
     historical_class_count: int,
-    sample_weights: Tensor | None = None,
-) -> tuple[
-    IncomingClassifierCalibrationState,
-    IncomingClassifierCalibrationState,
-    list[dict[str, float]],
-]:
-    """Calibrate only incoming cosine rows from real current HSI.
+) -> BalancedDecisionAdmissionState:
+    """Balanced cross-phase decision-admission state.
 
-    The optimization objective is class-balanced real-current all-seen CE.
-    Corrected historical Whole-CDS supplies hard pair-wise old->new feasibility
-    constraints.  A historically safe pair may not cross clearance zero; a pair
-    already unsafe at the warm start may not become worse.
-
-    This is a deterministic numerical calibration, not a second epoch schedule:
-    no optimizer state, learning-rate hyperparameter, replay, pseudo-features,
-    prototype classifier or second head is introduced.
+    The final admission rule uses synchronized historical Whole-CDS as the
+    exemplar-free positive evidence for old classes and real current HSI with exact
+    all-seen CE for incoming classes.  Old classifier rows stay fixed; only incoming
+    directions are admitted into the inherited global cosine decision space.
     """
     ids, _identity, _variation, count, _k, _d = _validate_cds(
         classifier=classifier, cds=seen_cds
@@ -953,764 +769,373 @@ def calibrate_incoming_classifier_with_whole_cds(
     old_count = int(historical_class_count)
     if old_count <= 0 or old_count >= count:
         raise ValueError("historical_class_count must split old and new seen classes")
-    old_ids = ids[:old_count]
     new_ids = ids[old_count:]
 
-    features = torch.as_tensor(
-        current_features, device=classifier.weight.device, dtype=classifier.weight.dtype
-    ).detach()
-    labels = torch.as_tensor(
-        current_labels, device=classifier.weight.device, dtype=torch.long
-    ).flatten().detach()
-    weights = (
-        None
-        if sample_weights is None
-        else torch.as_tensor(
-            sample_weights, device=classifier.weight.device, dtype=classifier.weight.dtype
-        ).flatten().detach()
+    historical_per_class, pair_weight = _historical_cross_phase_per_class_loss(
+        classifier=classifier,
+        seen_cds=seen_cds,
+        historical_class_count=old_count,
     )
-    if features.size(0) != labels.numel():
-        raise ValueError("current_features/current_labels size mismatch")
-    if not bool(torch.isin(labels, new_ids).all()):
-        raise ValueError("calibration labels must belong only to incoming classes")
+    current_per_class = _current_cross_phase_per_class_loss(
+        classifier=classifier,
+        current_features=current_features,
+        current_labels=current_labels,
+        seen_ids=ids,
+        old_count=old_count,
+        pair_weight=pair_weight,
+    )
 
-    parameter = classifier.weight
-    if not parameter.requires_grad:
-        raise RuntimeError("classifier.weight must require gradients during calibration")
+    # One vote per class: no old/new loss coefficient and no dependence on class size.
+    balanced = torch.cat((historical_per_class, current_per_class), dim=0).mean()
+    historical_positive = historical_per_class.mean()
+    current_positive = current_per_class.mean()
 
-    old_before = classifier.class_weight(old_ids).detach().clone()
-    scale_before = classifier.logit_scale.detach().clone()
-
-    (
-        _baseline_old,
-        _baseline_new,
-        baseline_clearance,
-        _learned,
-        _physical,
-        effective_risk,
-    ) = _historical_old_to_new_boundary_state(
+    real_new_loss, real_accuracy, new_only_loss, new_only_accuracy = (
+        _real_new_diagnostics(
+            classifier=classifier,
+            current_features=current_features,
+            current_labels=current_labels,
+            seen_ids=ids,
+            new_ids=new_ids,
+        )
+    )
+    cds_objective = whole_cds_class_balanced_classifier_loss(
         classifier=classifier,
         cds=seen_cds,
         historical_class_count=old_count,
     )
-    # Geometric feasibility: safe pairs retain non-negative robust clearance.
-    # Already-unsafe pairs are permitted to improve, but never to deteriorate.
-    threshold = torch.minimum(
-        baseline_clearance.detach(), torch.zeros_like(baseline_clearance)
+    if not all(
+        bool(torch.isfinite(v))
+        for v in (
+            balanced,
+            historical_positive,
+            current_positive,
+            real_new_loss,
+            new_only_loss,
+        )
+    ):
+        raise RuntimeError("cross-phase decision admission produced NaN or Inf")
+
+    return BalancedDecisionAdmissionState(
+        balanced_loss=balanced,
+        historical_positive_loss=historical_positive,
+        current_positive_loss=current_positive,
+        real_new_loss=real_new_loss,
+        real_all_seen_accuracy=real_accuracy,
+        new_only_accuracy=new_only_accuracy,
+        new_only_loss=new_only_loss,
+        historical_per_class_loss=historical_per_class,
+        current_per_class_loss=current_per_class,
+        cds_loss=cds_objective.loss,
+        clearance_mean=cds_objective.clearance_mean,
+        clearance_min=cds_objective.clearance_min,
+        violation_fraction=cds_objective.violation_fraction,
+        old_new_violation_fraction=cds_objective.old_new_violation_fraction,
+        old_old_violation_fraction=cds_objective.old_old_violation_fraction,
+        new_new_violation_fraction=cds_objective.new_new_violation_fraction,
+        learned_pair_risk_mean=cds_objective.learned_pair_risk_mean,
+        physical_pair_risk_mean=cds_objective.physical_pair_risk_mean,
+        effective_pair_risk_mean=cds_objective.effective_pair_risk_mean,
     )
 
-    initial = _incoming_calibration_state(
+
+def _new_tangent_gradient(
+    *,
+    classifier: CosineClassificationHead,
+    new_ids: Tensor,
+) -> tuple[Tensor, Tensor]:
+    gradient = classifier.weight.grad
+    if gradient is None or not bool(torch.isfinite(gradient).all()):
+        raise RuntimeError("Stage-3 classifier gradient is missing or non-finite")
+    eps = torch.finfo(classifier.weight.dtype).eps
+    rows = F.normalize(classifier.class_weight(new_ids).detach(), p=2, dim=1, eps=eps)
+    new_gradient = gradient.index_select(0, new_ids)
+    tangent = new_gradient - (new_gradient * rows).sum(dim=1, keepdim=True) * rows
+    if not bool(torch.isfinite(tangent).all()):
+        raise RuntimeError("Stage-3 incoming-row tangent gradient became NaN or Inf")
+    return rows, tangent
+
+
+def _gradient_observability(
+    *,
+    classifier: CosineClassificationHead,
+    state: BalancedDecisionAdmissionState,
+    old_ids: Tensor,
+    new_ids: Tensor,
+) -> dict[str, float]:
+    """Audit where historical CDS and real-current evidence apply pressure."""
+
+    def group_norm(loss: Tensor, group: Tensor, *, retain_graph: bool) -> float:
+        gradient = torch.autograd.grad(
+            loss, classifier.weight, retain_graph=retain_graph, allow_unused=False
+        )[0]
+        rows = gradient.index_select(0, group)
+        return float(torch.linalg.vector_norm(rows).detach().item())
+
+    return {
+        "historical_cds_to_old_grad_norm": group_norm(
+            state.historical_positive_loss, old_ids, retain_graph=True
+        ),
+        "historical_cds_to_new_grad_norm": group_norm(
+            state.historical_positive_loss, new_ids, retain_graph=True
+        ),
+        "real_new_to_old_grad_norm": group_norm(
+            state.current_positive_loss, old_ids, retain_graph=True
+        ),
+        "real_new_to_new_grad_norm": group_norm(
+            state.current_positive_loss, new_ids, retain_graph=False
+        ),
+    }
+
+
+def balanced_positive_decision_admission(
+    *,
+    classifier: CosineClassificationHead,
+    current_features: Tensor,
+    current_labels: Tensor,
+    seen_cds: ClassDiscriminativeStructureState,
+    historical_class_count: int,
+) -> tuple[
+    BalancedDecisionAdmissionState,
+    BalancedDecisionAdmissionState,
+    list[dict[str, float]],
+]:
+    ids, _identity, _variation, count, _k, _d = _validate_cds(
+        classifier=classifier, cds=seen_cds
+    )
+    old_count = int(historical_class_count)
+    if old_count <= 0 or old_count >= count:
+        raise ValueError("historical_class_count must split old and new seen classes")
+
+    features = torch.as_tensor(
+        current_features,
+        device=classifier.weight.device,
+        dtype=classifier.weight.dtype,
+    ).detach()
+    labels = (
+        torch.as_tensor(
+            current_labels,
+            device=classifier.weight.device,
+            dtype=torch.long,
+        )
+        .flatten()
+        .detach()
+    )
+    old_ids = ids[:old_count]
+    new_ids = ids[old_count:]
+    if features.ndim != 3 or features.size(0) != labels.numel():
+        raise ValueError("current_features must be [N,K,D] aligned with labels")
+    if not bool(torch.isin(labels, new_ids).all()):
+        raise ValueError("Stage 3 accepts real current/new labels only")
+    if not classifier.weight.requires_grad:
+        raise RuntimeError("classifier.weight must require gradients during Stage 3")
+
+    scale_before = classifier.logit_scale_parameter.detach().clone()
+    old_before = classifier.class_weight(old_ids).detach().clone()
+    all_ids = torch.arange(
+        classifier.total_class_count, device=ids.device, dtype=torch.long
+    )
+    future_ids = all_ids[~torch.isin(all_ids, ids)]
+    future_before = (
+        classifier.class_weight(future_ids).detach().clone()
+        if future_ids.numel() > 0
+        else None
+    )
+    eps = torch.finfo(classifier.weight.dtype).eps
+
+    initial = _balanced_state(
         classifier=classifier,
         current_features=features,
         current_labels=labels,
-        seen_class_ids=ids,
-        incoming_class_ids=new_ids,
-        sample_weights=weights,
-        cds=seen_cds,
+        seen_cds=seen_cds,
         historical_class_count=old_count,
     )
-    current = initial
-    trace: list[dict[str, float]] = []
+    observability = _gradient_observability(
+        classifier=classifier,
+        state=initial,
+        old_ids=old_ids,
+        new_ids=new_ids,
+    )
 
-    eps = torch.finfo(parameter.dtype).eps
-    sqrt_eps = float(eps) ** 0.5
-    numeric = 128.0 * float(eps)
-    max_iterations = max(32, 8 * int(new_ids.numel()))
-    max_backtracks = 40
+    dtype_eps = torch.finfo(classifier.weight.dtype).eps
+    gradient_tolerance = max(1.0e-7, 32.0 * dtype_eps)
+    relative_tolerance = max(1.0e-8, 64.0 * dtype_eps)
+    armijo_constant = 1.0e-4
+    backtrack_factor = 0.5
+    max_backtracks = 28
+    max_iterations = 256
+
+    trace: list[dict[str, float]] = []
+    best_value = float(initial.balanced_loss.detach().item())
+    best_rows = classifier.class_weight(new_ids).detach().clone()
+    step_guess = 1.0
 
     for iteration in range(max_iterations):
-        real_loss, _real_acc, _real_margin = _real_current_classifier_state(
+        classifier.weight.grad = None
+        classifier.logit_scale_parameter.grad = None
+        state = _balanced_state(
             classifier=classifier,
             current_features=features,
             current_labels=labels,
-            seen_class_ids=ids,
-            incoming_class_ids=new_ids,
-            sample_weights=weights,
+            seen_cds=seen_cds,
+            historical_class_count=old_count,
         )
-        gradient = torch.autograd.grad(
-            real_loss, parameter, retain_graph=False, allow_unused=False
-        )[0]
-        incoming_gradient = gradient.index_select(0, new_ids)
-        if not bool(torch.isfinite(incoming_gradient).all()):
-            raise RuntimeError("incoming calibration gradient contains NaN or Inf")
+        state.balanced_loss.backward()
 
-        raw_rows = classifier.class_weight(new_ids).detach()
-        row_norm = raw_rows.norm(dim=1, keepdim=True).clamp_min(eps)
-        unit_rows = raw_rows / row_norm
-        tangent = incoming_gradient - (
-            incoming_gradient * unit_rows
-        ).sum(dim=1, keepdim=True) * unit_rows
-        tangent_norm = torch.linalg.vector_norm(tangent)
-        if not bool(torch.isfinite(tangent_norm)):
-            raise RuntimeError("incoming calibration tangent gradient is invalid")
-        if float(tangent_norm.detach().item()) <= sqrt_eps:
+        current_rows, tangent_gradient = _new_tangent_gradient(
+            classifier=classifier, new_ids=new_ids
+        )
+        grad_norm = float(torch.linalg.vector_norm(tangent_gradient).detach().item())
+        current_value = float(state.balanced_loss.detach().item())
+        if grad_norm <= gradient_tolerance:
             break
 
-        direction = tangent / tangent_norm.clamp_min(eps)
-        baseline_loss = float(current.real_loss.detach().item())
-        backup = raw_rows.clone()
+        grad_sq = float(tangent_gradient.square().sum().detach().item())
         accepted = False
         accepted_step = 0.0
-        candidate_state = current
-        step = 1.0
+        candidate = state
+        candidate_value = current_value
+        step_size = step_guess
 
         for _ in range(max_backtracks):
-            candidate_unit = F.normalize(
-                unit_rows - step * direction, p=2, dim=1, eps=eps
-            )
-            candidate_rows = candidate_unit * row_norm
             with torch.no_grad():
+                candidate_rows = F.normalize(
+                    current_rows - step_size * tangent_gradient,
+                    p=2,
+                    dim=1,
+                    eps=eps,
+                )
                 classifier.weight.index_copy_(0, new_ids, candidate_rows)
+                candidate = _balanced_state(
+                    classifier=classifier,
+                    current_features=features,
+                    current_labels=labels,
+                    seen_cds=seen_cds,
+                    historical_class_count=old_count,
+                )
+                candidate_value = float(candidate.balanced_loss.item())
 
-            (
-                _candidate_old,
-                _candidate_new,
-                candidate_clearance,
-                _candidate_learned,
-                _candidate_physical,
-                _candidate_effective,
-            ) = _historical_old_to_new_boundary_state(
-                classifier=classifier,
-                cds=seen_cds,
-                historical_class_count=old_count,
-            )
-            feasible = bool((candidate_clearance >= threshold - numeric).all())
-
-            candidate = _incoming_calibration_state(
-                classifier=classifier,
-                current_features=features,
-                current_labels=labels,
-                seen_class_ids=ids,
-                incoming_class_ids=new_ids,
-                sample_weights=weights,
-                cds=seen_cds,
-                historical_class_count=old_count,
-            )
-            improves_real = (
-                float(candidate.real_loss.detach().item())
-                < baseline_loss - numeric
-            )
-
-            if feasible and improves_real:
+            required = current_value - armijo_constant * step_size * grad_sq
+            if candidate_value <= required:
                 accepted = True
-                accepted_step = step
-                candidate_state = candidate
+                accepted_step = step_size
                 break
 
             with torch.no_grad():
-                classifier.weight.index_copy_(0, new_ids, backup)
-            step *= 0.5
-            if step <= sqrt_eps:
+                classifier.weight.index_copy_(0, new_ids, current_rows)
+            step_size *= backtrack_factor
+            if step_size <= dtype_eps:
                 break
 
         if not accepted:
             with torch.no_grad():
-                classifier.weight.index_copy_(0, new_ids, backup)
+                classifier.weight.index_copy_(0, new_ids, current_rows)
             break
 
-        improvement = baseline_loss - float(candidate_state.real_loss.detach().item())
-        current = candidate_state
+        if candidate_value < best_value:
+            best_value = candidate_value
+            best_rows = classifier.class_weight(new_ids).detach().clone()
 
-        (
-            _trace_old,
-            _trace_new,
-            trace_clearance,
-            _trace_learned,
-            _trace_physical,
-            _trace_effective,
-        ) = _historical_old_to_new_boundary_state(
-            classifier=classifier,
-            cds=seen_cds,
-            historical_class_count=old_count,
+        relative_change = abs(current_value - candidate_value) / max(
+            1.0, abs(current_value)
         )
-        slack = trace_clearance - threshold
-        # Risk-weighted slack is diagnostic evidence of where spectral/learned
-        # confusability consumes historical safety. It does not invent a margin.
-        risk_weighted_slack = (
-            (1.0 + effective_risk) * slack
-        ).sum() / (1.0 + effective_risk).sum().clamp_min(eps)
-
         trace.append(
             {
                 "iteration": float(iteration + 1),
-                "step": float(accepted_step),
-                "real_loss": float(current.real_loss.detach().item()),
-                "real_accuracy": float(current.real_accuracy.detach().item()),
-                "real_margin_mean": float(current.real_margin_mean.detach().item()),
-                "historical_clearance_mean": float(
-                    current.historical_clearance_mean.detach().item()
+                "balanced_loss": candidate_value,
+                "historical_positive_loss": float(
+                    candidate.historical_positive_loss.detach().item()
                 ),
-                "historical_clearance_min": float(
-                    current.historical_clearance_min.detach().item()
+                "current_positive_loss": float(
+                    candidate.current_positive_loss.detach().item()
                 ),
-                "historical_violation_fraction": float(
-                    current.historical_violation_fraction.detach().item()
+                "real_new_loss": float(candidate.real_new_loss.detach().item()),
+                "real_all_seen_accuracy": float(
+                    candidate.real_all_seen_accuracy.detach().item()
                 ),
-                "historical_risk_weighted_violation": float(
-                    current.historical_risk_weighted_violation.detach().item()
+                "new_only_loss": float(candidate.new_only_loss.detach().item()),
+                "new_only_accuracy": float(candidate.new_only_accuracy.detach().item()),
+                "old_new_violation_fraction": float(
+                    candidate.old_new_violation_fraction.detach().item()
                 ),
-                "risk_weighted_feasibility_slack": float(
-                    risk_weighted_slack.detach().item()
-                ),
+                "tangent_grad_norm": grad_norm,
+                "accepted_step": accepted_step,
+                "relative_loss_change": relative_change,
+                **(observability if iteration == 0 else {}),
             }
         )
 
-        if improvement <= sqrt_eps * max(1.0, abs(baseline_loss)):
+        step_guess = min(1.0, accepted_step / backtrack_factor)
+        if relative_change <= relative_tolerance:
             break
 
-    final = _incoming_calibration_state(
+    with torch.no_grad():
+        classifier.weight.index_copy_(0, new_ids, best_rows)
+
+    final = _balanced_state(
         classifier=classifier,
         current_features=features,
         current_labels=labels,
-        seen_class_ids=ids,
-        incoming_class_ids=new_ids,
-        sample_weights=weights,
-        cds=seen_cds,
+        seen_cds=seen_cds,
         historical_class_count=old_count,
     )
-    (
-        _final_old,
-        _final_new,
-        final_clearance,
-        _final_learned,
-        _final_physical,
-        _final_effective,
-    ) = _historical_old_to_new_boundary_state(
-        classifier=classifier,
-        cds=seen_cds,
-        historical_class_count=old_count,
-    )
-
-    if float(final.real_loss.detach().item()) > float(initial.real_loss.detach().item()) + numeric:
-        raise RuntimeError("incoming calibration increased real-current all-seen CE")
-    if not bool((final_clearance >= threshold - numeric).all()):
-        raise RuntimeError("incoming calibration violated historical pair-wise CDS safety")
-    if not torch.equal(classifier.class_weight(old_ids).detach(), old_before):
-        raise RuntimeError("incoming calibration changed a historical classifier row")
-    if not torch.equal(classifier.logit_scale.detach(), scale_before):
-        raise RuntimeError("incoming calibration changed cosine logit scale")
-
-    return initial, final, trace
-
-
-def reconstruct_classifier_from_whole_cds(
-
-    *,
-
-    classifier: CosineClassificationHead,
-
-    cds: ClassDiscriminativeStructureState,
-
-    historical_class_count: int,
-
-) -> tuple[WholeCDSClassBalancedObjective, WholeCDSClassBalancedObjective, list[dict[str, float]]]:
-
-    """Deterministically reconstruct the existing seen-class cosine rows from final Whole-CDS.
-
-
-
-    This is a numerical projection, not a second training schedule.  The already-trained
-
-    classifier is the warm start.  The final all-seen CDS supplies the *only* objective:
-
-    I_Q/V_Q define robust directed clearance and learned/physical inter-class relations
-
-    weight the dangerous boundaries.  All seen rows are projected together; future rows
-
-    are never referenced or changed.  Backtracking accepts only monotonic improvements,
-
-    so the operation cannot silently worsen the structural reconstruction objective.
-
-
-
-    No exemplar, pseudo-feature, prototype-only carrier, extra network, optimizer state,
-
-    user-facing epoch count, or learning-rate hyperparameter is introduced.
-
-    """
-
-    ids, _identity, _variation, count, _k, _d = _validate_cds(
-
-        classifier=classifier, cds=cds
-
-    )
-
-    old_count = int(historical_class_count)
-
-    if old_count <= 0 or old_count >= count:
-
-        raise ValueError("historical_class_count must split old and new seen classes")
-
-
-
-    weight = classifier.weight
-
-    if not weight.requires_grad:
-
-        raise RuntimeError("classifier.weight must require gradients during reconstruction")
-
-    eps = torch.finfo(weight.dtype).eps
-
-    sqrt_eps = float(eps) ** 0.5
-
-    seen_before = classifier.class_weight(ids).detach().clone()
-
-    scale_before = classifier.logit_scale.detach().clone()
-
-
-
-    initial = whole_cds_class_balanced_classifier_loss(
-
-        classifier=classifier, cds=cds, historical_class_count=old_count
-
-    )
-
-    current = initial
-
-    trace: list[dict[str, float]] = []
-
-
-
-    # These are numerical safety bounds, not method hyperparameters.  Convergence is
-
-    # controlled by monotonic objective decrease and machine precision.
-
-    max_iterations = max(16, 4 * count)
-
-    max_backtracks = 32
-
-
-
-    for iteration in range(max_iterations):
-
-        gradient = torch.autograd.grad(
-
-            current.loss, classifier.weight, retain_graph=False, allow_unused=False
-
-        )[0]
-
-        seen_gradient = gradient.index_select(0, ids)
-
-        if not bool(torch.isfinite(seen_gradient).all()):
-
-            raise RuntimeError("Whole-CDS reconstruction gradient contains NaN or Inf")
-
-
-
-        raw_rows = classifier.class_weight(ids).detach()
-
-        row_norm = raw_rows.norm(dim=1, keepdim=True).clamp_min(eps)
-
-        unit_rows = raw_rows / row_norm
-
-
-
-        # The deployed head normalizes W, so only tangent-space rotation matters.
-
-        tangent = seen_gradient - (seen_gradient * unit_rows).sum(dim=1, keepdim=True) * unit_rows
-
-        tangent_norm = torch.linalg.vector_norm(tangent)
-
-        if not bool(torch.isfinite(tangent_norm)):
-
-            raise RuntimeError("Whole-CDS reconstruction tangent gradient is invalid")
-
-        if float(tangent_norm.detach().item()) <= sqrt_eps:
-
-            break
-
-        direction = tangent / tangent_norm.clamp_min(eps)
-
-
-
-        baseline_loss = float(current.loss.detach().item())
-
-        baseline_clearance = float(current.old_new_clearance_mean.detach().item())
-
-        baseline_violation = float(current.old_new_violation_fraction.detach().item())
-
-        baseline_all_violation = float(current.violation_fraction.detach().item())
-
-        baseline_old_old_violation = float(current.old_old_violation_fraction.detach().item())
-
-        baseline_new_new_violation = float(current.new_new_violation_fraction.detach().item())
-
-        backup = raw_rows.clone()
-
-        accepted = False
-
-        accepted_step = 0.0
-
-        candidate_objective = current
-
-        step = 1.0
-
-
-
-        for _ in range(max_backtracks):
-
-            candidate_unit = F.normalize(unit_rows - step * direction, p=2, dim=1, eps=eps)
-
-            candidate_rows = candidate_unit * row_norm
-
-            with torch.no_grad():
-
-                classifier.weight.index_copy_(0, ids, candidate_rows)
-
-
-
-            candidate = whole_cds_class_balanced_classifier_loss(
-
-                classifier=classifier, cds=cds, historical_class_count=old_count
-
-            )
-
-            candidate_loss = float(candidate.loss.detach().item())
-
-            candidate_clearance = float(candidate.old_new_clearance_mean.detach().item())
-
-            candidate_violation = float(candidate.old_new_violation_fraction.detach().item())
-
-            candidate_all_violation = float(candidate.violation_fraction.detach().item())
-
-            candidate_old_old_violation = float(candidate.old_old_violation_fraction.detach().item())
-
-            candidate_new_new_violation = float(candidate.new_new_violation_fraction.detach().item())
-
-
-
-            numeric = 64.0 * float(eps)
-
-            improves_loss = candidate_loss < baseline_loss - numeric
-
-            preserves_cross = candidate_clearance >= baseline_clearance - numeric
-
-            preserves_cross_viol = candidate_violation <= baseline_violation + numeric
-
-            preserves_all_viol = candidate_all_violation <= baseline_all_violation + numeric
-
-            preserves_old_old = candidate_old_old_violation <= baseline_old_old_violation + numeric
-
-            preserves_new_new = candidate_new_new_violation <= baseline_new_new_violation + numeric
-
-            if (
-
-                improves_loss
-
-                and preserves_cross
-
-                and preserves_cross_viol
-
-                and preserves_all_viol
-
-                and preserves_old_old
-
-                and preserves_new_new
-
-            ):
-
-                accepted = True
-
-                accepted_step = step
-
-                candidate_objective = candidate
-
-                break
-
-
-
-            with torch.no_grad():
-
-                classifier.weight.index_copy_(0, ids, backup)
-
-            step *= 0.5
-
-            if step <= sqrt_eps:
-
-                break
-
-
-
-        if not accepted:
-
-            with torch.no_grad():
-
-                classifier.weight.index_copy_(0, ids, backup)
-
-            break
-
-
-
-        improvement = baseline_loss - float(candidate_objective.loss.detach().item())
-
-        current = candidate_objective
-
-        trace.append({
-
-            "iteration": float(iteration + 1),
-
-            "step": float(accepted_step),
-
-            "loss": float(current.loss.detach().item()),
-
-            "clearance_mean": float(current.clearance_mean.detach().item()),
-
-            "clearance_min": float(current.clearance_min.detach().item()),
-
-            "violation_fraction": float(current.violation_fraction.detach().item()),
-
-            "old_new_clearance_mean": float(current.old_new_clearance_mean.detach().item()),
-
-            "old_new_violation_fraction": float(current.old_new_violation_fraction.detach().item()),
-
-            "old_old_violation_fraction": float(current.old_old_violation_fraction.detach().item()),
-
-            "new_new_violation_fraction": float(current.new_new_violation_fraction.detach().item()),
-
-        })
-
-
-
-        scale = max(1.0, abs(baseline_loss))
-
-        if improvement <= sqrt_eps * scale:
-
-            break
-
-
-
-    final = whole_cds_class_balanced_classifier_loss(
-
-        classifier=classifier, cds=cds, historical_class_count=old_count
-
-    )
-
-    if float(final.loss.detach().item()) > float(initial.loss.detach().item()) + 64.0 * float(eps):
-
-        raise RuntimeError("Whole-CDS reconstruction increased its structural objective")
-
-    if float(final.old_new_violation_fraction.detach().item()) > (
-
-        float(initial.old_new_violation_fraction.detach().item()) + 64.0 * float(eps)
-
+    if (
+        float(final.balanced_loss.detach().item())
+        > float(initial.balanced_loss.detach().item()) + 64.0 * dtype_eps
     ):
+        raise RuntimeError("Stage-3 cross-phase admission objective increased")
+    if not torch.equal(classifier.class_weight(old_ids).detach(), old_before):
+        raise RuntimeError("Stage 3 changed finalized historical classifier rows")
+    if future_before is not None and not torch.equal(
+        classifier.class_weight(future_ids).detach(), future_before
+    ):
+        raise RuntimeError("Stage 3 changed future classifier rows")
+    if not torch.equal(classifier.logit_scale_parameter.detach(), scale_before):
+        raise RuntimeError("Stage 3 changed the global cosine logit scale")
 
-        raise RuntimeError("Whole-CDS reconstruction increased old/new structural violations")
+    with torch.no_grad():
+        final_norms = classifier.class_weight(new_ids).norm(dim=1)
+        if not torch.allclose(
+            final_norms, torch.ones_like(final_norms), rtol=0.0, atol=64.0 * dtype_eps
+        ):
+            raise RuntimeError("Stage 3 left incoming cosine rows off the unit sphere")
 
-    if not torch.equal(classifier.logit_scale.detach(), scale_before):
-
-        raise RuntimeError("Whole-CDS reconstruction changed cosine logit scale")
-
-
-
-    seen_after = classifier.class_weight(ids).detach()
-
-    if not bool(torch.isfinite(seen_after).all()):
-
-        raise RuntimeError("Whole-CDS reconstruction produced invalid classifier rows")
-
-    # A successful reconstruction may leave the warm start unchanged when it is
-
-    # already structurally stationary; this is intentional and not an error.
-
-    _ = seen_before
+    if not trace:
+        trace.append(
+            {
+                "iteration": 0.0,
+                "balanced_loss": float(final.balanced_loss.detach().item()),
+                "historical_positive_loss": float(
+                    final.historical_positive_loss.detach().item()
+                ),
+                "current_positive_loss": float(
+                    final.current_positive_loss.detach().item()
+                ),
+                "real_new_loss": float(final.real_new_loss.detach().item()),
+                "real_all_seen_accuracy": float(
+                    final.real_all_seen_accuracy.detach().item()
+                ),
+                "new_only_loss": float(final.new_only_loss.detach().item()),
+                "new_only_accuracy": float(final.new_only_accuracy.detach().item()),
+                "old_new_violation_fraction": float(
+                    final.old_new_violation_fraction.detach().item()
+                ),
+                "tangent_grad_norm": 0.0,
+                "accepted_step": 0.0,
+                "relative_loss_change": 0.0,
+                **observability,
+            }
+        )
 
     return initial, final, trace
-
-
-
-
-
-class HSICDSDecisionRegionRegulator(nn.Module):
-
-    """Compatibility wrapper around finalized all-seen Whole-CDS boundary loss.
-
-
-
-    Previous classifier directions are intentionally *not* used as a penalty:
-
-    they belong to the previous Q coordinate. Historical retention is supplied by
-
-    the corrected historical CDS in the current coordinate, avoiding the stale-W
-
-    coordinate inconsistency that the finalization stage is meant to repair.
-
-    """
-
-
-
-    def __init__(self) -> None:
-
-        super().__init__()
-
-
-
-    @property
-
-    def parameter_count(self) -> int:
-
-        return 0
-
-
-
-    def forward(
-
-        self,
-
-        *,
-
-        classifier: CosineClassificationHead,
-
-        seen_cds: ClassDiscriminativeStructureState,
-
-        historical_class_count: int,
-
-        reference_classifier: CosineClassificationHead | None = None,
-
-        reference_historical_cds: ClassDiscriminativeStructureState | None = None,
-
-        trainable_class_ids: Tensor | None = None,
-
-    ) -> WholeCDSClassifierProtectionObjective:
-
-        del reference_classifier, reference_historical_cds
-
-        old_count = int(historical_class_count)
-
-        objective = whole_cds_class_balanced_classifier_loss(
-
-            classifier=classifier,
-
-            cds=seen_cds,
-
-            historical_class_count=old_count,
-
-            trainable_class_ids=trainable_class_ids,
-
-        )
-
-        (
-
-            ids, margin, exposure, clearance, learned, physical,
-
-            effective, pair_weight, valid,
-
-        ) = _boundary_state(classifier=classifier, cds=seen_cds)
-
-        count = int(ids.numel())
-
-        new_count = count - old_count
-
-        if old_count <= 0 or new_count <= 0:
-
-            raise ValueError("historical_class_count must split old and new seen classes")
-
-
-
-        old_rows = slice(0, old_count)
-
-        new_rows = slice(old_count, count)
-
-        cross_old = clearance[old_rows, new_rows]
-
-        cross_new = clearance[new_rows, old_rows]
-
-        cross_margin_old = margin[old_rows, new_rows]
-
-        cross_margin_new = margin[new_rows, old_rows]
-
-        cross_exposure_old = exposure[old_rows, new_rows]
-
-        cross_exposure_new = exposure[new_rows, old_rows]
-
-        old_old_mask = ~torch.eye(old_count, device=clearance.device, dtype=torch.bool)
-
-        old_internal = clearance[old_rows, old_rows][old_old_mask]
-
-        zero = clearance.sum() * 0.0
-
-
-
-        old_loss = objective.per_class_loss[:old_count].mean()
-
-        new_loss = objective.per_class_loss[old_count:].mean()
-
-        cross_weight = pair_weight[old_rows, new_rows]
-
-        cross_violation = torch.cat((cross_old.reshape(-1), cross_new.reshape(-1)))
-
-        old_new_violation_mean = (
-
-            cross_weight * F.relu(-cross_old)
-
-        ).sum() / cross_weight.sum().clamp_min(torch.finfo(clearance.dtype).eps)
-
-
-
-        return WholeCDSClassifierProtectionObjective(
-            loss=objective.loss,
-            global_reconstruction_loss=objective.loss,
-            old_class_reconstruction_loss=old_loss,
-            new_class_reconstruction_loss=new_loss,
-            old_old_retention_loss=zero,
-            historical_identity_margin_mean=cross_margin_old.mean(),
-            historical_identity_margin_min=cross_margin_old.min(),
-            historical_deformation_exposure_mean=cross_exposure_old.mean(),
-            historical_structural_clearance_mean=cross_old.mean(),
-            historical_structural_clearance_min=cross_old.min(),
-
-            current_identity_margin_mean=cross_margin_new.mean(),
-            current_identity_margin_min=cross_margin_new.min(),
-            current_deformation_exposure_mean=cross_exposure_new.mean(),
-            current_structural_clearance_mean=cross_new.mean(),
-            current_structural_clearance_min=cross_new.min(),
-            historical_internal_clearance_mean=old_internal.mean(),
-            historical_internal_clearance_min=old_internal.min(),
-            historical_internal_retention_mean=zero,
-            historical_internal_retention_min=zero,
-            historical_internal_violation_fraction=objective.old_old_violation_fraction,
-            joint_structural_clearance_mean=objective.clearance_mean,
-            joint_structural_clearance_min=objective.clearance_min,
-            unsafe_pair_fraction=objective.violation_fraction,
-            pair_weight_mean=pair_weight[valid].mean(),
-            learned_pair_risk_mean=learned[valid].mean(),
-            physical_pair_risk_mean=physical[valid].mean(),
-            effective_pair_risk_mean=effective[valid].mean(),
-            old_new_structural_violation_mean=old_new_violation_mean,
-            old_new_violation_fraction=cross_violation.lt(0.0).to(clearance.dtype).mean(),
-            reference_clearance_mean=zero,
-            reference_clearance_min=zero,
-            reference_retention_mean=zero,
-            reference_retention_min=zero,
-            reference_violation_fraction=zero,
-
-        )
-
-
-
 
 
 __all__ = [
-
-    "WholeCDSClassifierProtectionObjective",
     "WholeCDSClassBalancedObjective",
-    "IncomingClassifierCalibrationState",
+    "BalancedDecisionAdmissionState",
     "whole_cds_class_balanced_classifier_loss",
-    "calibrate_incoming_classifier_with_whole_cds",
-    "reconstruct_classifier_from_whole_cds",
-    "HSICDSDecisionRegionRegulator",
-
+    "balanced_positive_decision_admission",
 ]
-
-
-
-
-
-
-
-
-
-
 
 
 # from __future__ import annotations

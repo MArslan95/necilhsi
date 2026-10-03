@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-"""Read-only evaluation for the Whole-CDS NECIL-HSI decision rule."""
-
 from contextlib import contextmanager
 import math
 from numbers import Integral, Real
@@ -71,7 +68,11 @@ def _unpack(
         batch["raw_center_spectrum"], device=device, dtype=model.dtype
     )
     raw_labels = torch.as_tensor(batch["label"])
-    if raw_labels.dtype == torch.bool or raw_labels.is_complex() or torch.is_floating_point(raw_labels):
+    if (
+        raw_labels.dtype == torch.bool
+        or raw_labels.is_complex()
+        or torch.is_floating_point(raw_labels)
+    ):
         raise RuntimeError("evaluation labels must use an integer dtype")
     labels = raw_labels.to(device=device, dtype=torch.long).flatten()
     if labels.shape != (patch.size(0),):
@@ -79,7 +80,9 @@ def _unpack(
     return patch, spectrum, labels
 
 
-def _confusion(targets: np.ndarray, predictions: np.ndarray, ids: Sequence[int]) -> np.ndarray:
+def _confusion(
+    targets: np.ndarray, predictions: np.ndarray, ids: Sequence[int]
+) -> np.ndarray:
     index = {class_id: row for row, class_id in enumerate(ids)}
     matrix = np.zeros((len(ids), len(ids)), dtype=np.int64)
     for target, prediction in zip(targets.tolist(), predictions.tolist()):
@@ -96,7 +99,11 @@ def _kappa(matrix: np.ndarray) -> float:
     observed = float(np.trace(matrix)) / total
     expected = float((matrix.sum(axis=1) * matrix.sum(axis=0)).sum()) / (total * total)
     denominator = 1.0 - expected
-    return 0.0 if abs(denominator) <= np.finfo(np.float64).eps else (observed - expected) / denominator
+    return (
+        0.0
+        if abs(denominator) <= np.finfo(np.float64).eps
+        else (observed - expected) / denominator
+    )
 
 
 @torch.no_grad()
@@ -110,7 +117,11 @@ def evaluate_loader(
     decision_cds: ClassDiscriminativeStructureState | None = None,
 ) -> Dict[str, Any]:
     ids = _class_ids(class_ids)
-    target_ids = ids if target_class_ids is None else _class_ids(target_class_ids, name="target_class_ids")
+    target_ids = (
+        ids
+        if target_class_ids is None
+        else _class_ids(target_class_ids, name="target_class_ids")
+    )
     if set(target_ids) - set(ids):
         raise ValueError("target_class_ids must be a subset of class_ids")
 
@@ -133,9 +144,13 @@ def evaluate_loader(
 
     with _temporary_eval_state(model):
         for batch in loader:
-            patch, spectrum, labels = _unpack(batch, model=model, device=evaluation_device)
+            patch, spectrum, labels = _unpack(
+                batch, model=model, device=evaluation_device
+            )
             if not bool(torch.isin(labels, allowed).all()):
-                raise RuntimeError("evaluation loader contains a class outside class_ids")
+                raise RuntimeError(
+                    "evaluation loader contains a class outside class_ids"
+                )
             q = model.extract_features(
                 patch,
                 center_spectrum=spectrum,
@@ -224,8 +239,12 @@ def evaluate_loader(
             prediction[class_mask].eq(labels[class_mask]).float().mean().item()
         )
         per_class_margin[class_id] = float(margin[class_mask].mean().item())
-        per_class_energy_margin[class_id] = float(energy_margin[class_mask].mean().item())
-        per_class_raw_energy_margin[class_id] = float(raw_energy_margin[class_mask].mean().item())
+        per_class_energy_margin[class_id] = float(
+            energy_margin[class_mask].mean().item()
+        )
+        per_class_raw_energy_margin[class_id] = float(
+            raw_energy_margin[class_mask].mean().item()
+        )
         per_class_support[class_id] = float(target_whole[class_mask].mean().item())
 
     confusion = _confusion(labels.cpu().numpy(), prediction.cpu().numpy(), ids)
@@ -250,7 +269,9 @@ def evaluate_loader(
         "mean_energy_margin": float(energy_margin.mean().item()),
         "energy_violation_fraction": float(energy_margin.le(0).float().mean().item()),
         "mean_raw_energy_margin": float(raw_energy_margin.mean().item()),
-        "raw_energy_violation_fraction": float(raw_energy_margin.le(0).float().mean().item()),
+        "raw_energy_violation_fraction": float(
+            raw_energy_margin.le(0).float().mean().item()
+        ),
         "mean_target_probability": float(target_probability.mean().item()),
         "mean_target_learned_support": float(target_learned.mean().item()),
         "mean_target_physical_support": float(target_physical.mean().item()),
@@ -260,12 +281,19 @@ def evaluate_loader(
     }
 
 
-def summarize_evaluation_metrics(metrics: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+def summarize_evaluation_metrics(
+    metrics: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
     if metrics is None:
         return None
     required = (
-        "overall_accuracy", "balanced_accuracy", "minimum_class_accuracy", "kappa",
-        "mean_logit_margin", "mean_energy_margin", "energy_violation_fraction",
+        "overall_accuracy",
+        "balanced_accuracy",
+        "minimum_class_accuracy",
+        "kappa",
+        "mean_logit_margin",
+        "mean_energy_margin",
+        "energy_violation_fraction",
         "mean_target_probability",
     )
     missing = [name for name in required if name not in metrics]
@@ -279,8 +307,14 @@ def summarize_evaluation_metrics(metrics: Optional[Mapping[str, Any]]) -> Option
         "logit_margin": float(metrics["mean_logit_margin"]),
         "energy_margin": float(metrics["mean_energy_margin"]),
         "energy_violation_fraction": float(metrics["energy_violation_fraction"]),
-        "raw_energy_margin": float(metrics.get("mean_raw_energy_margin", metrics["mean_energy_margin"])),
-        "raw_energy_violation_fraction": float(metrics.get("raw_energy_violation_fraction", metrics["energy_violation_fraction"])),
+        "raw_energy_margin": float(
+            metrics.get("mean_raw_energy_margin", metrics["mean_energy_margin"])
+        ),
+        "raw_energy_violation_fraction": float(
+            metrics.get(
+                "raw_energy_violation_fraction", metrics["energy_violation_fraction"]
+            )
+        ),
         "target_probability": float(metrics["mean_target_probability"]),
         "learned_support": float(metrics.get("mean_target_learned_support", 0.0)),
         "physical_support": float(metrics.get("mean_target_physical_support", 0.0)),
@@ -293,7 +327,9 @@ def _ordered_variation_statistics(variation: Tensor) -> tuple[Tensor, Tensor]:
     if value.ndim != 4 or value.size(1) != value.size(2):
         raise ValueError("variation must be [C,L,L,F]")
     class_count, length, _, feature_count = value.shape
-    upper = torch.triu(torch.ones(length, length, device=value.device, dtype=torch.bool), diagonal=1)
+    upper = torch.triu(
+        torch.ones(length, length, device=value.device, dtype=torch.bool), diagonal=1
+    )
     pairs = value[:, upper, :].reshape(class_count, -1, feature_count)
     active = pairs.gt(0).to(value.dtype).mean(dim=1)
     positive_sum = pairs.sum(dim=1)
@@ -317,15 +353,21 @@ def class_structure_diagnostics(
     cds = bank.build_cds(structure)
     relations = cds.relations
     class_count = len(ids)
-    offdiag = ~torch.eye(class_count, device=structure.learned_identity.device, dtype=torch.bool)
+    offdiag = ~torch.eye(
+        class_count, device=structure.learned_identity.device, dtype=torch.bool
+    )
 
     learned_identity = relations.learned_identity_proximity_by_region.mean(dim=2)
     learned_relation = relations.learned_relation_proximity
     physical_identity = relations.physical_identity_proximity_by_band.mean(dim=2)
     physical_relation = relations.physical_relation_proximity
     physical_combined = relations.physical_combined_proximity
-    learned_active, learned_spread = _ordered_variation_statistics(structure.learned_variation)
-    physical_active, physical_spread = _ordered_variation_statistics(structure.physical_variation)
+    learned_active, learned_spread = _ordered_variation_statistics(
+        structure.learned_variation
+    )
+    physical_active, physical_spread = _ordered_variation_statistics(
+        structure.physical_variation
+    )
 
     def offdiag_mean(matrix: Tensor) -> float:
         return float(matrix[offdiag].mean().item()) if bool(offdiag.any()) else 1.0
@@ -343,18 +385,48 @@ def class_structure_diagnostics(
     names = list(target_names or [])
     classes = []
     for position, class_id in enumerate(ids):
-        classes.append({
-            "class_id": class_id,
-            "class_name": str(names[class_id]) if class_id < len(names) else f"Class {class_id + 1}",
-            "learned_identity_norm": float(torch.linalg.vector_norm(structure.learned_identity[position]).item()),
-            "learned_variation_norm": float(torch.linalg.vector_norm(structure.learned_variation[position]).item()),
-            "physical_identity_norm": float(torch.linalg.vector_norm(structure.physical_identity[position]).item()),
-            "physical_variation_norm": float(torch.linalg.vector_norm(structure.physical_variation[position]).item()),
-            "learned_active_relation_fraction": float(learned_active[position].mean().item()),
-            "learned_positive_relation_scale": float(learned_spread[position].mean().item()),
-            "physical_active_relation_fraction": float(physical_active[position].mean().item()),
-            "physical_positive_relation_scale": float(physical_spread[position].mean().item()),
-        })
+        classes.append(
+            {
+                "class_id": class_id,
+                "class_name": (
+                    str(names[class_id])
+                    if class_id < len(names)
+                    else f"Class {class_id + 1}"
+                ),
+                "learned_identity_norm": float(
+                    torch.linalg.vector_norm(
+                        structure.learned_identity[position]
+                    ).item()
+                ),
+                "learned_variation_norm": float(
+                    torch.linalg.vector_norm(
+                        structure.learned_variation[position]
+                    ).item()
+                ),
+                "physical_identity_norm": float(
+                    torch.linalg.vector_norm(
+                        structure.physical_identity[position]
+                    ).item()
+                ),
+                "physical_variation_norm": float(
+                    torch.linalg.vector_norm(
+                        structure.physical_variation[position]
+                    ).item()
+                ),
+                "learned_active_relation_fraction": float(
+                    learned_active[position].mean().item()
+                ),
+                "learned_positive_relation_scale": float(
+                    learned_spread[position].mean().item()
+                ),
+                "physical_active_relation_fraction": float(
+                    physical_active[position].mean().item()
+                ),
+                "physical_positive_relation_scale": float(
+                    physical_spread[position].mean().item()
+                ),
+            }
+        )
 
     return {
         "class_ids": ids,
@@ -369,7 +441,9 @@ def class_structure_diagnostics(
 
 
 @torch.no_grad()
-def structural_decision_diagnostics(model: Any, class_ids: Sequence[int]) -> Dict[str, Any]:
+def structural_decision_diagnostics(
+    model: Any, class_ids: Sequence[int]
+) -> Dict[str, Any]:
     ids = _class_ids(class_ids)
     structure = model.structure_bank.class_structures(ids)
     learned_variation = ordered_variation_operator(structure.learned_variation)
@@ -377,10 +451,15 @@ def structural_decision_diagnostics(model: Any, class_ids: Sequence[int]) -> Dic
     return {
         "class_ids": ids,
         "classifier_parameter_count": int(model.classifier.parameter_count),
-        "classifier_rule": "single all-seen bias-free cosine classifier over Q; Whole-CDS reconstructs/protects it during training and is read-only diagnostic evidence at evaluation",
+        "classifier_rule": "single cosine classifier over Q; inference is tau*cosine(Q,W); Whole-CDS is training-time structural supervision and read-only evaluation evidence",
         "classifier_logit_scale": float(model.classifier.logit_scale.detach().item()),
+        "classifier_beta": 0.0,
         "mean_learned_relation_variation_norm": float(
-            torch.linalg.vector_norm(learned_variation.reshape(learned_variation.size(0), -1), dim=1).mean().item()
+            torch.linalg.vector_norm(
+                learned_variation.reshape(learned_variation.size(0), -1), dim=1
+            )
+            .mean()
+            .item()
         ),
         "mean_active_ordered_relation_fraction": float(active.mean().item()),
         "mean_positive_ordered_relation_scale": float(spread.mean().item()),
@@ -411,7 +490,9 @@ def cross_phase_cds_decision_diagnostics(
 
     output = model.classifier(
         structure.learned_identity.to(device=model.device, dtype=model.dtype),
-        physical_spectral_evidence=structure.physical_identity.to(device=model.device, dtype=model.dtype),
+        physical_spectral_evidence=structure.physical_identity.to(
+            device=model.device, dtype=model.dtype
+        ),
         class_ids=structure.class_ids.to(device=model.device),
         cds=cds,
         trainable_class_ids=(),
@@ -447,11 +528,21 @@ def _mapping_value(mapping: Mapping[Any, Any] | None, class_id: int) -> float:
     raise KeyError(class_id)
 
 
-def summarize_class_group(metrics: Mapping[str, Any], class_ids: Sequence[int]) -> Dict[str, Any]:
+def summarize_class_group(
+    metrics: Mapping[str, Any], class_ids: Sequence[int]
+) -> Dict[str, Any]:
     ids = _class_ids(class_ids)
-    accuracies = [_mapping_value(metrics.get("per_class_accuracy"), class_id) for class_id in ids]
-    margins = [_mapping_value(metrics.get("per_class_mean_logit_margin"), class_id) for class_id in ids]
-    energy_margins = [_mapping_value(metrics.get("per_class_mean_energy_margin"), class_id) for class_id in ids]
+    accuracies = [
+        _mapping_value(metrics.get("per_class_accuracy"), class_id) for class_id in ids
+    ]
+    margins = [
+        _mapping_value(metrics.get("per_class_mean_logit_margin"), class_id)
+        for class_id in ids
+    ]
+    energy_margins = [
+        _mapping_value(metrics.get("per_class_mean_energy_margin"), class_id)
+        for class_id in ids
+    ]
     return {
         "class_ids": ids,
         "balanced_accuracy": float(sum(accuracies) / len(accuracies)),
@@ -486,7 +577,9 @@ def phase_origin_confusion_diagnostics(
     phases = sorted(int(phase) for phase in phase_to_classes)
     result: Dict[str, Any] = {}
     for true_phase in phases:
-        true_ids = [int(value) for value in phase_to_classes[true_phase] if int(value) in index]
+        true_ids = [
+            int(value) for value in phase_to_classes[true_phase] if int(value) in index
+        ]
         if not true_ids:
             continue
         rows = [index[value] for value in true_ids]
@@ -494,11 +587,15 @@ def phase_origin_confusion_diagnostics(
         row: Dict[str, float] = {}
         for predicted_phase in phases:
             predicted_ids = [
-                int(value) for value in phase_to_classes[predicted_phase] if int(value) in index
+                int(value)
+                for value in phase_to_classes[predicted_phase]
+                if int(value) in index
             ]
             columns = [index[value] for value in predicted_ids]
             count = int(matrix[np.ix_(rows, columns)].sum()) if columns else 0
-            row[str(predicted_phase)] = 0.0 if row_total == 0 else count / float(row_total)
+            row[str(predicted_phase)] = (
+                0.0 if row_total == 0 else count / float(row_total)
+            )
         result[str(true_phase)] = row
     return result
 
@@ -518,7 +615,9 @@ def whole_cds_classifier_diagnostics(
     cds = model.structure_bank.build_cds(structure)
     output = model.classifier(
         structure.learned_identity.to(device=model.device, dtype=model.dtype),
-        physical_spectral_evidence=structure.physical_identity.to(device=model.device, dtype=model.dtype),
+        physical_spectral_evidence=structure.physical_identity.to(
+            device=model.device, dtype=model.dtype
+        ),
         class_ids=structure.class_ids.to(device=model.device),
         cds=cds,
         trainable_class_ids=(),
@@ -531,9 +630,15 @@ def whole_cds_classifier_diagnostics(
     return {
         "whole_cds_margin_mean": float(margin.mean().item()),
         "whole_cds_margin_min": float(margin.min().item()),
-        "learned_self_support_mean": float(output.learned_support[target, target].mean().item()),
-        "physical_self_support_mean": float(output.physical_support[target, target].mean().item()),
-        "whole_self_support_mean": float(output.whole_support[target, target].mean().item()),
+        "learned_self_support_mean": float(
+            output.learned_support[target, target].mean().item()
+        ),
+        "physical_self_support_mean": float(
+            output.physical_support[target, target].mean().item()
+        ),
+        "whole_self_support_mean": float(
+            output.whole_support[target, target].mean().item()
+        ),
     }
 
 
@@ -548,15 +653,6 @@ __all__ = [
     "phase_origin_confusion_diagnostics",
     "whole_cds_classifier_diagnostics",
 ]
-
-
-
-
-
-
-
-
-
 
 
 # from __future__ import annotations
@@ -815,8 +911,6 @@ __all__ = [
 #         "minimum_structural_support_margin": float(metrics["minimum_structural_support_margin"]),
 #         "structural_overlap_fraction": float(metrics["structural_overlap_fraction"]),
 #     }
-
-
 
 
 # def _diagonal_variation_statistics(variation: Tensor) -> tuple[Tensor, Tensor]:
@@ -1085,9 +1179,6 @@ __all__ = [
 #     "old_new_summary",
 #     "phase_origin_confusion_diagnostics",
 # ]
-
-
-
 
 
 # from __future__ import annotations
