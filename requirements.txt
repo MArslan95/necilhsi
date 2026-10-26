@@ -47,10 +47,7 @@ pytest>=7.2.0
 
 # Multiple seeds
 
-python main.py --run_mode all --max_phase 1 --dataset IP --data_dir .\datasets --save_dir .\results_final_boundary_ip_ --device cuda:0 --seed 42 --protocol_seed 42 --deterministic true --num_workers 0 --base_classes 6 --increment 6 --shuffle_order false --train_ratio 0.20 --val_ratio 0.10 --split_strategy random_pixel --require_patch_disjoint false --require_phase_context_isolation false --patch_size 11 --pca_components 30 --pca_whiten false --d_model 128 --spectral_token_count 16 --d_state 16 --d_conv 4 --expand 2 --num_spectral_layers 2 --num_spatial_layers 2 --stem_norm_groups 8 --mamba_dropout 0.0 --epochs_base 80 --epochs_inc 35 --batch_size 64 --eval_batch_size 256 --lr 1e-4 --lr_inc 1e-4 --weight_decay 1e-4 --gradient_clip 5.0 --contrastive_weight 1.0 --feature_kd_weight 10.0 --cds_weight 1.0 --kd_logit_weight 0.0 --kd_temperature 2.0 --save_visualizations true --visualization_cmap nipy_spectral --visualization_dpi 300
-
-
-python main.py --run_mode all --max_phase 1 --dataset IP --data_dir .\datasets --save_dir .\results_wholecds_joint_ip --device cuda:0 --seed 42 --protocol_seed 42 --deterministic true --num_workers 0 --base_classes 6 --increment 6 --shuffle_order false --train_ratio 0.20 --val_ratio 0.10 --split_strategy random_pixel --require_patch_disjoint false --require_phase_context_isolation false --patch_size 11 --pca_components 30 --pca_whiten false --d_model 128 --spectral_token_count 16 --d_state 16 --d_conv 4 --expand 2 --num_spectral_layers 2 --num_spatial_layers 2 --stem_norm_groups 8 --mamba_dropout 0.0 --epochs_base 80 --epochs_inc 35 --batch_size 64 --eval_batch_size 256 --lr 1e-4 --lr_inc 1e-4 --weight_decay 1e-4 --gradient_clip 5.0 --contrastive_weight 1.0 --feature_kd_weight 10.0 --kd_logit_weight 0.0 --kd_temperature 2.0 --cds_weight 1.0 --save_visualizations false\
+python main.py --run_mode base --dataset IP --data_dir .\datasets --save_dir .\results_directional_ip --device cuda:0 --seed 42 --protocol_seed 42 --base_classes 6 --increment 6 --patch_size 11 --pca_components 30 --spectral_token_count 16 --d_model 128 --epochs_base 80 --batch_size 64 --eval_batch_size 256 --lr 1e-4 --save_visualizations false
 
 
 # Testing files

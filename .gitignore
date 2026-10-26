@@ -1,8 +1,8 @@
 datasets/
 *.log
 *.ckpt  
-checkpoints/
-results/
 results_*/
 *.md
-/prev_res */
+.vscode/
+__pycache__/ 
+config/ 

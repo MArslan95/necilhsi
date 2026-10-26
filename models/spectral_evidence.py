@@ -77,36 +77,31 @@ class PhysicalSpectralEvidence(nn.Module):
             raise RuntimeError("physical spectral normalization is already fitted")
 
         values = _validate_spectra(spectra, band_count=self.band_count)
-        cpu = values.detach().to(device="cpu", dtype=torch.float64)
+        # MPS cannot perform a float64 cast as part of a device transfer.
+        # Move first, then promote on CPU for the robust statistics.
+        cpu = values.detach().to(device="cpu").to(dtype=torch.float64)
         ordered = torch.sort(cpu, dim=0, stable=True).values
 
         center = _linear_quantile(ordered, 0.50)
-        lower = _linear_quantile(ordered, 0.25)
-        upper = _linear_quantile(ordered, 0.75)
-        interquartile_range = (upper - lower).clamp_min(0.0)
-
         absolute_deviation = (cpu - center.unsqueeze(0)).abs()
         ordered_deviation = torch.sort(absolute_deviation, dim=0, stable=True).values
-        median_absolute_deviation = _linear_quantile(ordered_deviation, 0.50)
-
+        mad = _linear_quantile(ordered_deviation, 0.50)
+        # IQR-free robust phase-zero normalization; no Gaussian fit or old prototypes.
+        # When MAD collapses, use empirical mean absolute deviation, then unit scale.
+        mean_abs = absolute_deviation.mean(dim=0)
         eps = torch.finfo(torch.float64).eps
-        # Keep the validated Phase-0 robust normalization contract: IQR first,
-        # then the Gaussian-consistent 1.4826*MAD fallback, then unit scale only
-        # for truly constant bands.
         scale = torch.where(
-            interquartile_range > eps,
-            interquartile_range,
-            torch.where(
-                median_absolute_deviation > eps,
-                1.4826 * median_absolute_deviation,
-                torch.ones_like(interquartile_range),
-            ),
+            mad > eps, mad, torch.where(mean_abs > eps, mean_abs, torch.ones_like(mad))
         )
 
-        if not bool(torch.isfinite(center).all()) or not bool(torch.isfinite(scale).all()):
+        if not bool(torch.isfinite(center).all()) or not bool(
+            torch.isfinite(scale).all()
+        ):
             raise RuntimeError("physical spectral normalization produced NaN or Inf")
         if bool((scale <= 0).any()):
-            raise RuntimeError("physical spectral normalization produced non-positive scale")
+            raise RuntimeError(
+                "physical spectral normalization produced non-positive scale"
+            )
 
         self.band_center.copy_(center.to(self.band_center))
         self.band_scale.copy_(scale.to(self.band_scale))
@@ -121,7 +116,11 @@ class PhysicalSpectralEvidence(nn.Module):
             value = value.unsqueeze(-1)
         if value.ndim != 3 or value.size(1) != self.band_count or value.size(2) != 1:
             raise ValueError(f"evidence must be [N,{self.band_count},1]")
-        if not torch.is_floating_point(value) or value.is_complex() or not bool(torch.isfinite(value).all()):
+        if (
+            not torch.is_floating_point(value)
+            or value.is_complex()
+            or not bool(torch.isfinite(value).all())
+        ):
             raise ValueError("evidence must be finite real floating point")
         center = self.band_center.to(device=value.device, dtype=value.dtype)
         scale = self.band_scale.to(device=value.device, dtype=value.dtype)
@@ -153,12 +152,6 @@ class PhysicalSpectralEvidence(nn.Module):
 
 
 __all__ = ["PhysicalSpectralEvidence"]
-
-
-
-
-
-
 
 # from __future__ import annotations
 
@@ -239,36 +232,31 @@ __all__ = ["PhysicalSpectralEvidence"]
 #             raise RuntimeError("physical spectral normalization is already fitted")
 
 #         values = _validate_spectra(spectra, band_count=self.band_count)
-#         cpu = values.detach().to(device="cpu", dtype=torch.float64)
+#         # MPS cannot perform a float64 cast as part of a device transfer.
+#         # Move first, then promote on CPU for the robust statistics.
+#         cpu = values.detach().to(device="cpu").to(dtype=torch.float64)
 #         ordered = torch.sort(cpu, dim=0, stable=True).values
 
 #         center = _linear_quantile(ordered, 0.50)
-#         lower = _linear_quantile(ordered, 0.25)
-#         upper = _linear_quantile(ordered, 0.75)
-#         interquartile_range = (upper - lower).clamp_min(0.0)
-
 #         absolute_deviation = (cpu - center.unsqueeze(0)).abs()
 #         ordered_deviation = torch.sort(absolute_deviation, dim=0, stable=True).values
-#         median_absolute_deviation = _linear_quantile(ordered_deviation, 0.50)
-
+#         mad = _linear_quantile(ordered_deviation, 0.50)
+#         # IQR-free robust phase-zero normalization; no Gaussian fit or old prototypes.
+#         # When MAD collapses, use empirical mean absolute deviation, then unit scale.
+#         mean_abs = absolute_deviation.mean(dim=0)
 #         eps = torch.finfo(torch.float64).eps
-#         # Keep the validated Phase-0 robust normalization contract: IQR first,
-#         # then the Gaussian-consistent 1.4826*MAD fallback, then unit scale only
-#         # for truly constant bands.
 #         scale = torch.where(
-#             interquartile_range > eps,
-#             interquartile_range,
-#             torch.where(
-#                 median_absolute_deviation > eps,
-#                 1.4826 * median_absolute_deviation,
-#                 torch.ones_like(interquartile_range),
-#             ),
+#             mad > eps, mad, torch.where(mean_abs > eps, mean_abs, torch.ones_like(mad))
 #         )
 
-#         if not bool(torch.isfinite(center).all()) or not bool(torch.isfinite(scale).all()):
+#         if not bool(torch.isfinite(center).all()) or not bool(
+#             torch.isfinite(scale).all()
+#         ):
 #             raise RuntimeError("physical spectral normalization produced NaN or Inf")
 #         if bool((scale <= 0).any()):
-#             raise RuntimeError("physical spectral normalization produced non-positive scale")
+#             raise RuntimeError(
+#                 "physical spectral normalization produced non-positive scale"
+#             )
 
 #         self.band_center.copy_(center.to(self.band_center))
 #         self.band_scale.copy_(scale.to(self.band_scale))
@@ -283,7 +271,11 @@ __all__ = ["PhysicalSpectralEvidence"]
 #             value = value.unsqueeze(-1)
 #         if value.ndim != 3 or value.size(1) != self.band_count or value.size(2) != 1:
 #             raise ValueError(f"evidence must be [N,{self.band_count},1]")
-#         if not torch.is_floating_point(value) or value.is_complex() or not bool(torch.isfinite(value).all()):
+#         if (
+#             not torch.is_floating_point(value)
+#             or value.is_complex()
+#             or not bool(torch.isfinite(value).all())
+#         ):
 #             raise ValueError("evidence must be finite real floating point")
 #         center = self.band_center.to(device=value.device, dtype=value.dtype)
 #         scale = self.band_scale.to(device=value.device, dtype=value.dtype)

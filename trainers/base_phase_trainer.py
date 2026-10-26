@@ -7,7 +7,13 @@ from typing import Any, Dict, Mapping
 import torch
 from tqdm import tqdm
 
-from losses.loss import classification_objective, whole_cds_contrastive_loss
+from losses.loss import (
+    classification_objective,
+    whole_cds_contrastive_loss,
+    whole_cds_support_classification_loss,
+    feature_overlap_audit,
+    deterministic_class_audit_indices,
+)
 from models.classifier import CosineClassificationHead
 from models.geometry_bank import ClassStructureBatch, PhysicalSpectralStructureBatch
 
@@ -183,6 +189,7 @@ class BasePhaseTrainer:
         contrastive_weight = _finite_nonnegative(
             "contrastive_weight", self.cfg("contrastive_weight", 1.0)
         )
+        cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
 
         self.model.validate_model_state()
         self.model.set_base_trainability()
@@ -304,6 +311,7 @@ class BasePhaseTrainer:
                     class_ids=output.class_ids,
                     labels_global=labels,
                     sample_weights=sample_weights,
+                    unbiased_sample_weighting=True,
                 )
                 physical_evidence = self.model.physical_spectral_evidence(
                     spectrum
@@ -317,10 +325,22 @@ class BasePhaseTrainer:
                     logit_scale=classifier.logit_scale,
                     sample_weights=sample_weights,
                 )
+                cds_support = whole_cds_support_classification_loss(
+                    learned_features=q,
+                    physical_features=physical_evidence,
+                    labels_global=labels,
+                    structure=epoch_structure,
+                    sample_weights=sample_weights,
+                    unbiased_sample_weighting=True,
+                )
                 # With no historical classes, the unified continual separation
                 # objective reduces to ordinary supervised contrastive learning.
                 # W is trained directly from real base samples by deployed cosine CE.
-                loss = classification.loss + contrastive_weight * contrastive.loss
+                loss = (
+                    classification.loss
+                    + contrastive_weight * contrastive.loss
+                    + cds_weight * cds_support
+                )
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(
                         "Phase-0 CE + Whole-CDS contrastive objective became NaN or Inf"
@@ -488,8 +508,54 @@ class BasePhaseTrainer:
         final_structure = self._working_structure(
             train_eval_loader, class_ids=class_ids, physical=physical_structure
         )
-
-        self.model.commit_class_structure(final_structure)
+        # Phase-0 TRAIN is the only permitted source of class evidence.
+        fit_rows = self.collect_ordered_features(train_eval_loader)
+        physical = self.model.physical_spectral_evidence(fit_rows["raw_center_spectra"])
+        # Read-only TRAIN audit. Do not store the feature rows in the bank/report.
+        base_overlap_audit = {"status": "disabled"}
+        if bool(self.cfg("audit_enabled", False)):
+            audit_indices = deterministic_class_audit_indices(
+                fit_rows["labels"],
+                max_per_class=int(self.cfg("audit_max_per_class", 48)),
+            )
+            base_overlap_audit = feature_overlap_audit(
+                fit_rows["ordered_features"].index_select(0, audit_indices),
+                fit_rows["labels"].index_select(0, audit_indices),
+            )
+            base_overlap_audit["split"] = "base_train_not_test"
+            base_overlap_audit["status"] = "evaluated"
+        self.model.commit_class_structure(
+            final_structure,
+            ordered_features=fit_rows["ordered_features"],
+            physical_evidence=physical,
+            labels=fit_rows["labels"],
+        )
+        self.historical_support.require(class_ids)
+        base_cds = self.model.class_discriminative_structure(class_ids)
+        with torch.no_grad():
+            estimate = self.historical_support.historical_risk(
+                classifier, class_ids, base_cds
+            )
+            out = classifier(
+                fit_rows["ordered_features"],
+                class_ids=class_ids,
+                trainable_class_ids=(),
+            )
+            label = fit_rows["labels"]
+            target = label[:, None].eq(class_ids_tensor[None, :]).long().argmax(1)
+            empirical_ce = torch.nn.functional.cross_entropy(out.logits, target)
+        print(
+            f"[Unified inter/intra/spectral CDS] objective={estimate.objective} "
+            f"Phase-0 risk={float(estimate.loss):.4f} real TRAIN CE={float(empirical_ce):.4f} "
+            "(historical risk is a surrogate, not exact empirical CE)"
+        )
+        risk_audit = self.audit_current_classifier_risk(
+            val_loader, class_ids=class_ids, cds=base_cds
+        )
+        base_readiness = __import__(
+            "models.cds_decision_region",
+            fromlist=["whole_cds_class_balanced_classifier_loss"],
+        ).whole_cds_class_balanced_classifier_loss(classifier=classifier, cds=base_cds)
         self.model.validate_finalized_state()
 
         train_metrics = self.evaluate_loader(
@@ -519,8 +585,15 @@ class BasePhaseTrainer:
             "validation": validation_metrics,
             "test": test_metrics,
             "structure_committed": True,
+            "base_cds_fitting_coverage": None,  # No enclosing G_Q region exists.
+            "base_cds_robust_positive_fraction": float(
+                1 - base_readiness.violation_fraction.item()
+            ),
+            "base_cds_robust_min_margin": float(base_readiness.clearance_min.item()),
             "phase_finalized": True,
             "contrastive_weight": contrastive_weight,
+            "risk_approximation_audit": risk_audit,
+            "feature_overlap_audit": base_overlap_audit,
         }
 
 
@@ -536,7 +609,11 @@ __all__ = ["BasePhaseTrainer"]
 # import torch
 # from tqdm import tqdm
 
-# from losses.loss import classification_objective, whole_cds_contrastive_loss
+# from losses.loss import (
+#     classification_objective,
+#     whole_cds_contrastive_loss,
+#     whole_cds_support_classification_loss,
+# )
 # from models.classifier import CosineClassificationHead
 # from models.geometry_bank import ClassStructureBatch, PhysicalSpectralStructureBatch
 
@@ -712,6 +789,7 @@ __all__ = ["BasePhaseTrainer"]
 #         contrastive_weight = _finite_nonnegative(
 #             "contrastive_weight", self.cfg("contrastive_weight", 1.0)
 #         )
+#         cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
 
 #         self.model.validate_model_state()
 #         self.model.set_base_trainability()
@@ -833,6 +911,7 @@ __all__ = ["BasePhaseTrainer"]
 #                     class_ids=output.class_ids,
 #                     labels_global=labels,
 #                     sample_weights=sample_weights,
+#                     unbiased_sample_weighting=True,
 #                 )
 #                 physical_evidence = self.model.physical_spectral_evidence(
 #                     spectrum
@@ -846,10 +925,22 @@ __all__ = ["BasePhaseTrainer"]
 #                     logit_scale=classifier.logit_scale,
 #                     sample_weights=sample_weights,
 #                 )
+#                 cds_support = whole_cds_support_classification_loss(
+#                     learned_features=q,
+#                     physical_features=physical_evidence,
+#                     labels_global=labels,
+#                     structure=epoch_structure,
+#                     sample_weights=sample_weights,
+#                     unbiased_sample_weighting=True,
+#                 )
 #                 # With no historical classes, the unified continual separation
 #                 # objective reduces to ordinary supervised contrastive learning.
 #                 # W is trained directly from real base samples by deployed cosine CE.
-#                 loss = classification.loss + contrastive_weight * contrastive.loss
+#                 loss = (
+#                     classification.loss
+#                     + contrastive_weight * contrastive.loss
+#                     + cds_weight * cds_support
+#                 )
 #                 if not bool(torch.isfinite(loss)):
 #                     raise RuntimeError(
 #                         "Phase-0 CE + Whole-CDS contrastive objective became NaN or Inf"
@@ -1017,8 +1108,41 @@ __all__ = ["BasePhaseTrainer"]
 #         final_structure = self._working_structure(
 #             train_eval_loader, class_ids=class_ids, physical=physical_structure
 #         )
-
-#         self.model.commit_class_structure(final_structure)
+#         # Phase-0 TRAIN is the only permitted source of class evidence.
+#         fit_rows = self.collect_ordered_features(train_eval_loader)
+#         physical = self.model.physical_spectral_evidence(fit_rows["raw_center_spectra"])
+#         self.model.commit_class_structure(
+#             final_structure,
+#             ordered_features=fit_rows["ordered_features"],
+#             physical_evidence=physical,
+#             labels=fit_rows["labels"],
+#         )
+#         self.historical_support.require(class_ids)
+#         base_cds = self.model.class_discriminative_structure(class_ids)
+#         with torch.no_grad():
+#             estimate = self.historical_support.historical_risk(
+#                 classifier, class_ids, base_cds
+#             )
+#             out = classifier(
+#                 fit_rows["ordered_features"],
+#                 class_ids=class_ids,
+#                 trainable_class_ids=(),
+#             )
+#             label = fit_rows["labels"]
+#             target = label[:, None].eq(class_ids_tensor[None, :]).long().argmax(1)
+#             empirical_ce = torch.nn.functional.cross_entropy(out.logits, target)
+#         print(
+#             f"[Unified inter/intra/spectral CDS] objective={estimate.objective} "
+#             f"Phase-0 risk={float(estimate.loss):.4f} real TRAIN CE={float(empirical_ce):.4f} "
+#             "(historical risk is a surrogate, not exact empirical CE)"
+#         )
+#         risk_audit = self.audit_current_classifier_risk(
+#             val_loader, class_ids=class_ids, cds=base_cds
+#         )
+#         base_readiness = __import__(
+#             "models.cds_decision_region",
+#             fromlist=["whole_cds_class_balanced_classifier_loss"],
+#         ).whole_cds_class_balanced_classifier_loss(classifier=classifier, cds=base_cds)
 #         self.model.validate_finalized_state()
 
 #         train_metrics = self.evaluate_loader(
@@ -1048,8 +1172,14 @@ __all__ = ["BasePhaseTrainer"]
 #             "validation": validation_metrics,
 #             "test": test_metrics,
 #             "structure_committed": True,
+#             "base_cds_fitting_coverage": None,  # No enclosing G_Q region exists.
+#             "base_cds_robust_positive_fraction": float(
+#                 1 - base_readiness.violation_fraction.item()
+#             ),
+#             "base_cds_robust_min_margin": float(base_readiness.clearance_min.item()),
 #             "phase_finalized": True,
 #             "contrastive_weight": contrastive_weight,
+#             "risk_approximation_audit": risk_audit,
 #         }
 
 
@@ -1065,7 +1195,11 @@ __all__ = ["BasePhaseTrainer"]
 # import torch
 # from tqdm import tqdm
 
-# from losses.loss import classification_objective, whole_cds_contrastive_loss
+# from losses.loss import (
+#     classification_objective,
+#     whole_cds_contrastive_loss,
+#     whole_cds_support_classification_loss,
+# )
 # from models.classifier import CosineClassificationHead
 # from models.geometry_bank import ClassStructureBatch, PhysicalSpectralStructureBatch
 
@@ -1118,7 +1252,10 @@ __all__ = ["BasePhaseTrainer"]
 
 #     def _require_classifier(self) -> CosineClassificationHead:
 #         classifier = getattr(self.model, "classifier", None)
-#         if not isinstance(classifier, CosineClassificationHead) or classifier.parameter_count <= 0:
+#         if (
+#             not isinstance(classifier, CosineClassificationHead)
+#             or classifier.parameter_count <= 0
+#         ):
 #             raise RuntimeError("model.classifier must be the CosineClassificationHead")
 #         return classifier
 
@@ -1134,10 +1271,14 @@ __all__ = ["BasePhaseTrainer"]
 #         total = 0
 #         for batch in loader:
 #             _, center_spectrum, labels = self.unpack_batch(batch)
-#             observed = set(int(value) for value in labels.unique().detach().cpu().tolist())
+#             observed = set(
+#                 int(value) for value in labels.unique().detach().cpu().tolist()
+#             )
 #             outside = observed - set(class_ids)
 #             if outside:
-#                 raise RuntimeError(f"Phase-0 TRAIN loader contains non-base classes {sorted(outside)}")
+#                 raise RuntimeError(
+#                     f"Phase-0 TRAIN loader contains non-base classes {sorted(outside)}"
+#                 )
 #             if not self.model.spectral_normalization_fitted:
 #                 spectra.append(center_spectrum.detach())
 #             for class_id in class_ids:
@@ -1150,7 +1291,9 @@ __all__ = ["BasePhaseTrainer"]
 #         if not self.model.spectral_normalization_fitted:
 #             if not spectra:
 #                 raise RuntimeError("Phase-0 spectra are unavailable for normalization")
-#             self.model.fit_spectral_normalization(torch.cat(spectra, dim=0), overwrite=False)
+#             self.model.fit_spectral_normalization(
+#                 torch.cat(spectra, dim=0), overwrite=False
+#             )
 
 #         class_count = len(class_ids)
 #         weights = torch.tensor(
@@ -1174,7 +1317,9 @@ __all__ = ["BasePhaseTrainer"]
 #             spectra.append(spectrum.detach())
 #             labels_rows.append(labels.detach())
 #         if not spectra:
-#             raise RuntimeError("cannot estimate physical CDS from an empty Phase-0 loader")
+#             raise RuntimeError(
+#                 "cannot estimate physical CDS from an empty Phase-0 loader"
+#             )
 #         return self.model.estimate_physical_class_structure(
 #             torch.cat(spectra, dim=0),
 #             torch.cat(labels_rows, dim=0),
@@ -1190,7 +1335,11 @@ __all__ = ["BasePhaseTrainer"]
 #         physical: PhysicalSpectralStructureBatch,
 #     ) -> ClassStructureBatch:
 #         rows = self.collect_ordered_features(loader)
-#         observed = tuple(sorted(int(value) for value in rows["labels"].unique().detach().cpu().tolist()))
+#         observed = tuple(
+#             sorted(
+#                 int(value) for value in rows["labels"].unique().detach().cpu().tolist()
+#             )
+#         )
 #         if observed != tuple(sorted(class_ids)):
 #             raise RuntimeError("Phase-0 TRAIN rows do not match the base class set")
 #         return self.model.estimate_class_structure(
@@ -1214,12 +1363,19 @@ __all__ = ["BasePhaseTrainer"]
 #         epoch_count = _positive_int(epochs, name="epochs")
 #         train_batch_size = _positive_int(batch_size, name="batch_size")
 #         learning_rate = _finite_positive("lr", lr)
-#         eval_batch_size = _positive_int(self.cfg("eval_batch_size", 256), name="eval_batch_size")
-#         weight_decay = _finite_nonnegative("weight_decay", self.cfg("weight_decay", 1e-4))
-#         gradient_clip = _finite_nonnegative("gradient_clip", self.cfg("gradient_clip", 0.0))
+#         eval_batch_size = _positive_int(
+#             self.cfg("eval_batch_size", 256), name="eval_batch_size"
+#         )
+#         weight_decay = _finite_nonnegative(
+#             "weight_decay", self.cfg("weight_decay", 1e-4)
+#         )
+#         gradient_clip = _finite_nonnegative(
+#             "gradient_clip", self.cfg("gradient_clip", 0.0)
+#         )
 #         contrastive_weight = _finite_nonnegative(
 #             "contrastive_weight", self.cfg("contrastive_weight", 1.0)
 #         )
+#         cds_weight = _finite_nonnegative("cds_weight", self.cfg("cds_weight", 1.0))
 
 #         self.model.validate_model_state()
 #         self.model.set_base_trainability()
@@ -1231,7 +1387,9 @@ __all__ = ["BasePhaseTrainer"]
 
 #         self.dataset.start_phase(0)
 #         class_ids = tuple(
-#             self._validated_class_ids(self.dataset.get_new_classes(0), name="phase_0_classes")
+#             self._validated_class_ids(
+#                 self.dataset.get_new_classes(0), name="phase_0_classes"
+#             )
 #         )
 #         if len(class_ids) < 2:
 #             raise RuntimeError("Phase 0 requires at least two classes")
@@ -1258,7 +1416,9 @@ __all__ = ["BasePhaseTrainer"]
 #             else None
 #         )
 
-#         backbone_trainable = [p for p in self.model.backbone.parameters() if p.requires_grad]
+#         backbone_trainable = [
+#             p for p in self.model.backbone.parameters() if p.requires_grad
+#         ]
 #         if not backbone_trainable:
 #             raise RuntimeError("Phase-0 backbone has no trainable parameters")
 
@@ -1322,8 +1482,15 @@ __all__ = ["BasePhaseTrainer"]
 #                 q = self.model.extract_features(
 #                     patch, center_spectrum=spectrum, return_aux=False
 #                 ).ordered_features
-#                 output = classifier(q, class_ids=class_ids_tensor, trainable_class_ids=class_ids_tensor)
-#                 targets_local = labels.unsqueeze(1).eq(class_ids_tensor.unsqueeze(0)).to(torch.long).argmax(dim=1)
+#                 output = classifier(
+#                     q, class_ids=class_ids_tensor, trainable_class_ids=class_ids_tensor
+#                 )
+#                 targets_local = (
+#                     labels.unsqueeze(1)
+#                     .eq(class_ids_tensor.unsqueeze(0))
+#                     .to(torch.long)
+#                     .argmax(dim=1)
+#                 )
 #                 sample_weights = class_weights.index_select(0, targets_local)
 #                 classification = classification_objective(
 #                     logits=output.logits,
@@ -1331,7 +1498,9 @@ __all__ = ["BasePhaseTrainer"]
 #                     labels_global=labels,
 #                     sample_weights=sample_weights,
 #                 )
-#                 physical_evidence = self.model.physical_spectral_evidence(spectrum).detach()
+#                 physical_evidence = self.model.physical_spectral_evidence(
+#                     spectrum
+#                 ).detach()
 #                 contrastive = whole_cds_contrastive_loss(
 #                     current_features=q,
 #                     labels_global=labels,
@@ -1341,22 +1510,45 @@ __all__ = ["BasePhaseTrainer"]
 #                     logit_scale=classifier.logit_scale,
 #                     sample_weights=sample_weights,
 #                 )
+#                 cds_support = whole_cds_support_classification_loss(
+#                     learned_features=q,
+#                     physical_features=physical_evidence,
+#                     labels_global=labels,
+#                     structure=epoch_structure,
+#                     sample_weights=sample_weights,
+#                 )
 #                 # With no historical classes, the unified continual separation
 #                 # objective reduces to ordinary supervised contrastive learning.
 #                 # W is trained directly from real base samples by deployed cosine CE.
-#                 loss = classification.loss + contrastive_weight * contrastive.loss
+#                 loss = (
+#                     classification.loss
+#                     + contrastive_weight * contrastive.loss
+#                     + cds_weight * cds_support
+#                 )
 #                 if not bool(torch.isfinite(loss)):
-#                     raise RuntimeError("Phase-0 CE + Whole-CDS contrastive objective became NaN or Inf")
+#                     raise RuntimeError(
+#                         "Phase-0 CE + Whole-CDS contrastive objective became NaN or Inf"
+#                     )
 #                 loss.backward()
 
 #                 for parameter in backbone_trainable:
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("Phase-0 backbone gradient contains NaN or Inf")
+#                     if parameter.grad is not None and not bool(
+#                         torch.isfinite(parameter.grad).all()
+#                     ):
+#                         raise RuntimeError(
+#                             "Phase-0 backbone gradient contains NaN or Inf"
+#                         )
 #                 for parameter in classifier.parameters():
-#                     if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
-#                         raise RuntimeError("Phase-0 classifier gradient contains NaN or Inf")
+#                     if parameter.grad is not None and not bool(
+#                         torch.isfinite(parameter.grad).all()
+#                     ):
+#                         raise RuntimeError(
+#                             "Phase-0 classifier gradient contains NaN or Inf"
+#                         )
 #                 if gradient_clip > 0:
-#                     torch.nn.utils.clip_grad_norm_(backbone_trainable, gradient_clip, error_if_nonfinite=True)
+#                     torch.nn.utils.clip_grad_norm_(
+#                         backbone_trainable, gradient_clip, error_if_nonfinite=True
+#                     )
 
 #                 backbone_optimizer.step()
 #                 classifier_optimizer.step()
@@ -1364,10 +1556,18 @@ __all__ = ["BasePhaseTrainer"]
 #                 n = int(labels.numel())
 #                 classification_sum += float(classification.loss.detach().item()) * n
 #                 contrastive_sum += float(contrastive.loss.detach().item()) * n
-#                 contrastive_positive_sum += float(contrastive.positive_similarity_mean.detach().item()) * n
-#                 contrastive_negative_sum += float(contrastive.negative_similarity_mean.detach().item()) * n
-#                 contrastive_gap_sum += float(contrastive.similarity_gap.detach().item()) * n
-#                 contrastive_anchor_fraction_sum += float(contrastive.valid_anchor_fraction.detach().item()) * n
+#                 contrastive_positive_sum += (
+#                     float(contrastive.positive_similarity_mean.detach().item()) * n
+#                 )
+#                 contrastive_negative_sum += (
+#                     float(contrastive.negative_similarity_mean.detach().item()) * n
+#                 )
+#                 contrastive_gap_sum += (
+#                     float(contrastive.similarity_gap.detach().item()) * n
+#                 )
+#                 contrastive_anchor_fraction_sum += (
+#                     float(contrastive.valid_anchor_fraction.detach().item()) * n
+#                 )
 #                 total_sum += float(loss.detach().item()) * n
 #                 prediction = output.prediction.detach()
 #                 correct += int(prediction.eq(labels).sum().item())
@@ -1377,10 +1577,14 @@ __all__ = ["BasePhaseTrainer"]
 #                     count = int(mask.sum().item())
 #                     per_class_total[class_id] += count
 #                     if count:
-#                         per_class_correct[class_id] += int(prediction[mask].eq(labels[mask]).sum().item())
+#                         per_class_correct[class_id] += int(
+#                             prediction[mask].eq(labels[mask]).sum().item()
+#                         )
 
 #             if sample_count != expected_samples:
-#                 raise RuntimeError("Phase-0 loader did not traverse the complete TRAIN split")
+#                 raise RuntimeError(
+#                     "Phase-0 loader did not traverse the complete TRAIN split"
+#                 )
 #             backbone_scheduler.step()
 #             classifier_scheduler.step()
 
@@ -1389,22 +1593,19 @@ __all__ = ["BasePhaseTrainer"]
 #                 train_eval_loader, class_ids=class_ids, physical=physical_structure
 #             )
 #             train_metrics = self.evaluate_loader(
-#                 train_eval_loader,
-#                 class_ids=class_ids,
-#                 target_class_ids=class_ids
+#                 train_eval_loader, class_ids=class_ids, target_class_ids=class_ids
 #             )
 #             validation_metrics = (
 #                 None
 #                 if val_loader is None
 #                 else self.evaluate_loader(
-#                     val_loader,
-#                     class_ids=class_ids,
-#                     target_class_ids=class_ids
+#                     val_loader, class_ids=class_ids, target_class_ids=class_ids
 #                 )
 #             )
 
 #             online_per_class = {
-#                 cid: per_class_correct[cid] / float(per_class_total[cid]) for cid in class_ids
+#                 cid: per_class_correct[cid] / float(per_class_total[cid])
+#                 for cid in class_ids
 #             }
 #             train_worst_id, train_worst_acc = _worst_class_accuracy(train_metrics)
 #             if validation_metrics is None:
@@ -1418,25 +1619,47 @@ __all__ = ["BasePhaseTrainer"]
 #                 "classifier_learning_rate": epoch_classifier_lr,
 #                 "classification_loss": classification_sum / sample_count,
 #                 "contrastive_loss": contrastive_sum / sample_count,
-#                 "contrastive_positive_similarity_mean": contrastive_positive_sum / sample_count,
-#                 "contrastive_negative_similarity_mean": contrastive_negative_sum / sample_count,
+#                 "contrastive_positive_similarity_mean": contrastive_positive_sum
+#                 / sample_count,
+#                 "contrastive_negative_similarity_mean": contrastive_negative_sum
+#                 / sample_count,
 #                 "contrastive_similarity_gap": contrastive_gap_sum / sample_count,
-#                 "contrastive_valid_anchor_fraction": contrastive_anchor_fraction_sum / sample_count,
+#                 "contrastive_valid_anchor_fraction": contrastive_anchor_fraction_sum
+#                 / sample_count,
 #                 "total_loss": total_sum / sample_count,
 #                 "logit_scale": float(classifier.logit_scale.detach().item()),
 #                 "online_cosine_oa": correct / float(sample_count),
-#                 "online_cosine_ba": sum(online_per_class.values()) / float(len(online_per_class)),
+#                 "online_cosine_ba": sum(online_per_class.values())
+#                 / float(len(online_per_class)),
 #                 "online_cosine_min_class_accuracy": min(online_per_class.values()),
 #                 "train_oa": float(train_metrics["overall_accuracy"]),
 #                 "train_ba": float(train_metrics["balanced_accuracy"]),
-#                 "train_min_class_accuracy": float(train_metrics["minimum_class_accuracy"]),
+#                 "train_min_class_accuracy": float(
+#                     train_metrics["minimum_class_accuracy"]
+#                 ),
 #                 "train_logit_margin": float(train_metrics["mean_logit_margin"]),
 #                 "train_worst_class_id": int(train_worst_id),
 #                 "train_worst_class_accuracy": float(train_worst_acc),
-#                 "validation_oa": None if validation_metrics is None else float(validation_metrics["overall_accuracy"]),
-#                 "validation_ba": None if validation_metrics is None else float(validation_metrics["balanced_accuracy"]),
-#                 "validation_min_class_accuracy": None if validation_metrics is None else float(validation_metrics["minimum_class_accuracy"]),
-#                 "validation_logit_margin": None if validation_metrics is None else float(validation_metrics["mean_logit_margin"]),
+#                 "validation_oa": (
+#                     None
+#                     if validation_metrics is None
+#                     else float(validation_metrics["overall_accuracy"])
+#                 ),
+#                 "validation_ba": (
+#                     None
+#                     if validation_metrics is None
+#                     else float(validation_metrics["balanced_accuracy"])
+#                 ),
+#                 "validation_min_class_accuracy": (
+#                     None
+#                     if validation_metrics is None
+#                     else float(validation_metrics["minimum_class_accuracy"])
+#                 ),
+#                 "validation_logit_margin": (
+#                     None
+#                     if validation_metrics is None
+#                     else float(validation_metrics["mean_logit_margin"])
+#                 ),
 #                 "validation_worst_class_id": val_worst_id,
 #                 "validation_worst_class_accuracy": val_worst_acc,
 #             }
@@ -1469,7 +1692,41 @@ __all__ = ["BasePhaseTrainer"]
 #         final_structure = self._working_structure(
 #             train_eval_loader, class_ids=class_ids, physical=physical_structure
 #         )
-#         self.model.commit_class_structure(final_structure)
+#         # Phase-0 TRAIN is the only permitted source of class evidence.
+#         fit_rows = self.collect_ordered_features(train_eval_loader)
+#         physical = self.model.physical_spectral_evidence(fit_rows["raw_center_spectra"])
+#         self.model.commit_class_structure(
+#             final_structure,
+#             ordered_features=fit_rows["ordered_features"],
+#             physical_evidence=physical,
+#             labels=fit_rows["labels"],
+#         )
+#         self.historical_support.require(class_ids)
+#         base_cds = self.model.class_discriminative_structure(class_ids)
+#         with torch.no_grad():
+#             estimate = self.historical_support.historical_risk(
+#                 classifier, class_ids, base_cds
+#             )
+#             out = classifier(
+#                 fit_rows["ordered_features"],
+#                 class_ids=class_ids,
+#                 trainable_class_ids=(),
+#             )
+#             label = fit_rows["labels"]
+#             target = label[:, None].eq(class_ids_tensor[None, :]).long().argmax(1)
+#             empirical_ce = torch.nn.functional.cross_entropy(out.logits, target)
+#         print(
+#             f"[Unified inter/intra/spectral CDS] objective={estimate.objective} "
+#             f"Phase-0 risk={float(estimate.loss):.4f} real TRAIN CE={float(empirical_ce):.4f} "
+#             "(historical risk is a surrogate, not exact empirical CE)"
+#         )
+#         risk_audit = self.audit_current_classifier_risk(
+#             val_loader, class_ids=class_ids, cds=base_cds
+#         )
+#         base_readiness = __import__(
+#             "models.cds_decision_region",
+#             fromlist=["whole_cds_class_balanced_classifier_loss"],
+#         ).whole_cds_class_balanced_classifier_loss(classifier=classifier, cds=base_cds)
 #         self.model.validate_finalized_state()
 
 #         train_metrics = self.evaluate_loader(
@@ -1478,10 +1735,14 @@ __all__ = ["BasePhaseTrainer"]
 #         validation_metrics = (
 #             None
 #             if val_loader is None
-#             else self.evaluate_loader(val_loader, class_ids=class_ids, target_class_ids=class_ids)
+#             else self.evaluate_loader(
+#                 val_loader, class_ids=class_ids, target_class_ids=class_ids
+#             )
 #         )
 #         self.dataset.finalize_phase(0)
-#         reporting_loader = self.dataset.get_reporting_dataloader(0, batch_size=eval_batch_size)
+#         reporting_loader = self.dataset.get_reporting_dataloader(
+#             0, batch_size=eval_batch_size
+#         )
 #         test_metrics = self.evaluate_loader(
 #             reporting_loader, class_ids=class_ids, target_class_ids=class_ids
 #         )
@@ -1495,8 +1756,14 @@ __all__ = ["BasePhaseTrainer"]
 #             "validation": validation_metrics,
 #             "test": test_metrics,
 #             "structure_committed": True,
+#             "base_cds_fitting_coverage": None,  # No enclosing G_Q region exists.
+#             "base_cds_robust_positive_fraction": float(
+#                 1 - base_readiness.violation_fraction.item()
+#             ),
+#             "base_cds_robust_min_margin": float(base_readiness.clearance_min.item()),
 #             "phase_finalized": True,
 #             "contrastive_weight": contrastive_weight,
+#             "risk_approximation_audit": risk_audit,
 #         }
 
 

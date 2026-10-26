@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import math
+import random
 from numbers import Integral, Real
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import torch
+import numpy as np
 
 from models.classifier import CosineClassificationHead
 from models.geometry_bank import HSIClassDiscriminativeStructureBank
@@ -24,6 +26,102 @@ class TrainerHelper:
 
     def cfg(self, name: str, default: Any) -> Any:
         return getattr(self.args, name, default)
+
+    @staticmethod
+    def parameter_gradient_audit(objectives, parameters):
+        """One-batch backbone-gradient measurement, without optimizer mutation."""
+        parameters = tuple(p for p in parameters if p.requires_grad)
+        gradients = {
+            name: (
+                torch.autograd.grad(
+                    value, parameters, retain_graph=True, allow_unused=True
+                )
+                if value.requires_grad and parameters
+                else (None,) * len(parameters)
+            )
+            for name, value in objectives.items()
+        }
+        zero = next(iter(objectives.values())).new_zeros(())
+        norms = {
+            name: sum((g.square().sum() for g in row if g is not None), zero).sqrt()
+            for name, row in gradients.items()
+        }
+        cosines = {}
+        names = list(gradients)
+        for i, left in enumerate(names):
+            for right in names[i + 1 :]:
+                denominator = norms[left] * norms[right]
+                dot = sum(
+                    (
+                        (a * b).sum()
+                        for a, b in zip(gradients[left], gradients[right])
+                        if a is not None and b is not None
+                    ),
+                    zero,
+                )
+                cosines[f"{left}|{right}"] = (
+                    float((dot / denominator).clamp(-1, 1))
+                    if float(denominator) > 1e-12
+                    else None
+                )
+        return {
+            "norms": {k: float(v) for k, v in norms.items()},
+            "cosines": cosines,
+            "scope": "backbone parameters, sampled minibatch, before clipping/AdamW",
+            "changes_optimizer_update": False,
+        }
+
+    @torch.no_grad()
+    def audit_current_classifier_risk(self, loader, *, class_ids, cds):
+        """Compare TRAIN-fitted moments with current validation CE; no selection."""
+        if loader is None:
+            return {
+                "status": "skipped_validation_disabled",
+                "used_for_selection": False,
+            }
+        # Even a non-shuffled DataLoader advances its base-seed generator.
+        # Diagnostics must not alter later training shuffles/dropout streams.
+        generators = {
+            id(g): g
+            for g in (
+                getattr(loader, "generator", None),
+                getattr(getattr(loader, "sampler", None), "generator", None),
+            )
+            if g is not None
+        }
+        states = {key: g.get_state() for key, g in generators.items()}
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        devices = (
+            [
+                (
+                    self.device.index
+                    if self.device.index is not None
+                    else torch.cuda.current_device()
+                )
+            ]
+            if self.device.type == "cuda"
+            else []
+        )
+        try:
+            with torch.random.fork_rng(devices=devices):
+                rows = self.collect_ordered_features(loader)
+        finally:
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            for key, generator in generators.items():
+                generator.set_state(states[key])
+        result = self.historical_support.audit_expected_ce(
+            self.model.classifier,
+            class_ids,
+            cds,
+            rows["ordered_features"],
+            rows["labels"],
+        )
+        result.update(
+            split="validation", moments_fit_split="train", used_for_selection=False
+        )
+        return result
 
     @staticmethod
     def _exact_nonnegative_int(value: object, *, name: str) -> int:
@@ -84,6 +182,7 @@ class TrainerHelper:
         required = (
             "start_phase",
             "finalize_phase",
+            "restore_finalized_phases",
             "get_phase_dataloader",
             "get_reporting_dataloader",
             "get_new_classes",
@@ -185,14 +284,15 @@ class TrainerHelper:
         return {
             "representation": "one ordered learned Q[K,D]",
             "physical_spectral_evidence": "direct robustly normalized native spectrum P[B,1]",
-            "persistent_cds": "{I_Q,V_Q,I_P,V_P}; learned/physical inter-class relations are derived on demand",
+            "persistent_cds_structure": "one learned Q mean + low-rank covariance, native P mean/band variance/adjacent variance; legacy interval diagnostics only",
             "prediction_head": "one all-seen cosine head; inference is exactly tau*cosine(Q,W)",
-            "base_training": "real base CE + unified Whole-CDS contrastive separation in the single ordered Q",
-            "incremental_reference": "frozen previous backbone/classifier are temporary teacher references; the current backbone remains plastic",
-            "incremental_feature_stability": "Feature KD plus historical Whole-CDS intra/inter preservation; optional old-logit KD",
-            "incremental_cds": "one observable phase map plus bounded Whole-CDS-conditioned residual correction; physical I_P/V_P remain fixed",
-            "classifier_finalization": "Stage 3 freezes E_t and jointly optimizes all seen W using corrected historical Whole-CDS positive supervision plus real-current all-seen CE; no replay, reconstruction state, phase bias or second head is used",
-            "phase_commit": "commit the existing Whole-CDS {I_Q,V_Q,I_P,V_P} and single deployed W only after Stage 1 representation, Stage 2 coordinate correction/real-new CDS, and Stage 3 balanced decision learning",
+            "base_training": "real base CE + Whole-CDS separation and fused learned/physical CDS support; finalize fixed-size class structure",
+            "incremental_reference": "frozen previous backbone/classifier are temporary references; current backbone remains plastic",
+            "incremental_feature_stability": "Feature KD + Whole-CDS intra/inter preservation; optional old-logit KD",
+            "incremental_cds": "inter/intra/spectral class-pair preservation, identity historical coordinates, fixed native P",
+            "classifier_learning": "real all-seen CE updates Q and W_new; directional historical margin/covariance risk updates W_old/W_new",
+            "classifier_finalization": "no post-hoc head training in unified method",
+            "phase_commit": "commit synchronized fixed-size Whole-CDS structure and the jointly learned single W",
         }
 
     def unpack_batch(
@@ -283,7 +383,7 @@ class TrainerHelper:
         coordinate_rows: list[Tensor] = []
         coordinates_present: bool | None = None
 
-        with self.temporary_eval_state():
+        with self._preserve_rng_state(loader), self.temporary_eval_state():
             if backbone is not None:
                 backbone.eval()
 
@@ -357,20 +457,18 @@ class TrainerHelper:
         class_ids: Sequence[int],
         target_class_ids: Sequence[int] | None = None,
     ) -> Dict[str, Any]:
-        return evaluate_model_loader(
-            self.model,
-            loader,
-            class_ids=class_ids,
-            target_class_ids=target_class_ids,
-            device=self.device,
-        )
+        with self._preserve_rng_state(loader):
+            return evaluate_model_loader(
+                self.model,
+                loader,
+                class_ids=class_ids,
+                target_class_ids=target_class_ids,
+                device=self.device,
+            )
 
 
 __all__ = ["TrainerHelper"]
 
-
-
-############ Before the Orcal Version TrainerHelper Starts ############
 
 # from __future__ import annotations
 
@@ -378,10 +476,12 @@ __all__ = ["TrainerHelper"]
 
 # from contextlib import contextmanager
 # import math
+# import random
 # from numbers import Integral, Real
 # from typing import Any, Dict, Iterable, Mapping, Sequence
 
 # import torch
+# import numpy as np
 
 # from models.classifier import CosineClassificationHead
 # from models.geometry_bank import HSIClassDiscriminativeStructureBank
@@ -398,6 +498,97 @@ __all__ = ["TrainerHelper"]
 
 #     def cfg(self, name: str, default: Any) -> Any:
 #         return getattr(self.args, name, default)
+
+#     @staticmethod
+#     def parameter_gradient_audit(objectives, parameters):
+#         """One-batch backbone-gradient measurement, without optimizer mutation."""
+#         gradients = {
+#             name: torch.autograd.grad(
+#                 value, parameters, retain_graph=True, allow_unused=True
+#             )
+#             for name, value in objectives.items()
+#         }
+#         zero = parameters[0].new_zeros(())
+#         norms = {
+#             name: sum((g.square().sum() for g in row if g is not None), zero).sqrt()
+#             for name, row in gradients.items()
+#         }
+#         cosines = {}
+#         names = list(gradients)
+#         for i, left in enumerate(names):
+#             for right in names[i + 1 :]:
+#                 denominator = norms[left] * norms[right]
+#                 dot = sum(
+#                     (
+#                         (a * b).sum()
+#                         for a, b in zip(gradients[left], gradients[right])
+#                         if a is not None and b is not None
+#                     ),
+#                     zero,
+#                 )
+#                 cosines[f"{left}|{right}"] = (
+#                     float((dot / denominator).clamp(-1, 1))
+#                     if float(denominator) > 1e-12
+#                     else None
+#                 )
+#         return {
+#             "norms": {k: float(v) for k, v in norms.items()},
+#             "cosines": cosines,
+#             "scope": "backbone parameters, sampled minibatch, before clipping/AdamW",
+#             "changes_optimizer_update": False,
+#         }
+
+#     @torch.no_grad()
+#     def audit_current_classifier_risk(self, loader, *, class_ids, cds):
+#         """Compare TRAIN-fitted moments with current validation CE; no selection."""
+#         if loader is None:
+#             return {
+#                 "status": "skipped_validation_disabled",
+#                 "used_for_selection": False,
+#             }
+#         # Even a non-shuffled DataLoader advances its base-seed generator.
+#         # Diagnostics must not alter later training shuffles/dropout streams.
+#         generators = {
+#             id(g): g
+#             for g in (
+#                 getattr(loader, "generator", None),
+#                 getattr(getattr(loader, "sampler", None), "generator", None),
+#             )
+#             if g is not None
+#         }
+#         states = {key: g.get_state() for key, g in generators.items()}
+#         python_rng = random.getstate()
+#         numpy_rng = np.random.get_state()
+#         devices = (
+#             [
+#                 (
+#                     self.device.index
+#                     if self.device.index is not None
+#                     else torch.cuda.current_device()
+#                 )
+#             ]
+#             if self.device.type == "cuda"
+#             else []
+#         )
+#         try:
+#             with torch.random.fork_rng(devices=devices):
+#                 rows = self.collect_ordered_features(loader)
+#         finally:
+#             random.setstate(python_rng)
+#             np.random.set_state(numpy_rng)
+#             for key, generator in generators.items():
+#                 generator.set_state(states[key])
+#         result = self.historical_support.audit_expected_ce(
+#             self.model.classifier,
+#             class_ids,
+#             cds,
+#             rows["ordered_features"],
+#             rows["labels"],
+#         )
+#         result.update(
+#             split="validation", moments_fit_split="train", used_for_selection=False
+#         )
+#         return result
 
 #     @staticmethod
 #     def _exact_nonnegative_int(value: object, *, name: str) -> int:
@@ -428,8 +619,7 @@ __all__ = ["TrainerHelper"]
 #     @classmethod
 #     def _validated_class_ids(cls, values: Iterable[int], *, name: str) -> list[int]:
 #         ids = [
-#             cls._exact_nonnegative_int(value, name=f"{name} value")
-#             for value in values
+#             cls._exact_nonnegative_int(value, name=f"{name} value") for value in values
 #         ]
 #         if not ids or len(ids) != len(set(ids)):
 #             raise RuntimeError(f"{name} must contain unique class IDs")
@@ -444,9 +634,7 @@ __all__ = ["TrainerHelper"]
 #         used: set[int] = set()
 #         for raw_phase, raw_classes in phase_map.items():
 #             phase = self._exact_nonnegative_int(raw_phase, name="phase_id")
-#             ids = self._validated_class_ids(
-#                 raw_classes, name=f"phase_{phase}_classes"
-#             )
+#             ids = self._validated_class_ids(raw_classes, name=f"phase_{phase}_classes")
 #             overlap = used.intersection(ids)
 #             if overlap:
 #                 raise RuntimeError(
@@ -469,37 +657,25 @@ __all__ = ["TrainerHelper"]
 #             "assert_exemplar_free_contract",
 #         )
 #         missing = [
-#             name
-#             for name in required
-#             if not callable(getattr(self.dataset, name, None))
+#             name for name in required if not callable(getattr(self.dataset, name, None))
 #         ]
 #         if missing:
 #             raise RuntimeError(f"dataset lacks required APIs: {missing}")
 
 #         if self.dataset.assert_exemplar_free_contract() is not True:
-#             raise RuntimeError(
-#                 "dataset reports an exemplar-free protocol violation"
-#             )
+#             raise RuntimeError("dataset reports an exemplar-free protocol violation")
 
 #         processed = getattr(self.dataset, "processed_cube", None)
 #         ordered = getattr(self.dataset, "ordered_spectral_cube", None)
 #         if processed is None or ordered is None:
-#             raise RuntimeError(
-#                 "dataset must expose processed and ordered HSI cubes"
-#             )
+#             raise RuntimeError("dataset must expose processed and ordered HSI cubes")
 
 #         if int(processed.shape[2]) != int(self.model.backbone.patch_bands):
-#             raise RuntimeError(
-#                 "processed cube channels disagree with backbone"
-#             )
+#             raise RuntimeError("processed cube channels disagree with backbone")
 #         if int(ordered.shape[2]) != int(self.model.backbone.spectral_bands):
-#             raise RuntimeError(
-#                 "ordered cube bands disagree with backbone"
-#             )
+#             raise RuntimeError("ordered cube bands disagree with backbone")
 #         if int(self.dataset.patch_size) != int(self.model.backbone.patch_size):
-#             raise RuntimeError(
-#                 "dataset/backbone patch sizes disagree"
-#             )
+#             raise RuntimeError("dataset/backbone patch sizes disagree")
 
 #         return {"schedule": dict(sorted(schedule.items()))}
 
@@ -522,9 +698,7 @@ __all__ = ["TrainerHelper"]
 #             "forward",
 #         )
 #         missing = [
-#             name
-#             for name in required
-#             if not callable(getattr(self.model, name, None))
+#             name for name in required if not callable(getattr(self.model, name, None))
 #         ]
 #         if missing:
 #             raise RuntimeError(f"model lacks required NECIL-HSI APIs: {missing}")
@@ -542,17 +716,16 @@ __all__ = ["TrainerHelper"]
 #             raise RuntimeError("classifier must be CosineClassificationHead")
 #         if classifier.parameter_count <= 0:
 #             raise RuntimeError("classifier must contain trainable parameters")
-#         if not bool(torch.isfinite(classifier.logit_scale)) or not bool(classifier.logit_scale > 0):
+#         if not bool(torch.isfinite(classifier.logit_scale)) or not bool(
+#             classifier.logit_scale > 0
+#         ):
 #             raise RuntimeError("classifier logit scale is invalid")
 
-#         expected_feature_dim = (
-#             int(self.model.backbone.spectral_token_count)
-#             * int(self.model.backbone.spectral_token_dim)
+#         expected_feature_dim = int(self.model.backbone.spectral_token_count) * int(
+#             self.model.backbone.spectral_token_dim
 #         )
 #         if int(classifier.feature_dim) != expected_feature_dim:
-#             raise RuntimeError(
-#                 "classifier feature dimension disagrees with Q[K,D]"
-#             )
+#             raise RuntimeError("classifier feature dimension disagrees with Q[K,D]")
 
 #         scheduled_classes = {
 #             int(class_id)
@@ -577,14 +750,15 @@ __all__ = ["TrainerHelper"]
 #         return {
 #             "representation": "one ordered learned Q[K,D]",
 #             "physical_spectral_evidence": "direct robustly normalized native spectrum P[B,1]",
-#             "persistent_cds": "{I_Q,V_Q,I_P,V_P}; learned/physical inter-class relations are derived on demand",
-#             "prediction_head": "one calibrated all-seen cosine head; inference is tau*cosine(Q,W)+committed phase offset",
-#             "base_training": "real base CE + unified Whole-CDS contrastive separation in the single ordered Q",
-#             "incremental_reference": "frozen previous backbone/classifier are temporary teacher references; the current backbone remains plastic",
-#             "incremental_feature_stability": "Feature KD plus historical Whole-CDS intra/inter preservation; optional old-logit KD",
-#             "incremental_cds": "one observable phase map plus bounded Whole-CDS-conditioned residual correction; physical I_P/V_P remain fixed",
-#             "classifier_finalization": "after E+ and all-seen CDS are finalized, one deterministic mixed-evidence solver calibrates incoming W direction plus one shared phase offset from real-new HSI and historical Whole-CDS; no classifier epoch schedule",
-#             "phase_commit": "commit only after representation, coordinate correction, real-new CDS construction and unified decision calibration; no replay or second classifier",
+#             "persistent_cds_structure": "one learned Q mean + low-rank covariance, native P mean/band variance/adjacent variance; legacy interval diagnostics only",
+#             "prediction_head": "one all-seen cosine head; inference is exactly tau*cosine(Q,W)",
+#             "base_training": "real base CE + Whole-CDS separation and fused learned/physical CDS support; finalize fixed-size class structure",
+#             "incremental_reference": "frozen previous backbone/classifier are temporary references; current backbone remains plastic",
+#             "incremental_feature_stability": "Feature KD + Whole-CDS intra/inter preservation; optional old-logit KD",
+#             "incremental_cds": "inter/intra/spectral class-pair preservation, identity historical coordinates, fixed native P",
+#             "classifier_learning": "real all-seen CE updates Q and W_new; directional historical margin/covariance risk updates W_old/W_new",
+#             "classifier_finalization": "no post-hoc head training in unified method",
+#             "phase_commit": "commit synchronized fixed-size Whole-CDS structure and the jointly learned single W",
 #         }
 
 #     def unpack_batch(
@@ -633,24 +807,19 @@ __all__ = ["TrainerHelper"]
 #             or patch.size(0) == 0
 #             or tuple(patch.shape[1:]) != expected_patch
 #         ):
-#             raise RuntimeError(
-#                 "processed HSI patch shape is invalid"
-#             )
+#             raise RuntimeError("processed HSI patch shape is invalid")
 
 #         if spectrum.shape != (
 #             patch.size(0),
 #             int(self.model.backbone.spectral_bands),
 #         ):
-#             raise RuntimeError(
-#                 "raw center spectrum shape is invalid"
-#             )
+#             raise RuntimeError("raw center spectrum shape is invalid")
 
 #         if labels.shape != (patch.size(0),):
 #             raise RuntimeError("labels are batch-misaligned")
 
-#         if (
-#             not bool(torch.isfinite(patch).all())
-#             or not bool(torch.isfinite(spectrum).all())
+#         if not bool(torch.isfinite(patch).all()) or not bool(
+#             torch.isfinite(spectrum).all()
 #         ):
 #             raise RuntimeError("HSI batch contains NaN or Inf")
 
@@ -658,10 +827,7 @@ __all__ = ["TrainerHelper"]
 
 #     @contextmanager
 #     def temporary_eval_state(self):
-#         states = [
-#             (module, bool(module.training))
-#             for module in self.model.modules()
-#         ]
+#         states = [(module, bool(module.training)) for module in self.model.modules()]
 #         try:
 #             self.model.eval()
 #             yield
@@ -712,14 +878,10 @@ __all__ = ["TrainerHelper"]
 #                 if coordinates_present is None:
 #                     coordinates_present = has_coords
 #                 elif coordinates_present != has_coords:
-#                     raise RuntimeError(
-#                         "coord presence must be consistent"
-#                     )
+#                     raise RuntimeError("coord presence must be consistent")
 
 #                 if require_coordinates and not has_coords:
-#                     raise RuntimeError(
-#                         "coordinates are required but absent"
-#                     )
+#                     raise RuntimeError("coordinates are required but absent")
 
 #                 if has_coords:
 #                     coords = torch.as_tensor(batch["coord"])
@@ -729,12 +891,8 @@ __all__ = ["TrainerHelper"]
 #                         or coords.is_complex()
 #                         or torch.is_floating_point(coords)
 #                     ):
-#                         raise RuntimeError(
-#                             "coord must be integer [N,2]"
-#                         )
-#                     coordinate_rows.append(
-#                         coords.to(torch.long).cpu()
-#                     )
+#                         raise RuntimeError("coord must be integer [N,2]")
+#                     coordinate_rows.append(coords.to(torch.long).cpu())
 
 #         if not feature_rows:
 #             raise RuntimeError("cannot encode an empty loader")
@@ -752,9 +910,7 @@ __all__ = ["TrainerHelper"]
 #         if coordinates_present:
 #             coords = torch.cat(coordinate_rows, dim=0)
 #             if coords.shape != (labels.numel(), 2):
-#                 raise RuntimeError(
-#                     "collected coordinates are misaligned"
-#                 )
+#                 raise RuntimeError("collected coordinates are misaligned")
 #             result["coords"] = coords
 
 #         return result
@@ -777,6 +933,3 @@ __all__ = ["TrainerHelper"]
 
 
 # __all__ = ["TrainerHelper"]
-
-
-############ ENDs Here ############
