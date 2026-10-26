@@ -1,8 +1,25 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor
+.vscode/
+
+# Training
 datasets/
 *.log
-*.ckpt  
+*.ckpt
 results_*/
-*.md
-.vscode/
-__pycache__/ 
-config/ 
+
+# Environments
+.venv/
+venv/
